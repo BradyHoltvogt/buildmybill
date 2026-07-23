@@ -1,0 +1,3064 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BuildMyBill — Construction Business Management</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2316A34A'/><text x='16' y='23' font-size='20' font-family='system-ui' font-weight='800' fill='white' text-anchor='middle'>B</text></svg>" />
+<style>
+  :root {
+    --brand-primary: #111827;
+    --brand-secondary: #16A34A;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: #F9FAFB;
+    color: #111827;
+    -webkit-font-smoothing: antialiased;
+  }
+  input, select, textarea, button { font-family: inherit; }
+  button { font-family: inherit; }
+  h1, h2, h3, p, ul { margin: 0; }
+
+  /* ── App shell ── */
+  .app { display: flex; min-height: 100vh; background: #F9FAFB; }
+  .app-main { flex: 1; padding: 28px 32px; min-width: 0; }
+  .sidebar {
+    width: 220px; min-width: 220px; background: var(--brand-primary); color: #fff;
+    display: flex; flex-direction: column; height: 100vh;
+    position: sticky; top: 0; flex-shrink: 0;
+  }
+  .sidebar-backdrop { display: none; }
+  .topbar { display: none; }
+
+  @media (max-width: 900px) {
+    .sidebar {
+      position: fixed; left: 0; top: 0; z-index: 150;
+      transform: translateX(-100%); transition: transform .2s ease;
+    }
+    .sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop.open {
+      display: block; position: fixed; inset: 0;
+      background: rgba(0,0,0,.5); z-index: 140;
+    }
+    .topbar {
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 16px; background: var(--brand-primary); color: #fff;
+      position: sticky; top: 0; z-index: 100;
+    }
+    .app { flex-direction: column; }
+    .app-main { padding: 16px; }
+  }
+
+  /* ── Responsive grids ── */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .grid-auto { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+  @media (max-width: 860px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  .row-wrap { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+  .scroll-x { overflow-x: auto; }
+
+  /* Rich-text editor + printed document: restore heading/list styling the reset removes */
+  .rte-surface h2, .rte-print h2 { font-size: 20px; font-weight: 800; margin: 10px 0 6px; }
+  .rte-surface h3, .rte-print h3 { font-size: 16px; font-weight: 700; margin: 8px 0 4px; }
+  .rte-surface p, .rte-print p { margin: 0 0 8px; }
+  .rte-surface ul, .rte-print ul { margin: 4px 0 8px; padding-left: 24px; list-style: disc; }
+  .rte-surface ol, .rte-print ol { margin: 4px 0 8px; padding-left: 24px; list-style: decimal; }
+  .rte-surface li, .rte-print li { margin: 2px 0; }
+  .rte-surface:empty:focus { outline: none; }
+
+  /* ── Print ── */
+  @media print {
+    body * { visibility: hidden !important; }
+    #print-area, #print-area * { visibility: visible !important; }
+    #print-area {
+      position: absolute !important; left: 0 !important; top: 0 !important;
+      width: 100% !important; box-shadow: none !important; border-radius: 0 !important;
+      padding: 24px !important;
+    }
+    .no-print { display: none !important; }
+  }
+
+  /* ── Boot screen ── */
+  #boot {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 14px; background: #111827; color: #fff; z-index: 999;
+    font-family: system-ui, sans-serif;
+  }
+  #boot .logo {
+    width: 56px; height: 56px; border-radius: 14px; background: #16A34A;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 26px; font-weight: 800;
+  }
+  #boot .msg { font-size: 13px; opacity: .6; }
+</style>
+</head>
+<body>
+  <div id="boot">
+    <div class="logo">B</div>
+    <div class="msg">Starting BuildMyBill…</div>
+  </div>
+  <div id="root"></div>
+
+  <script src="vendor/react.production.min.js"></script>
+  <script src="vendor/react-dom.production.min.js"></script>
+  <script src="vendor/babel.min.js"></script>
+  <script type="text/babel" data-presets="react">
+/* ═══════════════════════════════════════════════════════════════════════════
+   BuildMyBill — single-file React app. Sections are marked with banners.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const { useState, useEffect, useRef, useMemo, createContext, useContext } = React;
+
+/* ─── Storage (localStorage-backed tiny DB) ──────────────────────────────── */
+const genId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+// localStorage can throw outright (private mode, file:// restrictions, disabled
+// site data). Fall back to memory so the app still runs instead of white-screening;
+// isPersistent() drives the "data is not being saved" warning in the shell.
+const memoryStore = {};
+const storage = {
+  get(key) {
+    try { return localStorage.getItem(key); }
+    catch { return key in memoryStore ? memoryStore[key] : null; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, value); return true; }
+    catch { memoryStore[key] = value; return false; }
+  },
+  remove(key) {
+    try { localStorage.removeItem(key); } catch { /* memory-only mode */ }
+    delete memoryStore[key];
+  },
+  isPersistent() {
+    try {
+      localStorage.setItem("bmb_probe", "1");
+      localStorage.removeItem("bmb_probe");
+      return true;
+    } catch { return false; }
+  },
+};
+
+const COLLECTIONS = [
+  "quotes", "clients", "jobs", "employees", "subcontractors", "equipment",
+  "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
+  "warehouses", "managerlogs", "doctemplates",
+];
+
+function getCol(name) {
+  try {
+    const parsed = JSON.parse(storage.get("bmb_" + name) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+
+function setCol(name, items) {
+  const ok = storage.set("bmb_" + name, JSON.stringify(items));
+  if (!ok) {
+    window.alert(
+      "Could not save to browser storage — it may be full or disabled.\n\n" +
+      "Your change is held in memory for this session only. Export your data from " +
+      "Settings before closing this tab."
+    );
+  }
+  return ok;
+}
+
+const db = {
+  getAll(col, filters = {}, opts = {}) {
+    let items = getCol(col);
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") items = items.filter(i => i[k] === v);
+    });
+    const total = items.length;
+    const skip = opts.skip || 0;
+    const limit = opts.limit || 1000;
+    return { items: items.slice(skip, skip + limit), hasNext: total > skip + limit, total };
+  },
+  getById(col, id) { return getCol(col).find(i => i._id === id) || null; },
+  create(col, data) {
+    const items = getCol(col);
+    const now = new Date().toISOString();
+    const rec = { ...data, _id: data._id || genId(), _createdDate: now, _updatedDate: now };
+    items.unshift(rec);
+    setCol(col, items);
+    return rec;
+  },
+  update(col, data) {
+    const items = getCol(col);
+    const idx = items.findIndex(i => i._id === data._id);
+    if (idx === -1) return null;
+    items[idx] = { ...items[idx], ...data, _updatedDate: new Date().toISOString() };
+    setCol(col, items);
+    return items[idx];
+  },
+  remove(col, id) { setCol(col, getCol(col).filter(i => i._id !== id)); return true; },
+};
+
+/* ─── Shared helpers ─────────────────────────────────────────────────────── */
+function fmt(n, currency = "CAD") {
+  const val = Number(n);
+  return new Intl.NumberFormat("en-CA", {
+    style: "currency", currency: currency || "CAD", minimumFractionDigits: 2,
+  }).format(Number.isFinite(val) ? val : 0);
+}
+
+function num(v, fallback = 0) {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+// Local calendar date as YYYY-MM-DD. toISOString() would return the UTC day,
+// which is wrong for anyone west of Greenwich in the evening.
+function dateStr(d = new Date()) {
+  const pad = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+}
+function today() { return dateStr(); }
+
+function downloadFile(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function toCSV(rows) {
+  // Prefix BOM so Excel reads UTF-8 correctly; escape embedded quotes.
+  return "﻿" + rows
+    .map(r => r.map(c => '"' + String(c === undefined || c === null ? "" : c).replace(/"/g, '""') + '"').join(","))
+    .join("\r\n");
+}
+
+function hoursBetween(start, end) {
+  if (!start || !end) return 0;
+  const [sh, sm] = start.split(":").map(Number);
+  const [eh, em] = end.split(":").map(Number);
+  if (![sh, sm, eh, em].every(Number.isFinite)) return 0;
+  return Math.max(0, (eh * 60 + em - sh * 60 - sm) / 60);
+}
+
+/* ─── Theme ──────────────────────────────────────────────────────────────── */
+// primary/secondary resolve through CSS variables so company branding applies live.
+const C = {
+  bg: "#F9FAFB",
+  surface: "#FFFFFF",
+  surfaceAlt: "#F3F4F6",
+  primary: "var(--brand-primary)",
+  secondary: "var(--brand-secondary)",
+  accent: "#6366F1",
+  destructive: "#EF4444",
+  text: "#111827",
+  textMuted: "#6B7280",
+  border: "#E5E7EB",
+  green: "#22C55E",
+};
+
+const inputCls = {
+  width: "100%", padding: "8px 12px", border: "1px solid " + C.border,
+  borderRadius: 8, fontSize: 13, background: C.surface, color: C.text,
+  outline: "none",
+};
+const btnBase = { border: "none", borderRadius: 8, cursor: "pointer", fontWeight: 600, fontSize: 13, padding: "9px 18px" };
+const btnPrimary = { ...btnBase, background: C.primary, color: "#fff" };
+const btnSecondary = { ...btnBase, background: C.secondary, color: "#fff" };
+const btnOutline = { ...btnBase, background: "transparent", color: C.text, border: "1px solid " + C.border };
+const btnDanger = { ...btnBase, background: C.destructive, color: "#fff", padding: "6px 12px", borderRadius: 6, fontSize: 12 };
+const card = {
+  background: C.surface, borderRadius: 12, border: "1px solid " + C.border,
+  padding: 20, marginBottom: 16,
+};
+
+/* ─── Auth context ───────────────────────────────────────────────────────── */
+const AuthCtx = createContext(null);
+const useAuth = () => useContext(AuthCtx);
+
+function AuthProvider({ children }) {
+  const [user, setUser] = useState(() => {
+    try { return JSON.parse(storage.get("bmb_user") || "null"); } catch { return null; }
+  });
+
+  const login = (userData) => {
+    const u = { ...userData, id: userData.id || genId() };
+    storage.set("bmb_user", JSON.stringify(u));
+    setUser(u);
+  };
+  const logout = () => { storage.remove("bmb_user"); setUser(null); };
+
+  return (
+    <AuthCtx.Provider value={{ user, login, logout, isAuthenticated: !!user }}>
+      {children}
+    </AuthCtx.Provider>
+  );
+}
+
+/* ─── Company context ────────────────────────────────────────────────────── */
+const CompanyCtx = createContext(null);
+const useCompany = () => useContext(CompanyCtx);
+
+const DEFAULT_PRIMARY = "#111827";
+const DEFAULT_SECONDARY = "#16A34A";
+
+function applyBranding(company) {
+  const root = document.documentElement;
+  root.style.setProperty("--brand-primary", company?.primaryColor || DEFAULT_PRIMARY);
+  root.style.setProperty("--brand-secondary", company?.secondaryColor || DEFAULT_SECONDARY);
+}
+
+function CompanyProvider({ children }) {
+  const { user } = useAuth();
+  const [company, setCompany] = useState(() => {
+    try { return JSON.parse(storage.get("bmb_company") || "null"); } catch { return null; }
+  });
+
+  const updateCompany = (data) => {
+    setCompany(prev => {
+      const updated = { ...(prev || {}), ...data };
+      storage.set("bmb_company", JSON.stringify(updated));
+      return updated;
+    });
+  };
+
+  // Create a company record the first time someone signs in.
+  useEffect(() => {
+    if (user && !company) {
+      const defaultCompany = {
+        id: genId(),
+        companyName: user.companyName || "My Company",
+        primaryColor: DEFAULT_PRIMARY,
+        secondaryColor: DEFAULT_SECONDARY,
+        logoUrl: "",
+        userRole: "Owner",
+      };
+      storage.set("bmb_company", JSON.stringify(defaultCompany));
+      setCompany(defaultCompany);
+    }
+  }, [user, company]);
+
+  // Keep CSS variables in sync with saved branding.
+  useEffect(() => { applyBranding(company); }, [company]);
+
+  return (
+    <CompanyCtx.Provider value={{ company, updateCompany, companyId: company?.id }}>
+      {children}
+    </CompanyCtx.Provider>
+  );
+}
+
+/* ─── Router ─────────────────────────────────────────────────────────────── */
+const RouterCtx = createContext(null);
+const useRouter = () => useContext(RouterCtx);
+
+function Router({ children }) {
+  const [route, setRoute] = useState(() => ({
+    page: (window.location.hash || "").replace(/^#\/?/, "") || "dashboard",
+    params: {},
+  }));
+
+  const navigate = (page, params = {}) => {
+    setRoute({ page, params });
+    window.location.hash = "#/" + page;
+    window.scrollTo(0, 0);
+  };
+
+  // Support browser back/forward via the hash.
+  useEffect(() => {
+    const onHash = () => {
+      const page = (window.location.hash || "").replace(/^#\/?/, "") || "dashboard";
+      setRoute(r => (r.page === page ? r : { page, params: {} }));
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  return (
+    <RouterCtx.Provider value={{ page: route.page, params: route.params, navigate }}>
+      {children}
+    </RouterCtx.Provider>
+  );
+}
+
+/* ─── UI atoms ───────────────────────────────────────────────────────────── */
+function Badge({ children, color = C.surfaceAlt, textColor = C.textMuted }) {
+  return (
+    <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 20, background: color, color: textColor, whiteSpace: "nowrap" }}>
+      {children}
+    </span>
+  );
+}
+
+const STATUS_COLORS = {
+  Draft: [C.surfaceAlt, C.textMuted],
+  Quote: ["#EFF6FF", "#2563EB"],
+  Invoice: ["#FFF7ED", "#EA580C"],
+  Paid: ["#F0FDF4", "#16A34A"],
+  Cancelled: ["#FEF2F2", "#DC2626"],
+  Active: ["#F0FDF4", "#16A34A"],
+  "In Progress": ["#EFF6FF", "#2563EB"],
+  Completed: ["#EFF6FF", "#2563EB"],
+  "On Hold": ["#FEFCE8", "#CA8A04"],
+  Pending: ["#FEFCE8", "#CA8A04"],
+  Accepted: ["#F0FDF4", "#16A34A"],
+  Rejected: ["#FEF2F2", "#DC2626"],
+  Sent: ["#EFF6FF", "#2563EB"],
+};
+
+function StatusBadge({ status }) {
+  const [bg, tx] = STATUS_COLORS[status] || [C.surfaceAlt, C.textMuted];
+  return <Badge color={bg} textColor={tx}>{status || "Draft"}</Badge>;
+}
+
+function PassFailBadge({ value }) {
+  return value
+    ? <Badge color="#F0FDF4" textColor="#16A34A">Pass</Badge>
+    : <Badge color="#FEF2F2" textColor="#DC2626">Fail</Badge>;
+}
+
+function Field({ label, children, required, style }) {
+  return (
+    <div style={{ marginBottom: 12, ...style }}>
+      <label style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+        {label}{required && <span style={{ color: C.destructive }}> *</span>}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+function TextInput({ value, onChange, placeholder, type = "text", rows, style = {}, ...rest }) {
+  const s = { ...inputCls, ...style };
+  const val = value === undefined || value === null ? "" : value;
+  return rows
+    ? <textarea value={val} onChange={e => onChange(e.target.value)} placeholder={placeholder} rows={rows} style={{ ...s, resize: "vertical" }} {...rest} />
+    : <input type={type} value={val} onChange={e => onChange(e.target.value)} placeholder={placeholder} style={s} {...rest} />;
+}
+
+function Select({ value, onChange, options, style = {}, placeholder }) {
+  return (
+    <select value={value === undefined || value === null ? "" : value} onChange={e => onChange(e.target.value)} style={{ ...inputCls, ...style }}>
+      {placeholder && <option value="">{placeholder}</option>}
+      {options.map(o => typeof o === "string"
+        ? <option key={o} value={o}>{o}</option>
+        : <option key={String(o.value)} value={o.value}>{o.label}</option>)}
+    </select>
+  );
+}
+
+function Checkbox({ checked, onChange, label }) {
+  return (
+    <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", background: checked ? "#F0FDF4" : C.surfaceAlt, borderRadius: 8, cursor: "pointer", border: "1px solid " + (checked ? "#BBF7D0" : C.border) }}>
+      <input type="checkbox" checked={!!checked} onChange={e => onChange(e.target.checked)} style={{ accentColor: C.green, width: 17, height: 17, cursor: "pointer" }} />
+      <span style={{ fontSize: 13, fontWeight: 500 }}>{label}</span>
+    </label>
+  );
+}
+
+function Modal({ title, onClose, children, width = 560 }) {
+  useEffect(() => {
+    const onKey = e => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 200, display: "flex", alignItems: "flex-start", justifyContent: "center", overflowY: "auto", padding: "40px 16px" }}
+      onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div style={{ background: C.surface, borderRadius: 16, padding: 28, width: "100%", maxWidth: width }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <h3 style={{ fontSize: 18, fontWeight: 700 }}>{title}</h3>
+          <button type="button" onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: C.textMuted, lineHeight: 1 }}>×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function PageHeader({ title, subtitle, action }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 24, flexWrap: "wrap", gap: 12 }}>
+      <div>
+        <h1 style={{ fontSize: 28, fontWeight: 800, color: C.text, letterSpacing: "-0.5px" }}>{title}</h1>
+        {subtitle && <p style={{ color: C.textMuted, margin: "4px 0 0", fontSize: 14 }}>{subtitle}</p>}
+      </div>
+      {action}
+    </div>
+  );
+}
+
+function EmptyState({ icon, title, subtitle, action }) {
+  return (
+    <div style={{ textAlign: "center", padding: "60px 20px", background: C.surface, borderRadius: 12, border: "1px solid " + C.border }}>
+      <div style={{ fontSize: 48, marginBottom: 16 }}>{icon}</div>
+      <h3 style={{ fontSize: 20, fontWeight: 700, color: C.text, marginBottom: 8 }}>{title}</h3>
+      <p style={{ color: C.textMuted, marginBottom: 20 }}>{subtitle}</p>
+      {action}
+    </div>
+  );
+}
+
+function StatCard({ label, value, icon, onClick }) {
+  return (
+    <div
+      onClick={onClick}
+      style={{ ...card, marginBottom: 0, cursor: onClick ? "pointer" : "default", textAlign: "center" }}
+    >
+      {icon && <div style={{ fontSize: 26, marginBottom: 6 }}>{icon}</div>}
+      <div style={{ fontSize: 26, fontWeight: 800, color: C.text }}>{value}</div>
+      <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 600 }}>{label}</div>
+    </div>
+  );
+}
+
+function defaultCell(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return value;
+}
+
+function DataTable({ columns, rows, onEdit, onDelete, onView, emptyMessage = "No data yet" }) {
+  const hasActions = !!(onEdit || onDelete || onView);
+  if (!rows || rows.length === 0) {
+    return <div style={{ textAlign: "center", padding: 40, color: C.textMuted }}>{emptyMessage}</div>;
+  }
+  return (
+    <div className="scroll-x">
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+        <thead>
+          <tr style={{ background: C.surfaceAlt }}>
+            {columns.map(c => (
+              <th key={c.key} style={{ padding: "10px 12px", textAlign: "left", fontWeight: 700, fontSize: 11, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", borderBottom: "2px solid " + C.border, whiteSpace: "nowrap" }}>
+                {c.label}
+              </th>
+            ))}
+            {hasActions && <th style={{ width: 140, padding: "10px 12px", borderBottom: "2px solid " + C.border }} />}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => (
+            <tr key={row._id || i} style={{ borderBottom: "1px solid " + C.border, background: i % 2 === 0 ? C.surface : "#FAFAFA" }}>
+              {columns.map(c => (
+                <td key={c.key} style={{ padding: "10px 12px", color: C.text }}>
+                  {c.render ? c.render(row[c.key], row) : defaultCell(row[c.key])}
+                </td>
+              ))}
+              {hasActions && (
+                <td style={{ padding: "10px 12px" }}>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {onView && <button type="button" onClick={() => onView(row)} style={{ ...btnOutline, padding: "4px 10px", fontSize: 12 }}>View</button>}
+                    {onEdit && <button type="button" onClick={() => onEdit(row)} style={{ ...btnOutline, padding: "4px 10px", fontSize: 12 }}>Edit</button>}
+                    {onDelete && <button type="button" onClick={() => onDelete(row)} style={{ ...btnDanger, padding: "4px 10px" }}>Del</button>}
+                  </div>
+                </td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function Toast({ message }) {
+  if (!message) return null;
+  return (
+    <div style={{ background: "#F0FDF4", color: "#16A34A", padding: "12px 16px", borderRadius: 8, marginBottom: 16, fontWeight: 600, border: "1px solid #BBF7D0" }}>
+      ✓ {message}
+    </div>
+  );
+}
+
+/* ─── Generic CRUD page ──────────────────────────────────────────────────── */
+function CRUDForm({ fields, data, onSave, onCancel }) {
+  const [form, setForm] = useState({ ...data });
+  const [error, setError] = useState("");
+  const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
+
+  const submit = () => {
+    const missing = fields.filter(f => f.required && !String(form[f.key] ?? "").trim());
+    if (missing.length) { setError(missing[0].label + " is required."); return; }
+    onSave(form);
+  };
+
+  return (
+    <div>
+      {error && <div style={{ background: "#FEF2F2", color: "#DC2626", padding: "10px 14px", borderRadius: 8, marginBottom: 14, fontSize: 13 }}>{error}</div>}
+      {fields.map(f => {
+        if (f.type === "boolean") {
+          return (
+            <div key={f.key} style={{ marginBottom: 12 }}>
+              <Checkbox checked={!!form[f.key]} onChange={v => set(f.key, v)} label={f.label} />
+            </div>
+          );
+        }
+        return (
+          <Field key={f.key} label={f.label} required={f.required}>
+            {f.type === "select"
+              ? <Select value={form[f.key] || ""} onChange={v => set(f.key, v)} options={f.options} placeholder={f.placeholder} />
+              : f.type === "textarea"
+                ? <TextInput value={form[f.key]} onChange={v => set(f.key, v)} placeholder={f.placeholder} rows={3} />
+                : <TextInput type={f.type || "text"} value={form[f.key]} onChange={v => set(f.key, v)} placeholder={f.placeholder} />}
+          </Field>
+        );
+      })}
+      <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+        <button type="button" onClick={onCancel} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+        <button type="button" onClick={submit} style={{ ...btnSecondary, flex: 1 }}>Save</button>
+      </div>
+    </div>
+  );
+}
+
+function CRUDPage({ title, singular, subtitle, collection, columns, formFields, emptyIcon, defaultValues = {} }) {
+  const [items, setItems] = useState(() => db.getAll(collection).items);
+  const [modal, setModal] = useState(null);
+  const [query, setQuery] = useState("");
+  const noun = singular || title.replace(/ies$/, "y").replace(/s$/, "");
+
+  const reload = () => setItems(db.getAll(collection).items);
+
+  const save = (data) => {
+    if (modal.mode === "edit") db.update(collection, data);
+    else db.create(collection, data);
+    setModal(null);
+    reload();
+  };
+
+  const del = (item) => {
+    if (window.confirm("Delete this " + noun.toLowerCase() + "?")) {
+      db.remove(collection, item._id);
+      reload();
+    }
+  };
+
+  const openCreate = () => setModal({ mode: "create", data: { _id: genId(), ...defaultValues } });
+  const openEdit = (item) => setModal({ mode: "edit", data: { ...item } });
+
+  const filtered = query.trim()
+    ? items.filter(item => columns.some(c => String(item[c.key] ?? "").toLowerCase().includes(query.trim().toLowerCase())))
+    : items;
+
+  return (
+    <div>
+      <PageHeader
+        title={title}
+        subtitle={subtitle}
+        action={<button type="button" onClick={openCreate} style={btnSecondary}>+ New {noun}</button>}
+      />
+      {items.length === 0
+        ? <EmptyState
+            icon={emptyIcon || "📂"}
+            title={"No " + title.toLowerCase() + " yet"}
+            subtitle={"Add your first " + noun.toLowerCase() + " to get started."}
+            action={<button type="button" onClick={openCreate} style={btnSecondary}>Create {noun}</button>}
+          />
+        : (
+          <div style={card}>
+            <div style={{ marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <TextInput value={query} onChange={setQuery} placeholder={"Search " + title.toLowerCase() + "…"} style={{ maxWidth: 280 }} />
+              <span style={{ fontSize: 12, color: C.textMuted }}>{filtered.length} of {items.length}</span>
+            </div>
+            <DataTable columns={columns} rows={filtered} onEdit={openEdit} onDelete={del} emptyMessage="No matches for your search." />
+          </div>
+        )}
+
+      {modal && (
+        <Modal title={(modal.mode === "create" ? "New " : "Edit ") + noun} onClose={() => setModal(null)}>
+          <CRUDForm fields={formFields} data={modal.data} onSave={save} onCancel={() => setModal(null)} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+const money = v => (v === "" || v === null || v === undefined ? "—" : "$" + num(v).toFixed(2));
+
+/* ─── Record pages ───────────────────────────────────────────────────────── */
+function ClientsPage() {
+  return <CRUDPage
+    title="Clients" singular="Client" subtitle="Manage your client relationships" collection="clients" emptyIcon="👥"
+    columns={[
+      { key: "clientName", label: "Name" },
+      { key: "contactPerson", label: "Contact" },
+      { key: "emailAddress", label: "Email" },
+      { key: "phoneNumber", label: "Phone" },
+      { key: "billingAddress", label: "Address" },
+    ]}
+    formFields={[
+      { key: "clientName", label: "Client / Business Name", required: true, placeholder: "Acme Corp" },
+      { key: "contactPerson", label: "Contact Person", placeholder: "Jane Smith" },
+      { key: "emailAddress", label: "Email", type: "email", placeholder: "jane@acme.com" },
+      { key: "phoneNumber", label: "Phone", placeholder: "+1 555 000 0000" },
+      { key: "billingAddress", label: "Billing Address", type: "textarea", placeholder: "123 Main St, City, Province" },
+      { key: "notes", label: "Notes", type: "textarea", placeholder: "Additional notes…" },
+    ]}
+  />;
+}
+
+function JobsPage() {
+  return <CRUDPage
+    title="Jobs" singular="Job" subtitle="Manage construction projects and track progress" collection="jobs" emptyIcon="🏗️"
+    defaultValues={{ jobStatus: "Pending" }}
+    columns={[
+      { key: "jobTitle", label: "Job Title" },
+      { key: "clientName", label: "Client" },
+      { key: "jobAddress", label: "Address" },
+      { key: "startDate", label: "Start Date" },
+      { key: "jobStatus", label: "Status", render: v => <StatusBadge status={v} /> },
+    ]}
+    formFields={[
+      { key: "jobTitle", label: "Job Title", required: true, placeholder: "Site Renovation" },
+      { key: "clientName", label: "Client", placeholder: "Client name" },
+      { key: "jobAddress", label: "Job Address", placeholder: "Site address" },
+      { key: "startDate", label: "Start Date", type: "date" },
+      { key: "endDate", label: "End Date", type: "date" },
+      { key: "jobStatus", label: "Status", type: "select", options: ["Pending", "Active", "In Progress", "Completed", "On Hold"] },
+      { key: "jobDescription", label: "Description", type: "textarea", placeholder: "Project details…" },
+    ]}
+  />;
+}
+
+function EmployeesPage() {
+  return <CRUDPage
+    title="Employees" singular="Employee" subtitle="Manage your team members" collection="employees" emptyIcon="👤"
+    defaultValues={{ isActive: true, role: "Employee" }}
+    columns={[
+      { key: "fullName", label: "Name" },
+      { key: "role", label: "Role" },
+      { key: "email", label: "Email" },
+      { key: "phoneNumber", label: "Phone" },
+      { key: "hourlyRate", label: "Rate/hr", render: money },
+      { key: "isActive", label: "Active", render: v => v ? "✅" : "❌" },
+    ]}
+    formFields={[
+      { key: "fullName", label: "Full Name", required: true, placeholder: "John Doe" },
+      { key: "employeeId", label: "Employee ID", placeholder: "EMP001" },
+      { key: "role", label: "Role", type: "select", options: ["Owner", "Manager", "Supervisor", "Crew Lead", "Employee"] },
+      { key: "email", label: "Email", type: "email", placeholder: "john@company.com" },
+      { key: "phoneNumber", label: "Phone", placeholder: "+1 555 000 0000" },
+      { key: "hourlyRate", label: "Hourly Rate ($)", type: "number", placeholder: "25.00" },
+      { key: "startDate", label: "Start Date", type: "date" },
+      { key: "isActive", label: "Currently active", type: "boolean" },
+    ]}
+  />;
+}
+
+function SubcontractorsPage() {
+  return <CRUDPage
+    title="Subcontractors" singular="Subcontractor" subtitle="Manage your external contractor network" collection="subcontractors" emptyIcon="🔧"
+    columns={[
+      { key: "subcontractorName", label: "Company" },
+      { key: "contactPerson", label: "Contact" },
+      { key: "email", label: "Email" },
+      { key: "phoneNumber", label: "Phone" },
+      { key: "hourlyRate", label: "Rate/hr", render: money },
+      { key: "specialties", label: "Specialties" },
+    ]}
+    formFields={[
+      { key: "subcontractorName", label: "Company Name", required: true, placeholder: "ABC Electrical" },
+      { key: "contactPerson", label: "Contact Person", placeholder: "Jane Doe" },
+      { key: "email", label: "Email", type: "email", placeholder: "contact@abc.com" },
+      { key: "phoneNumber", label: "Phone", placeholder: "+1 555 000 0000" },
+      { key: "address", label: "Address", placeholder: "Street address" },
+      { key: "hourlyRate", label: "Hourly Rate ($)", type: "number", placeholder: "75.00" },
+      { key: "specialties", label: "Specialties", placeholder: "Electrical, Plumbing, HVAC…" },
+      { key: "descriptionOfServices", label: "Description", type: "textarea", placeholder: "Services offered…" },
+    ]}
+  />;
+}
+
+function EquipmentPage() {
+  return <CRUDPage
+    title="Equipment" singular="Equipment Item" subtitle="Track your fleet and machinery" collection="equipment" emptyIcon="🚛"
+    columns={[
+      { key: "equipmentName", label: "Name" },
+      { key: "equipmentType", label: "Type" },
+      { key: "manufacturer", label: "Manufacturer" },
+      { key: "yearOfManufacture", label: "Year" },
+      { key: "billingRatePerHour", label: "$/hr", render: money },
+      { key: "totalHours", label: "Hours/KM" },
+    ]}
+    formFields={[
+      { key: "equipmentName", label: "Equipment Name", required: true, placeholder: "Excavator CAT 320" },
+      { key: "equipmentType", label: "Type", type: "select", options: ["Semi", "Truck", "Wheel Loader", "Excavator", "Bulldozer", "Crane", "Skid Steer", "Other"], placeholder: "Select type…" },
+      { key: "manufacturer", label: "Manufacturer", placeholder: "Caterpillar, John Deere…" },
+      { key: "yearOfManufacture", label: "Year", type: "number", placeholder: "2020" },
+      { key: "billingRatePerHour", label: "Billing Rate ($/hr)", type: "number", placeholder: "150.00" },
+      { key: "totalHours", label: "Total Hours / KM", type: "number", placeholder: "0" },
+      { key: "vinNumber", label: "VIN Number", placeholder: "1HGBH41JXMN109186" },
+      { key: "description", label: "Description", type: "textarea", placeholder: "Equipment notes…" },
+      { key: "maintenanceNotes", label: "Maintenance Notes", type: "textarea", placeholder: "Recent maintenance…" },
+    ]}
+  />;
+}
+
+function InventoryPage() {
+  return <CRUDPage
+    title="Inventory" singular="Material" subtitle="Track stock levels and materials" collection="inventory" emptyIcon="📦"
+    columns={[
+      { key: "materialName", label: "Material" },
+      { key: "currentStock", label: "Stock", render: (v, row) => num(v) + " " + (row.unitOfMeasure || "units") },
+      { key: "unitPrice", label: "Unit Price", render: money },
+      { key: "currentStock2", label: "Stock Value", render: (_v, row) => fmt(num(row.currentStock) * num(row.unitPrice)) },
+      { key: "warehouse", label: "Warehouse" },
+      { key: "supplier", label: "Supplier" },
+    ]}
+    formFields={[
+      { key: "materialName", label: "Material Name", required: true, placeholder: "Gravel, Sand, Lumber…" },
+      { key: "currentStock", label: "Current Stock", type: "number", placeholder: "100" },
+      { key: "unitOfMeasure", label: "Unit of Measure", placeholder: "tons, yards, units…" },
+      { key: "unitPrice", label: "Unit Price ($)", type: "number", placeholder: "25.00" },
+      { key: "warehouse", label: "Warehouse", placeholder: "Main Warehouse" },
+      { key: "supplier", label: "Supplier", placeholder: "Supplier name" },
+      { key: "description", label: "Description", type: "textarea", placeholder: "Material details…" },
+    ]}
+  />;
+}
+
+function ContractsPage() {
+  return <CRUDPage
+    title="Contracts" singular="Contract" subtitle="Manage construction contracts" collection="contracts" emptyIcon="📋"
+    defaultValues={{ status: "Active" }}
+    columns={[
+      { key: "contractName", label: "Contract Name" },
+      { key: "clientReference", label: "Client" },
+      { key: "contractValue", label: "Value", render: v => (v === "" || v === undefined ? "—" : fmt(v)) },
+      { key: "startDate", label: "Start Date" },
+      { key: "endDate", label: "End Date" },
+      { key: "status", label: "Status", render: v => <StatusBadge status={v} /> },
+    ]}
+    formFields={[
+      { key: "contractName", label: "Contract Name", required: true, placeholder: "Downtown Office Building" },
+      { key: "clientReference", label: "Client Reference", required: true, placeholder: "Client name or ID" },
+      { key: "contractValue", label: "Contract Value ($)", type: "number", placeholder: "250000" },
+      { key: "startDate", label: "Start Date", type: "date" },
+      { key: "endDate", label: "End Date", type: "date" },
+      { key: "status", label: "Status", type: "select", options: ["Active", "Pending", "Completed", "On Hold"] },
+      { key: "description", label: "Description", type: "textarea", placeholder: "Contract scope and details…" },
+    ]}
+  />;
+}
+
+function SafetyPage() {
+  return <CRUDPage
+    title="Safety Checks" singular="Safety Check" subtitle="Manage safety check templates and submissions" collection="safetychecks" emptyIcon="🦺"
+    defaultValues={{ passFailStatus: true, checkDate: today() }}
+    columns={[
+      { key: "templateName", label: "Template" },
+      { key: "equipmentCategory", label: "Equipment Category" },
+      { key: "checkDate", label: "Date" },
+      { key: "createdBy", label: "Created By" },
+      { key: "passFailStatus", label: "Status", render: v => <PassFailBadge value={v} /> },
+    ]}
+    formFields={[
+      { key: "templateName", label: "Template Name", required: true, placeholder: "Daily Equipment Inspection" },
+      { key: "equipmentCategory", label: "Equipment Category", placeholder: "Excavator, Truck…" },
+      { key: "checkDate", label: "Date", type: "date" },
+      { key: "checklistQuestions", label: "Checklist Items (one per line)", type: "textarea", placeholder: "Brakes\nLights\nFluids\nTires" },
+      { key: "createdBy", label: "Created By", placeholder: "Your name" },
+      { key: "passFailStatus", label: "Passed inspection", type: "boolean" },
+    ]}
+  />;
+}
+
+function WarehousesPage() {
+  return <CRUDPage
+    title="Warehouses" singular="Warehouse" subtitle="Manage storage locations and facilities" collection="warehouses" emptyIcon="🏭"
+    defaultValues={{ isActive: true }}
+    columns={[
+      { key: "warehouseName", label: "Warehouse Name" },
+      { key: "address", label: "Address" },
+      { key: "contactPerson", label: "Contact" },
+      { key: "phoneNumber", label: "Phone" },
+      { key: "capacity", label: "Capacity", render: v => (v ? num(v).toLocaleString() + " sq ft" : "—") },
+      { key: "isActive", label: "Active", render: v => (v !== false ? "✅" : "❌") },
+    ]}
+    formFields={[
+      { key: "warehouseName", label: "Warehouse Name", required: true, placeholder: "Main Warehouse" },
+      { key: "address", label: "Address", required: true, placeholder: "123 Industrial Blvd, City" },
+      { key: "contactPerson", label: "Contact Person", placeholder: "John Doe" },
+      { key: "phoneNumber", label: "Phone Number", placeholder: "+1 555 000 0000" },
+      { key: "capacity", label: "Capacity (sq ft)", type: "number", placeholder: "10000" },
+      { key: "isActive", label: "Currently active", type: "boolean" },
+    ]}
+  />;
+}
+
+function ManagerLogsPage() {
+  return <CRUDPage
+    title="Manager Logs" singular="Manager Log" subtitle="Track daily management activities and oversight" collection="managerlogs" emptyIcon="📖"
+    defaultValues={{ status: "Pending", logDate: today() }}
+    columns={[
+      { key: "managerName", label: "Manager" },
+      { key: "logDate", label: "Date" },
+      { key: "logTime", label: "Time" },
+      { key: "activityDescription", label: "Activity", render: v => (v ? v.slice(0, 60) + (v.length > 60 ? "…" : "") : "—") },
+      { key: "status", label: "Status", render: v => <StatusBadge status={v} /> },
+    ]}
+    formFields={[
+      { key: "managerName", label: "Manager Name", required: true, placeholder: "Your name" },
+      { key: "logDate", label: "Log Date", type: "date" },
+      { key: "logTime", label: "Log Time", type: "time" },
+      { key: "activityDescription", label: "Activity Description", type: "textarea", placeholder: "Describe the day's management activities…" },
+      { key: "status", label: "Status", type: "select", options: ["Pending", "In Progress", "Completed", "On Hold"] },
+    ]}
+  />;
+}
+
+/* ─── Quotes & invoices ──────────────────────────────────────────────────── */
+const CURRENCIES = ["CAD", "USD", "GBP", "EUR", "AUD", "NZD", "ZAR"];
+const QUOTE_STATUSES = ["Draft", "Quote", "Invoice", "Paid", "Cancelled"];
+const TAX_PRESETS = [0, 5, 10, 12, 13, 15, 20];
+
+const emptyItem = () => ({ id: genId(), description: "", unit: "", qty: 1, rate: 0, taxable: true });
+
+// True when rich-text HTML has real content (not just empty tags / whitespace).
+function hasRichContent(html) {
+  if (!html) return false;
+  const stripped = html.replace(/<(br|hr)\s*\/?>/gi, "").replace(/<[^>]*>/g, "").replace(/&nbsp;/gi, " ");
+  return stripped.trim().length > 0;
+}
+
+function calcTotals(doc) {
+  const items = Array.isArray(doc.items) ? doc.items : [];
+  const lineTotal = it => num(it.qty) * num(it.rate);
+  const subtotal = items.reduce((s, it) => s + lineTotal(it), 0);
+  const taxableSubtotal = items.filter(i => i.taxable).reduce((s, it) => s + lineTotal(it), 0);
+  const discountAmt = doc.discountType === "percent"
+    ? subtotal * (num(doc.discount) / 100)
+    : Math.min(num(doc.discount), subtotal);
+  const afterDiscount = subtotal - discountAmt;
+  // Spread the discount proportionally across taxable lines.
+  const taxBase = subtotal > 0 ? taxableSubtotal * (1 - discountAmt / subtotal) : 0;
+  const taxAmt = taxBase * (num(doc.taxRate) / 100);
+  return { subtotal, discountAmt, taxAmt, total: afterDiscount + taxAmt };
+}
+
+function defaultDoc(company) {
+  const d = new Date();
+  const due = new Date(d);
+  due.setDate(due.getDate() + 30);
+  return {
+    _id: genId(),
+    quoteId: "INV-" + d.getFullYear() + "-" + String(Math.floor(Math.random() * 9000) + 1000),
+    status: "Invoice",
+    currency: "CAD",
+    issueDate: dateStr(d),
+    dueDate: dateStr(due),
+    from: {
+      name: company?.companyName || "",
+      email: company?.email || "",
+      phone: company?.phone || "",
+      address: company?.address || "",
+      logo: company?.logoUrl || null,
+    },
+    to: { name: "", email: "", phone: "", address: "" },
+    items: [emptyItem()],
+    taxRate: 0,
+    taxLabel: "Tax",
+    discount: 0,
+    discountType: "percent",
+    notes: "",
+    terms: "Payment due within 30 days.",
+    expirationDate: "",
+    clientReference: "",
+    jobReference: "",
+    totalAmount: 0,
+    documentEnabled: false,   // optional Word-style scope document
+    documentTitle: "Scope of Work",
+    documentHtml: "",
+  };
+}
+
+/* ─── Rich text (Word-style) document editor ─────────────────────────────── */
+// A lightweight contenteditable editor with a formatting toolbar. Uses
+// document.execCommand — deprecated but supported everywhere and dependency-free,
+// which suits this fully-offline app. The HTML is written by the app's own user
+// and only ever rendered back to that same user, so no external sanitizer is needed.
+const RTE_TOOLS = [
+  { cmd: "formatBlock", value: "<h2>", label: "H1", title: "Large heading", style: { fontWeight: 800 } },
+  { cmd: "formatBlock", value: "<h3>", label: "H2", title: "Small heading", style: { fontWeight: 700 } },
+  { cmd: "formatBlock", value: "<p>", label: "¶", title: "Normal text" },
+  { sep: true },
+  { cmd: "bold", label: "B", title: "Bold", style: { fontWeight: 800 } },
+  { cmd: "italic", label: "I", title: "Italic", style: { fontStyle: "italic" } },
+  { cmd: "underline", label: "U", title: "Underline", style: { textDecoration: "underline" } },
+  { sep: true },
+  { cmd: "insertUnorderedList", label: "• List", title: "Bulleted list" },
+  { cmd: "insertOrderedList", label: "1. List", title: "Numbered list" },
+  { sep: true },
+  { cmd: "justifyLeft", label: "⇤", title: "Align left" },
+  { cmd: "justifyCenter", label: "≡", title: "Align center" },
+  { cmd: "justifyRight", label: "⇥", title: "Align right" },
+  { sep: true },
+  { cmd: "removeFormat", label: "Clear", title: "Clear formatting" },
+];
+
+function RichTextEditor({ html, onChange, placeholder = "Start typing…", minHeight = 220 }) {
+  const ref = useRef(null);
+
+  // Load incoming HTML only when it differs, so we don't clobber the caret on every keystroke.
+  useEffect(() => {
+    if (ref.current && ref.current.innerHTML !== (html || "")) {
+      ref.current.innerHTML = html || "";
+    }
+  }, [html]);
+
+  const exec = (cmd, value) => {
+    ref.current.focus();
+    try { document.execCommand(cmd, false, value); } catch { /* unsupported command */ }
+    onChange(ref.current.innerHTML);
+  };
+
+  const isEmpty = !html || html === "<br>" || html.replace(/<[^>]*>/g, "").trim() === "";
+
+  return (
+    <div style={{ border: "1px solid " + C.border, borderRadius: 10, overflow: "hidden", background: C.surface }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 2, padding: "6px 8px", background: C.surfaceAlt, borderBottom: "1px solid " + C.border }}>
+        {RTE_TOOLS.map((t, i) => t.sep
+          ? <div key={"sep" + i} style={{ width: 1, background: C.border, margin: "2px 4px" }} />
+          : (
+            <button
+              key={t.label + i}
+              type="button"
+              title={t.title}
+              // onMouseDown (not click) so the editor keeps its text selection.
+              onMouseDown={e => { e.preventDefault(); exec(t.cmd, t.value); }}
+              style={{ minWidth: 30, height: 28, padding: "0 8px", background: C.surface, border: "1px solid " + C.border, borderRadius: 6, cursor: "pointer", fontSize: 12, color: C.text, ...t.style }}
+            >
+              {t.label}
+            </button>
+          ))}
+      </div>
+      <div style={{ position: "relative" }}>
+        {isEmpty && (
+          <div style={{ position: "absolute", top: 14, left: 16, color: C.textMuted, fontSize: 14, pointerEvents: "none" }}>
+            {placeholder}
+          </div>
+        )}
+        <div
+          ref={ref}
+          contentEditable
+          suppressContentEditableWarning
+          onInput={e => onChange(e.currentTarget.innerHTML)}
+          className="rte-surface"
+          style={{ minHeight, padding: "12px 16px", fontSize: 14, lineHeight: 1.7, color: C.text, outline: "none" }}
+        />
+      </div>
+    </div>
+  );
+}
+
+// Reusable document templates: save the current scope write-up under a name,
+// then drop it into any future quote. Stored in the "doctemplates" collection so
+// it rides along in Settings → Export/Import backups.
+function DocumentTemplates({ doc, update }) {
+  const [templates, setTemplates] = useState(() => db.getAll("doctemplates").items);
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [manageOpen, setManageOpen] = useState(false);
+  const [name, setName] = useState("");
+  const reload = () => setTemplates(db.getAll("doctemplates").items);
+
+  const canSave = hasRichContent(doc.documentHtml);
+
+  const insert = (id) => {
+    const t = db.getById("doctemplates", id);
+    if (!t) return;
+    if (hasRichContent(doc.documentHtml) &&
+        !window.confirm('Replace the current document with the template "' + t.name + '"?')) return;
+    update({ documentTitle: t.title || doc.documentTitle, documentHtml: t.html || "" });
+  };
+
+  const commitSave = () => {
+    if (!name.trim()) return;
+    db.create("doctemplates", { name: name.trim(), title: doc.documentTitle || "Scope of Work", html: doc.documentHtml });
+    setName("");
+    setSaveOpen(false);
+    reload();
+  };
+
+  const del = (t) => {
+    if (window.confirm('Delete template "' + t.name + '"?')) { db.remove("doctemplates", t._id); reload(); }
+  };
+
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
+      {templates.length > 0 && (
+        <select
+          value=""
+          onChange={e => { if (e.target.value) insert(e.target.value); e.target.value = ""; }}
+          style={{ ...inputCls, width: "auto", minWidth: 200, flex: "0 1 auto" }}
+        >
+          <option value="">Insert a saved template…</option>
+          {templates.map(t => <option key={t._id} value={t._id}>{t.name}</option>)}
+        </select>
+      )}
+      <button
+        type="button"
+        onClick={() => { setName(doc.documentTitle || ""); setSaveOpen(true); }}
+        disabled={!canSave}
+        title={canSave ? "Save this document as a reusable template" : "Type some content first"}
+        style={{ ...btnOutline, opacity: canSave ? 1 : 0.5, cursor: canSave ? "pointer" : "not-allowed" }}
+      >
+        💾 Save as Template
+      </button>
+      {templates.length > 0 && (
+        <button type="button" onClick={() => setManageOpen(true)} style={{ ...btnOutline, fontSize: 12, padding: "7px 12px" }}>
+          Manage ({templates.length})
+        </button>
+      )}
+
+      {saveOpen && (
+        <Modal title="Save Document Template" width={440} onClose={() => setSaveOpen(false)}>
+          <Field label="Template Name" required>
+            <TextInput value={name} onChange={setName} placeholder="e.g. Standard Excavation Scope" />
+          </Field>
+          <p style={{ fontSize: 12, color: C.textMuted, margin: "0 0 16px" }}>
+            Saves the current heading and formatted document so you can reuse it on future quotes.
+          </p>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button type="button" onClick={() => setSaveOpen(false)} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+            <button type="button" onClick={commitSave} disabled={!name.trim()} style={{ ...btnSecondary, flex: 1, opacity: name.trim() ? 1 : 0.5 }}>Save Template</button>
+          </div>
+        </Modal>
+      )}
+
+      {manageOpen && (
+        <Modal title="Document Templates" width={520} onClose={() => setManageOpen(false)}>
+          {templates.length === 0
+            ? <p style={{ color: C.textMuted, fontSize: 13 }}>No templates saved yet.</p>
+            : templates.map(t => (
+              <div key={t._id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, padding: "10px 12px", border: "1px solid " + C.border, borderRadius: 8, marginBottom: 8 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>{t.name}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {t.title} — {(t.html || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 60) || "empty"}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  <button type="button" onClick={() => { insert(t._id); setManageOpen(false); }} style={{ ...btnOutline, fontSize: 12, padding: "5px 10px" }}>Insert</button>
+                  <button type="button" onClick={() => del(t)} style={{ ...btnDanger, padding: "5px 10px" }}>Delete</button>
+                </div>
+              </div>
+            ))}
+          <button type="button" onClick={() => setManageOpen(false)} style={{ ...btnOutline, width: "100%", marginTop: 8 }}>Done</button>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function LogoUpload({ logo, onChange }) {
+  const ref = useRef(null);
+  const handleFile = e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (file.size > 500 * 1024) {
+      window.alert("Please pick a logo under 500 KB — larger images can fill up browser storage.");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = ev => onChange(ev.target.result);
+    reader.readAsDataURL(file);
+  };
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <input ref={ref} type="file" accept="image/*" style={{ display: "none" }} onChange={handleFile} />
+      {logo
+        ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <img src={logo} alt="Company logo" style={{ height: 48, maxWidth: 140, objectFit: "contain", borderRadius: 6, border: "1px solid " + C.border }} />
+            <button type="button" onClick={() => ref.current.click()} style={{ ...btnOutline, fontSize: 11, padding: "3px 8px" }}>Change</button>
+            <button type="button" onClick={() => onChange(null)} style={{ ...btnDanger, padding: "3px 8px", fontSize: 11 }}>Remove</button>
+          </div>
+        )
+        : <button type="button" onClick={() => ref.current.click()} style={{ padding: "8px 14px", border: "2px dashed " + C.border, borderRadius: 8, background: C.surfaceAlt, color: C.textMuted, cursor: "pointer", fontSize: 12 }}>+ Upload Logo</button>}
+    </div>
+  );
+}
+
+function TotalsBlock({ doc, update }) {
+  const { subtotal, discountAmt, taxAmt, total } = calcTotals(doc);
+  const line = (label, value, bold) => (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid " + C.border }}>
+      <span style={{ fontSize: 13, color: bold ? C.text : C.textMuted, fontWeight: bold ? 700 : 400 }}>{label}</span>
+      <span style={{ fontSize: 13, color: bold ? C.accent : C.text, fontWeight: bold ? 700 : 500 }}>{fmt(value, doc.currency)}</span>
+    </div>
+  );
+  return (
+    <>
+      {line("Subtotal", subtotal)}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 0", borderBottom: "1px solid " + C.border }}>
+        <span style={{ fontSize: 12, color: C.textMuted, flex: 1 }}>Discount</span>
+        <input type="number" min="0" value={doc.discount} onChange={e => update({ discount: num(e.target.value) })} style={{ ...inputCls, width: 70, padding: "3px 6px", textAlign: "right" }} />
+        <select value={doc.discountType} onChange={e => update({ discountType: e.target.value })} style={{ ...inputCls, width: 58, padding: "3px 6px" }}>
+          <option value="percent">%</option>
+          <option value="fixed">$</option>
+        </select>
+        <span style={{ fontSize: 12, color: C.text, fontWeight: 500 }}>−{fmt(discountAmt, doc.currency)}</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 0", borderBottom: "1px solid " + C.border }}>
+        <input value={doc.taxLabel} onChange={e => update({ taxLabel: e.target.value })} style={{ ...inputCls, width: 58, padding: "3px 6px", fontSize: 11 }} placeholder="Tax" />
+        <select value={String(doc.taxRate)} onChange={e => update({ taxRate: num(e.target.value) })} style={{ ...inputCls, width: 74, padding: "3px 6px" }}>
+          {TAX_PRESETS.map(t => <option key={t} value={String(t)}>{t}%</option>)}
+          {!TAX_PRESETS.includes(num(doc.taxRate)) && <option value={String(doc.taxRate)}>{doc.taxRate}%</option>}
+        </select>
+        <input type="number" min="0" max="100" step="0.1" value={doc.taxRate} onChange={e => update({ taxRate: num(e.target.value) })} style={{ ...inputCls, width: 62, padding: "3px 6px" }} />
+        <span style={{ fontSize: 12, color: C.text, fontWeight: 500, marginLeft: "auto" }}>{fmt(taxAmt, doc.currency)}</span>
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0 0" }}>
+        <span style={{ fontSize: 16, fontWeight: 700 }}>Total Due</span>
+        <span style={{ fontSize: 20, fontWeight: 800, color: C.accent }}>{fmt(total, doc.currency)}</span>
+      </div>
+    </>
+  );
+}
+
+function PreviewModal({ doc, onClose }) {
+  const { subtotal, discountAmt, taxAmt, total } = calcTotals(doc);
+  const visibleItems = doc.items.filter(it => it.description || num(it.rate) || num(it.qty) !== 1);
+  const label = k => ({ fontSize: 10, fontWeight: 700, color: "#94A3B8", textTransform: "uppercase", letterSpacing: "1px", marginBottom: 4 });
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.8)", zIndex: 1000, display: "flex", alignItems: "flex-start", justifyContent: "center", overflowY: "auto", padding: "40px 16px" }}>
+      <div style={{ width: "100%", maxWidth: 780 }}>
+        <div className="no-print" style={{ display: "flex", gap: 10, marginBottom: 16, justifyContent: "flex-end" }}>
+          <button type="button" onClick={() => window.print()} style={btnSecondary}>🖨 Print / Save as PDF</button>
+          <button type="button" onClick={onClose} style={{ ...btnOutline, background: "#fff" }}>Close</button>
+        </div>
+        <div id="print-area" style={{ background: "#fff", borderRadius: 12, padding: "48px 52px", boxShadow: "0 20px 60px rgba(0,0,0,0.2)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 40, gap: 24 }}>
+            <div>
+              {doc.from.logo && <img src={doc.from.logo} alt="Logo" style={{ height: 60, maxWidth: 180, objectFit: "contain", marginBottom: 12 }} />}
+              <div style={{ fontWeight: 700, fontSize: 16, color: "#0F172A" }}>{doc.from.name || "Your Business"}</div>
+              <div style={{ fontSize: 12, color: "#64748B", lineHeight: 1.7, whiteSpace: "pre-line" }}>
+                {[doc.from.email, doc.from.phone, doc.from.address].filter(Boolean).join("\n")}
+              </div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 30, fontWeight: 900, color: "#0F172A", letterSpacing: "-1px", marginBottom: 6 }}>
+                {doc.status === "Quote" || doc.status === "Draft" ? "QUOTE" : "INVOICE"}
+              </div>
+              <div style={{ fontSize: 13, color: "#64748B", marginBottom: 6 }}>{doc.quoteId}</div>
+              <StatusBadge status={doc.status} />
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 32, marginBottom: 36, padding: "20px 24px", background: "#F8FAFC", borderRadius: 10, flexWrap: "wrap" }}>
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <div style={label()}>Bill To</div>
+              <div style={{ fontWeight: 700, fontSize: 14, color: "#0F172A" }}>{doc.to.name || "—"}</div>
+              <div style={{ fontSize: 12, color: "#64748B", lineHeight: 1.7, whiteSpace: "pre-line" }}>
+                {[doc.to.email, doc.to.phone, doc.to.address].filter(Boolean).join("\n")}
+              </div>
+            </div>
+            <div style={{ minWidth: 150 }}>
+              {doc.issueDate && <div style={{ marginBottom: 8 }}><div style={label()}>Issue Date</div><div style={{ fontSize: 13, color: "#0F172A", fontWeight: 600 }}>{doc.issueDate}</div></div>}
+              {doc.dueDate && <div style={{ marginBottom: 8 }}><div style={label()}>Due Date</div><div style={{ fontSize: 13, color: "#0F172A", fontWeight: 600 }}>{doc.dueDate}</div></div>}
+              {doc.jobReference && <div><div style={label()}>Job Ref</div><div style={{ fontSize: 13, color: "#0F172A", fontWeight: 600 }}>{doc.jobReference}</div></div>}
+            </div>
+          </div>
+
+          <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 28, fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: "#0F172A" }}>
+                {["Description", "Unit", "Qty", "Rate", "Amount"].map((h, i) => (
+                  <th key={h} style={{ padding: "10px 12px", color: "#E2E8F0", fontWeight: 600, fontSize: 11, textAlign: i >= 2 ? "right" : "left", textTransform: "uppercase", letterSpacing: "0.5px" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {visibleItems.length === 0 && (
+                <tr><td colSpan={5} style={{ padding: "16px 12px", color: "#94A3B8", textAlign: "center" }}>No line items</td></tr>
+              )}
+              {visibleItems.map((it, i) => (
+                <tr key={it.id} style={{ background: i % 2 === 0 ? "#fff" : "#F8FAFC" }}>
+                  <td style={{ padding: "10px 12px" }}>{it.description}</td>
+                  <td style={{ padding: "10px 12px", color: "#64748B" }}>{it.unit}</td>
+                  <td style={{ padding: "10px 12px", textAlign: "right" }}>{num(it.qty)}</td>
+                  <td style={{ padding: "10px 12px", textAlign: "right" }}>{fmt(it.rate, doc.currency)}</td>
+                  <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 600 }}>{fmt(num(it.qty) * num(it.rate), doc.currency)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 28 }}>
+            <div style={{ width: 270 }}>
+              {[
+                ["Subtotal", subtotal],
+                discountAmt > 0 && ["Discount", -discountAmt],
+                num(doc.taxRate) > 0 && [(doc.taxLabel || "Tax") + " (" + doc.taxRate + "%)", taxAmt],
+              ].filter(Boolean).map(([l, v]) => (
+                <div key={l} style={{ display: "flex", justifyContent: "space-between", padding: "5px 0", fontSize: 13, color: "#64748B", borderBottom: "1px solid #F1F5F9" }}>
+                  <span>{l}</span><span style={{ color: "#1E293B" }}>{fmt(v, doc.currency)}</span>
+                </div>
+              ))}
+              <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0 0" }}>
+                <span style={{ fontSize: 15, fontWeight: 700, color: "#0F172A" }}>Total Due</span>
+                <span style={{ fontSize: 20, fontWeight: 800, color: C.accent }}>{fmt(total, doc.currency)}</span>
+              </div>
+            </div>
+          </div>
+
+          {doc.documentEnabled && hasRichContent(doc.documentHtml) && (
+            <div style={{ paddingTop: 24, marginBottom: 8, borderTop: "1px solid #E2E8F0" }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: "#0F172A", marginBottom: 12 }}>{doc.documentTitle || "Scope of Work"}</div>
+              <div className="rte-print" style={{ fontSize: 13, color: "#334155", lineHeight: 1.7 }} dangerouslySetInnerHTML={{ __html: doc.documentHtml }} />
+            </div>
+          )}
+
+          {(doc.notes || doc.terms) && (
+            <div style={{ display: "flex", gap: 24, paddingTop: 20, borderTop: "1px solid #E2E8F0", flexWrap: "wrap" }}>
+              {doc.notes && <div style={{ flex: 1, minWidth: 200 }}><div style={label()}>Notes</div><div style={{ fontSize: 12, color: "#64748B", lineHeight: 1.7, whiteSpace: "pre-line" }}>{doc.notes}</div></div>}
+              {doc.terms && <div style={{ flex: 1, minWidth: 200 }}><div style={label()}>Terms &amp; Conditions</div><div style={{ fontSize: 12, color: "#64748B", lineHeight: 1.7, whiteSpace: "pre-line" }}>{doc.terms}</div></div>}
+            </div>
+          )}
+          <div style={{ marginTop: 32, textAlign: "center", fontSize: 11, color: "#CBD5E1" }}>Generated with BuildMyBill</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function QuoteEditor({ docId, onClose }) {
+  const { company } = useCompany();
+  const [doc, setDoc] = useState(() => (docId && db.getById("quotes", docId)) || defaultDoc(company));
+  const [savedId, setSavedId] = useState(docId || null);
+  const [preview, setPreview] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const clients = useMemo(() => db.getAll("clients").items, []);
+  const jobs = useMemo(() => db.getAll("jobs").items, []);
+
+  const update = patch => setDoc(d => ({ ...d, ...patch }));
+  const updateFrom = patch => setDoc(d => ({ ...d, from: { ...d.from, ...patch } }));
+  const updateTo = patch => setDoc(d => ({ ...d, to: { ...d.to, ...patch } }));
+  const updateItems = items => setDoc(d => ({ ...d, items }));
+  const updateItem = (id, field, val) => setDoc(d => ({ ...d, items: d.items.map(it => (it.id === id ? { ...it, [field]: val } : it)) }));
+
+  const totals = calcTotals(doc);
+
+  const handleSave = () => {
+    const toSave = { ...doc, totalAmount: totals.total, clientReference: doc.to.name };
+    if (savedId) {
+      db.update("quotes", { ...toSave, _id: savedId });
+    } else {
+      const rec = db.create("quotes", toSave);
+      setSavedId(rec._id);
+    }
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const pickClient = (name) => {
+    const c = clients.find(x => x.clientName === name);
+    if (!c) { updateTo({ name }); return; }
+    updateTo({ name: c.clientName, email: c.emailAddress || "", phone: c.phoneNumber || "", address: c.billingAddress || "" });
+  };
+
+  const sectionTitle = t => (
+    <div style={{ fontSize: 12, fontWeight: 700, color: C.accent, marginBottom: 12, paddingBottom: 6, borderBottom: "2px solid " + C.accent, textTransform: "uppercase", letterSpacing: "0.5px" }}>{t}</div>
+  );
+
+  if (preview) return <PreviewModal doc={doc} onClose={() => setPreview(false)} />;
+
+  return (
+    <div style={{ margin: "-28px -32px", background: C.bg, minHeight: "100vh" }}>
+      <div style={{ position: "sticky", top: 0, zIndex: 50, background: C.surface, borderBottom: "1px solid " + C.border, padding: "12px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          {onClose && <button type="button" onClick={onClose} style={{ ...btnOutline, fontSize: 12, padding: "5px 12px" }}>← Back</button>}
+          <input value={doc.quoteId} onChange={e => update({ quoteId: e.target.value })} style={{ ...inputCls, width: 160, fontWeight: 700, fontSize: 15, border: "none", borderBottom: "2px solid " + C.border, borderRadius: 0 }} />
+          <Select value={doc.status} onChange={v => update({ status: v })} options={QUOTE_STATUSES} style={{ width: 120 }} />
+          <Select value={doc.currency} onChange={v => update({ currency: v })} options={CURRENCIES} style={{ width: 84 }} />
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          {saved && <span style={{ color: C.green, fontSize: 13, fontWeight: 600 }}>✓ Saved</span>}
+          <span style={{ fontSize: 16, fontWeight: 800, color: C.accent }}>{fmt(totals.total, doc.currency)}</span>
+          <button type="button" onClick={handleSave} style={btnSecondary}>Save</button>
+          <button type="button" onClick={() => setPreview(true)} style={btnPrimary}>Preview &amp; Print</button>
+        </div>
+      </div>
+
+      <div style={{ padding: 24, maxWidth: 980, margin: "0 auto" }}>
+        <div className="grid-3" style={{ marginBottom: 20 }}>
+          <Field label="Issue Date"><input type="date" value={doc.issueDate} onChange={e => update({ issueDate: e.target.value })} style={inputCls} /></Field>
+          <Field label="Due Date"><input type="date" value={doc.dueDate} onChange={e => update({ dueDate: e.target.value })} style={inputCls} /></Field>
+          <Field label="Expiry Date"><input type="date" value={doc.expirationDate} onChange={e => update({ expirationDate: e.target.value })} style={inputCls} /></Field>
+        </div>
+
+        <div className="grid-2" style={{ marginBottom: 20 }}>
+          <div style={{ ...card, marginBottom: 0 }}>
+            {sectionTitle("From (Your Business)")}
+            <LogoUpload logo={doc.from.logo} onChange={v => updateFrom({ logo: v })} />
+            <Field label="Business Name"><TextInput value={doc.from.name} onChange={v => updateFrom({ name: v })} placeholder="Your Business" /></Field>
+            <Field label="Email"><TextInput value={doc.from.email} onChange={v => updateFrom({ email: v })} placeholder="you@business.com" /></Field>
+            <Field label="Phone"><TextInput value={doc.from.phone} onChange={v => updateFrom({ phone: v })} placeholder="+1 555 000 0000" /></Field>
+            <Field label="Address"><TextInput value={doc.from.address} onChange={v => updateFrom({ address: v })} placeholder="123 Main St, City" rows={2} /></Field>
+          </div>
+          <div style={{ ...card, marginBottom: 0 }}>
+            {sectionTitle("Bill To")}
+            {clients.length > 0 && (
+              <Field label="Load Saved Client">
+                <select value="" onChange={e => e.target.value && pickClient(e.target.value)} style={inputCls}>
+                  <option value="">Select a client…</option>
+                  {clients.map(c => <option key={c._id} value={c.clientName}>{c.clientName}</option>)}
+                </select>
+              </Field>
+            )}
+            <Field label="Client Name"><TextInput value={doc.to.name} onChange={v => updateTo({ name: v })} placeholder="Client Name" /></Field>
+            <Field label="Email"><TextInput value={doc.to.email} onChange={v => updateTo({ email: v })} placeholder="client@email.com" /></Field>
+            <Field label="Phone"><TextInput value={doc.to.phone} onChange={v => updateTo({ phone: v })} placeholder="+1 555 000 0000" /></Field>
+            <Field label="Address"><TextInput value={doc.to.address} onChange={v => updateTo({ address: v })} placeholder="Client address" rows={2} /></Field>
+          </div>
+        </div>
+
+        <div style={{ ...card, marginBottom: 20 }}>
+          <Field label="Job / Project Reference">
+            {jobs.length > 0
+              ? (
+                <select value={doc.jobReference} onChange={e => update({ jobReference: e.target.value })} style={inputCls}>
+                  <option value="">No job selected</option>
+                  {jobs.map(j => <option key={j._id} value={j.jobTitle}>{j.jobTitle}</option>)}
+                </select>
+              )
+              : <TextInput value={doc.jobReference} onChange={v => update({ jobReference: v })} placeholder="Job name, number, or ID" />}
+          </Field>
+        </div>
+
+        <div style={{ ...card, marginBottom: 20 }}>
+          {sectionTitle("Line Items")}
+          <div className="scroll-x">
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 620 }}>
+              <thead>
+                <tr style={{ background: C.surfaceAlt }}>
+                  {["Description", "Unit", "Qty", "Rate", "Amount", "Tax?", ""].map((h, i) => (
+                    <th key={i} style={{ padding: "8px 10px", textAlign: i >= 2 && i <= 4 ? "right" : "left", fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", borderBottom: "2px solid " + C.border }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {doc.items.map((item, i) => (
+                  <tr key={item.id} style={{ background: i % 2 === 0 ? C.surface : "#FAFAFA" }}>
+                    <td style={{ padding: "6px 8px" }}>
+                      <input value={item.description} onChange={e => updateItem(item.id, "description", e.target.value)} placeholder="Description…" style={{ ...inputCls, border: "none", background: "transparent" }} />
+                    </td>
+                    <td style={{ padding: "6px 4px" }}>
+                      <input value={item.unit} onChange={e => updateItem(item.id, "unit", e.target.value)} placeholder="hrs" style={{ ...inputCls, width: 64, border: "none", background: "transparent", textAlign: "center" }} />
+                    </td>
+                    <td style={{ padding: "6px 4px" }}>
+                      <input type="number" min="0" step="any" value={item.qty} onChange={e => updateItem(item.id, "qty", num(e.target.value))} style={{ ...inputCls, width: 72, border: "none", background: "transparent", textAlign: "right" }} />
+                    </td>
+                    <td style={{ padding: "6px 4px" }}>
+                      <input type="number" min="0" step="0.01" value={item.rate} onChange={e => updateItem(item.id, "rate", num(e.target.value))} style={{ ...inputCls, width: 100, border: "none", background: "transparent", textAlign: "right" }} />
+                    </td>
+                    <td style={{ padding: "6px 8px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{fmt(num(item.qty) * num(item.rate), doc.currency)}</td>
+                    <td style={{ padding: "6px 4px", textAlign: "center" }}>
+                      <input type="checkbox" checked={!!item.taxable} onChange={e => updateItem(item.id, "taxable", e.target.checked)} style={{ accentColor: C.accent, cursor: "pointer" }} />
+                    </td>
+                    <td style={{ padding: "6px 4px", textAlign: "center" }}>
+                      {doc.items.length > 1 && <button type="button" onClick={() => updateItems(doc.items.filter(it => it.id !== item.id))} style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 16 }}>×</button>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <button type="button" onClick={() => updateItems([...doc.items, emptyItem()])} style={{ marginTop: 12, padding: "7px 14px", background: "#EEF2FF", color: C.accent, border: "1px dashed #A5B4FC", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>+ Add Line Item</button>
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 20 }}>
+          <div style={{ width: 360, maxWidth: "100%", background: C.surfaceAlt, borderRadius: 12, padding: "16px 20px", border: "1px solid " + C.border }}>
+            <TotalsBlock doc={doc} update={update} />
+          </div>
+        </div>
+
+        {/* Optional Word-style scope document */}
+        <div style={{ ...card, marginBottom: 20 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>Detailed Document <span style={{ fontSize: 11, fontWeight: 600, color: C.textMuted }}>(optional)</span></div>
+              <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>Add a full write-up — scope of work, specifications, exclusions — with formatting, like a Word doc. Prints with the quote.</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => update({ documentEnabled: !doc.documentEnabled })}
+              style={{ ...(doc.documentEnabled ? btnOutline : btnSecondary), whiteSpace: "nowrap" }}
+            >
+              {doc.documentEnabled ? "Remove Document" : "+ Add Document"}
+            </button>
+          </div>
+
+          {doc.documentEnabled && (
+            <div style={{ marginTop: 16 }}>
+              <Field label="Document Heading">
+                <TextInput value={doc.documentTitle} onChange={v => update({ documentTitle: v })} placeholder="Scope of Work" />
+              </Field>
+              <DocumentTemplates doc={doc} update={update} />
+              <RichTextEditor
+                html={doc.documentHtml}
+                onChange={v => update({ documentHtml: v })}
+                placeholder="Type the full details here. Use the toolbar for headings, bold, lists, and alignment…"
+              />
+            </div>
+          )}
+        </div>
+
+        <div className="grid-2">
+          <div style={card}>
+            {sectionTitle("Notes")}
+            <TextInput value={doc.notes} onChange={v => update({ notes: v })} placeholder="Payment instructions, thank-you note…" rows={4} />
+          </div>
+          <div style={card}>
+            {sectionTitle("Terms & Conditions")}
+            <TextInput value={doc.terms} onChange={v => update({ terms: v })} placeholder="Payment terms, late fees…" rows={4} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function QuotesPage({ startNew }) {
+  const { navigate } = useRouter();
+  const [quotes, setQuotes] = useState(() => db.getAll("quotes").items);
+  const [editing, setEditing] = useState(startNew ? "new" : null);
+
+  const reload = () => setQuotes(db.getAll("quotes").items);
+  const close = () => { setEditing(null); reload(); if (startNew) navigate("quotes"); };
+  const del = q => { if (window.confirm("Delete " + (q.quoteId || "this quote") + "?")) { db.remove("quotes", q._id); reload(); } };
+
+  if (editing !== null) return <QuoteEditor docId={editing === "new" ? null : editing} onClose={close} />;
+
+  const outstanding = quotes
+    .filter(q => q.status === "Invoice" || q.status === "Quote")
+    .reduce((s, q) => s + num(q.totalAmount), 0);
+  const paid = quotes.filter(q => q.status === "Paid").reduce((s, q) => s + num(q.totalAmount), 0);
+
+  return (
+    <div>
+      <PageHeader
+        title="Quotes & Invoices"
+        subtitle="Create and manage quotes and invoices for your clients"
+        action={<button type="button" onClick={() => setEditing("new")} style={btnSecondary}>+ New Quote</button>}
+      />
+      {quotes.length === 0
+        ? <EmptyState icon="📄" title="No quotes yet" subtitle="Create your first quote to get started." action={<button type="button" onClick={() => setEditing("new")} style={btnSecondary}>Create Quote</button>} />
+        : (
+          <>
+            <div className="grid-3" style={{ marginBottom: 20 }}>
+              <StatCard label="Documents" value={quotes.length} icon="📄" />
+              <StatCard label="Outstanding" value={fmt(outstanding)} icon="⏳" />
+              <StatCard label="Paid" value={fmt(paid)} icon="✅" />
+            </div>
+            <div style={card}>
+              <DataTable
+                columns={[
+                  { key: "quoteId", label: "ID" },
+                  { key: "status", label: "Status", render: v => <StatusBadge status={v} /> },
+                  { key: "clientReference", label: "Client" },
+                  { key: "jobReference", label: "Job Ref" },
+                  { key: "issueDate", label: "Date" },
+                  { key: "totalAmount", label: "Total", render: (v, row) => fmt(v, row.currency) },
+                ]}
+                rows={quotes}
+                onView={q => setEditing(q._id)}
+                onDelete={del}
+              />
+            </div>
+          </>
+        )}
+    </div>
+  );
+}
+
+/* ─── Time tracking ──────────────────────────────────────────────────────── */
+const newTimeRow = () => ({
+  id: genId(), jobLocation: "", contract: "", workDone: "",
+  startTime: "08:00", endTime: "17:00", equipment: "", notes: "", mileage: "",
+});
+
+function useEmployeeOptions() {
+  const { user } = useAuth();
+  const employees = useMemo(() => db.getAll("employees").items, []);
+  const names = employees.map(e => e.fullName).filter(Boolean);
+  const me = user?.name || user?.email || "Unknown";
+  return names.includes(me) ? names : [me, ...names];
+}
+
+function TimeEntryPage() {
+  const { user } = useAuth();
+  const employeeOptions = useEmployeeOptions();
+  const [employeeName, setEmployeeName] = useState(employeeOptions[0] || "Unknown");
+  const [date, setDate] = useState(today());
+  const [rows, setRows] = useState([newTimeRow()]);
+  const [message, setMessage] = useState("");
+  const [entries, setEntries] = useState(() => db.getAll("timeentries", {}, { limit: 20 }).items);
+  const jobs = useMemo(() => db.getAll("jobs").items, []);
+  const equipment = useMemo(() => db.getAll("equipment").items, []);
+
+  const updRow = (id, k, v) => setRows(r => r.map(x => (x.id === id ? { ...x, [k]: v } : x)));
+  const delRow = id => setRows(r => r.filter(x => x.id !== id));
+  const totalHours = rows.reduce((t, r) => t + hoursBetween(r.startTime, r.endTime), 0);
+
+  const refresh = () => setEntries(db.getAll("timeentries", {}, { limit: 20 }).items);
+
+  const submit = () => {
+    const valid = rows.filter(r => r.jobLocation || r.workDone);
+    if (valid.length === 0) { window.alert("Add a job or a description of the work before submitting."); return; }
+    valid.forEach(r => {
+      db.create("timeentries", {
+        employeeName,
+        jobName: r.jobLocation,
+        entryDate: date,
+        hoursWorked: hoursBetween(r.startTime, r.endTime),
+        startTime: r.startTime,
+        endTime: r.endTime,
+        workDescription: r.workDone,
+        notes: r.notes,
+        equipmentUsed: r.equipment,
+        mileageDriven: num(r.mileage),
+      });
+    });
+    setRows([newTimeRow()]);
+    refresh();
+    setMessage(valid.length + " time " + (valid.length === 1 ? "entry" : "entries") + " submitted!");
+    setTimeout(() => setMessage(""), 3000);
+  };
+
+  return (
+    <div>
+      <PageHeader title="Time Tracking" subtitle="Log your daily work hours and activities" />
+      <Toast message={message} />
+
+      <div style={{ ...card, marginBottom: 20 }}>
+        <div className="row-wrap" style={{ marginBottom: 16 }}>
+          <Field label="Employee" style={{ marginBottom: 0 }}>
+            <Select value={employeeName} onChange={setEmployeeName} options={employeeOptions} style={{ width: 200 }} />
+          </Field>
+          <Field label="Date" style={{ marginBottom: 0 }}>
+            <input type="date" value={date} onChange={e => setDate(e.target.value)} style={inputCls} />
+          </Field>
+          <div style={{ fontSize: 14, color: C.textMuted, paddingBottom: 8 }}>
+            Total: <strong style={{ color: C.accent }}>{totalHours.toFixed(2)} hrs</strong>
+          </div>
+          <div style={{ fontSize: 14, color: C.textMuted, paddingBottom: 8 }}>{rows.length}/10 rows</div>
+        </div>
+
+        <div className="scroll-x">
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 860 }}>
+            <thead>
+              <tr style={{ background: C.surfaceAlt }}>
+                {["Job / Location", "Work Done", "Start", "End", "Hrs", "Equipment", "Miles", "Notes", ""].map(h => (
+                  <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontWeight: 700, fontSize: 11, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", borderBottom: "2px solid " + C.border }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={r.id} style={{ background: i % 2 === 0 ? C.surface : "#FAFAFA", borderBottom: "1px solid " + C.border }}>
+                  <td style={{ padding: "6px 8px" }}>
+                    {jobs.length > 0
+                      ? (
+                        <select value={r.jobLocation} onChange={e => updRow(r.id, "jobLocation", e.target.value)} style={{ ...inputCls, minWidth: 140 }}>
+                          <option value="">Select job…</option>
+                          {jobs.map(j => <option key={j._id} value={j.jobTitle}>{j.jobTitle}</option>)}
+                        </select>
+                      )
+                      : <input value={r.jobLocation} onChange={e => updRow(r.id, "jobLocation", e.target.value)} placeholder="Site A" style={{ ...inputCls, minWidth: 130 }} />}
+                  </td>
+                  <td style={{ padding: "6px 8px" }}><input value={r.workDone} onChange={e => updRow(r.id, "workDone", e.target.value)} placeholder="Excavation…" style={{ ...inputCls, minWidth: 150 }} /></td>
+                  <td style={{ padding: "6px 4px" }}><input type="time" value={r.startTime} onChange={e => updRow(r.id, "startTime", e.target.value)} style={{ ...inputCls, width: 110 }} /></td>
+                  <td style={{ padding: "6px 4px" }}><input type="time" value={r.endTime} onChange={e => updRow(r.id, "endTime", e.target.value)} style={{ ...inputCls, width: 110 }} /></td>
+                  <td style={{ padding: "6px 8px", fontWeight: 700, color: C.accent, whiteSpace: "nowrap" }}>{hoursBetween(r.startTime, r.endTime).toFixed(1)}h</td>
+                  <td style={{ padding: "6px 4px" }}>
+                    {equipment.length > 0
+                      ? (
+                        <select value={r.equipment} onChange={e => updRow(r.id, "equipment", e.target.value)} style={{ ...inputCls, minWidth: 120 }}>
+                          <option value="">None</option>
+                          {equipment.map(eq => <option key={eq._id} value={eq.equipmentName}>{eq.equipmentName}</option>)}
+                        </select>
+                      )
+                      : <input value={r.equipment} onChange={e => updRow(r.id, "equipment", e.target.value)} placeholder="None" style={{ ...inputCls, width: 110 }} />}
+                  </td>
+                  <td style={{ padding: "6px 4px" }}><input type="number" min="0" value={r.mileage} onChange={e => updRow(r.id, "mileage", e.target.value)} placeholder="0" style={{ ...inputCls, width: 70 }} /></td>
+                  <td style={{ padding: "6px 4px" }}><input value={r.notes} onChange={e => updRow(r.id, "notes", e.target.value)} placeholder="Notes…" style={{ ...inputCls, minWidth: 110 }} /></td>
+                  <td style={{ padding: "6px 4px" }}>
+                    {rows.length > 1 && <button type="button" onClick={() => delRow(r.id)} style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 16 }}>×</button>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ display: "flex", gap: 12, marginTop: 16, flexWrap: "wrap" }}>
+          {rows.length < 10 && <button type="button" onClick={() => setRows(r => [...r, newTimeRow()])} style={btnOutline}>+ Add Row</button>}
+          <button type="button" onClick={submit} style={btnSecondary}>Submit Time Entries</button>
+        </div>
+      </div>
+
+      <div style={card}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>Recent Entries</h3>
+        <DataTable
+          columns={[
+            { key: "entryDate", label: "Date" },
+            { key: "employeeName", label: "Employee" },
+            { key: "jobName", label: "Job" },
+            { key: "hoursWorked", label: "Hours", render: v => num(v).toFixed(2) + "h" },
+            { key: "equipmentUsed", label: "Equipment" },
+            { key: "workDescription", label: "Work" },
+          ]}
+          rows={entries}
+          emptyMessage="No entries yet."
+          onDelete={e => { if (window.confirm("Delete this entry?")) { db.remove("timeentries", e._id); refresh(); } }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function DailyLogPage() {
+  const employeeOptions = useEmployeeOptions();
+  const [employeeName, setEmployeeName] = useState(employeeOptions[0] || "Unknown");
+  const [entryDate, setEntryDate] = useState(today());
+  const [rows, setRows] = useState([newTimeRow()]);
+  const [message, setMessage] = useState("");
+  const jobs = useMemo(() => db.getAll("jobs").items, []);
+  const contracts = useMemo(() => db.getAll("contracts").items, []);
+  const equipment = useMemo(() => db.getAll("equipment").items, []);
+
+  const updRow = (id, k, v) => setRows(r => r.map(x => (x.id === id ? { ...x, [k]: v } : x)));
+  const delRow = id => setRows(r => r.filter(x => x.id !== id));
+  const totalHours = rows.reduce((t, r) => t + hoursBetween(r.startTime, r.endTime), 0);
+
+  const submit = () => {
+    const valid = rows.filter(r => r.jobLocation || r.workDone);
+    if (valid.length === 0) { window.alert("Fill in at least one row before submitting."); return; }
+    valid.forEach(r => {
+      db.create("timeentries", {
+        employeeName,
+        jobName: r.jobLocation,
+        contract: r.contract,
+        entryDate,
+        hoursWorked: hoursBetween(r.startTime, r.endTime),
+        startTime: r.startTime,
+        endTime: r.endTime,
+        workDescription: r.workDone,
+        notes: r.notes,
+        equipmentUsed: r.equipment,
+        mileageDriven: num(r.mileage),
+      });
+    });
+    setRows([newTimeRow()]);
+    setMessage("Daily log submitted — " + valid.length + " entries saved.");
+    setTimeout(() => setMessage(""), 3000);
+  };
+
+  const exportCSV = () => {
+    const rowsOut = [
+      ["Date", entryDate],
+      ["Employee", employeeName],
+      [],
+      ["Job Location", "Contract", "Work Done", "Start", "End", "Hours", "Equipment", "Miles", "Notes"],
+      ...rows.map(r => [r.jobLocation, r.contract, r.workDone, r.startTime, r.endTime, hoursBetween(r.startTime, r.endTime).toFixed(2), r.equipment, r.mileage, r.notes]),
+      [],
+      ["", "", "TOTAL HOURS", totalHours.toFixed(2)],
+    ];
+    downloadFile("daily_log_" + entryDate + ".csv", toCSV(rowsOut), "text/csv;charset=utf-8");
+  };
+
+  return (
+    <div>
+      <PageHeader title="Daily Log" subtitle="Record daily work activities, hours, and equipment usage" />
+      <Toast message={message} />
+
+      <div style={{ ...card, marginBottom: 20 }}>
+        <div className="row-wrap" style={{ marginBottom: 16 }}>
+          <Field label="Employee" style={{ marginBottom: 0 }}>
+            <Select value={employeeName} onChange={setEmployeeName} options={employeeOptions} style={{ width: 200 }} />
+          </Field>
+          <Field label="Date" style={{ marginBottom: 0 }}>
+            <input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} style={inputCls} />
+          </Field>
+          <div style={{ fontSize: 14, color: C.textMuted, paddingBottom: 8 }}>
+            Total: <strong style={{ color: C.accent }}>{totalHours.toFixed(2)} hrs</strong>
+          </div>
+          <div style={{ fontSize: 14, color: C.textMuted, paddingBottom: 8 }}>{rows.length}/30 rows</div>
+        </div>
+
+        {rows.map(r => (
+          <div key={r.id} style={{ background: C.surfaceAlt, borderRadius: 10, padding: 16, marginBottom: 10 }}>
+            <div className="grid-2" style={{ gap: 12 }}>
+              <Field label="Job Location">
+                <select value={r.jobLocation} onChange={e => updRow(r.id, "jobLocation", e.target.value)} style={inputCls}>
+                  <option value="">Select job…</option>
+                  {jobs.map(j => <option key={j._id} value={j.jobAddress || j.jobTitle}>{j.jobAddress || j.jobTitle}</option>)}
+                </select>
+              </Field>
+              <Field label="Contract">
+                <select value={r.contract} onChange={e => updRow(r.id, "contract", e.target.value)} style={inputCls}>
+                  <option value="">Select contract…</option>
+                  {contracts.map(c => <option key={c._id} value={c.contractName}>{c.contractName}</option>)}
+                </select>
+              </Field>
+            </div>
+            <div className="row-wrap" style={{ gap: 12 }}>
+              <Field label="Start Time"><input type="time" value={r.startTime} onChange={e => updRow(r.id, "startTime", e.target.value)} style={{ ...inputCls, width: 130 }} /></Field>
+              <Field label="End Time"><input type="time" value={r.endTime} onChange={e => updRow(r.id, "endTime", e.target.value)} style={{ ...inputCls, width: 130 }} /></Field>
+              <Field label="Hours">
+                <div style={{ ...inputCls, width: 90, textAlign: "center", fontWeight: 700, color: C.accent }}>{hoursBetween(r.startTime, r.endTime).toFixed(1)}h</div>
+              </Field>
+              <Field label="Equipment">
+                <select value={r.equipment} onChange={e => updRow(r.id, "equipment", e.target.value)} style={{ ...inputCls, width: 180 }}>
+                  <option value="">No equipment</option>
+                  {equipment.map(eq => <option key={eq._id} value={eq.equipmentName}>{eq.equipmentName}</option>)}
+                </select>
+              </Field>
+              <Field label="Miles Driven"><input type="number" min="0" value={r.mileage} onChange={e => updRow(r.id, "mileage", e.target.value)} placeholder="0" style={{ ...inputCls, width: 110 }} /></Field>
+            </div>
+            <div className="grid-2" style={{ gap: 12 }}>
+              <Field label="Work Done"><TextInput value={r.workDone} onChange={v => updRow(r.id, "workDone", v)} placeholder="Excavation, foundation work…" rows={2} /></Field>
+              <Field label="Notes"><TextInput value={r.notes} onChange={v => updRow(r.id, "notes", v)} placeholder="Additional notes…" rows={2} /></Field>
+            </div>
+            {rows.length > 1 && <button type="button" onClick={() => delRow(r.id)} style={{ ...btnDanger, fontSize: 11 }}>Remove Row</button>}
+          </div>
+        ))}
+
+        <div style={{ display: "flex", gap: 12, marginTop: 16, flexWrap: "wrap" }}>
+          {rows.length < 30 && <button type="button" onClick={() => setRows(r => [...r, newTimeRow()])} style={btnOutline}>+ Add Row</button>}
+          <button type="button" onClick={exportCSV} style={btnOutline}>📊 Export CSV</button>
+          <button type="button" onClick={submit} style={btnSecondary}>Submit Daily Log</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TruckLogForm({ data, onSave, onCancel }) {
+  const [form, setForm] = useState({ ...data });
+  const [error, setError] = useState("");
+  const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
+  const overall = !!(form.brakesChecked && form.lightsChecked && form.fluidsChecked);
+
+  const submit = () => {
+    if (!String(form.vehicleIdentifier || "").trim()) { setError("Vehicle ID is required."); return; }
+    if (!String(form.employeeName || "").trim()) { setError("Employee name is required."); return; }
+    onSave(form);
+  };
+
+  return (
+    <div>
+      {error && <div style={{ background: "#FEF2F2", color: "#DC2626", padding: "10px 14px", borderRadius: 8, marginBottom: 14, fontSize: 13 }}>{error}</div>}
+      <Field label="Vehicle ID / Name" required><TextInput value={form.vehicleIdentifier} onChange={v => set("vehicleIdentifier", v)} placeholder="Truck 01, Excavator A…" /></Field>
+      <Field label="Employee Name" required><TextInput value={form.employeeName} onChange={v => set("employeeName", v)} placeholder="John Doe" /></Field>
+      <Field label="Odometer Reading"><TextInput type="number" value={form.odometerReading} onChange={v => set("odometerReading", v)} placeholder="0" /></Field>
+      <div style={{ marginBottom: 12 }}>
+        <label style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, display: "block", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.5px" }}>Safety Checks</label>
+        {[
+          ["brakesChecked", "Brakes checked and operational"],
+          ["lightsChecked", "Lights checked and operational"],
+          ["fluidsChecked", "Fluid levels checked and adequate"],
+        ].map(([k, l]) => (
+          <div key={k} style={{ marginBottom: 8 }}>
+            <Checkbox checked={form[k]} onChange={v => set(k, v)} label={l} />
+          </div>
+        ))}
+      </div>
+      <Field label="Defects / Notes"><TextInput value={form.notes} onChange={v => set("notes", v)} placeholder="Anything needing attention…" rows={2} /></Field>
+      <div style={{ padding: "10px 14px", background: overall ? "#F0FDF4" : "#FEF2F2", borderRadius: 8, marginBottom: 16, textAlign: "center", fontWeight: 700, color: overall ? "#16A34A" : "#DC2626" }}>
+        Overall Status: {overall ? "PASS" : "FAIL"}
+      </div>
+      <div style={{ display: "flex", gap: 10 }}>
+        <button type="button" onClick={onCancel} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+        <button type="button" onClick={submit} style={{ ...btnSecondary, flex: 1 }}>Save</button>
+      </div>
+    </div>
+  );
+}
+
+function TruckLogBooksPage() {
+  const { user } = useAuth();
+  const [logs, setLogs] = useState(() => db.getAll("trucklogbooks").items);
+  const [modal, setModal] = useState(null);
+  const reload = () => setLogs(db.getAll("trucklogbooks").items);
+
+  const blank = () => ({
+    _id: genId(), vehicleIdentifier: "", employeeName: user?.name || "",
+    brakesChecked: false, lightsChecked: false, fluidsChecked: false,
+    odometerReading: "", notes: "",
+  });
+
+  const save = (data) => {
+    const record = {
+      ...data,
+      overallStatus: !!(data.brakesChecked && data.lightsChecked && data.fluidsChecked),
+      logDateTime: data.logDateTime || new Date().toISOString(),
+    };
+    if (modal.mode === "edit") db.update("trucklogbooks", record);
+    else db.create("trucklogbooks", record);
+    setModal(null);
+    reload();
+  };
+
+  const del = item => { if (window.confirm("Delete this log?")) { db.remove("trucklogbooks", item._id); reload(); } };
+  const openCreate = () => setModal({ mode: "create", data: blank() });
+
+  return (
+    <div>
+      <PageHeader
+        title="Vehicle Log Books"
+        subtitle="Daily morning safety checklists for vehicles and equipment"
+        action={<button type="button" onClick={openCreate} style={btnSecondary}>+ New Log</button>}
+      />
+      {logs.length === 0
+        ? <EmptyState icon="🚚" title="No vehicle logs yet" subtitle="Create daily safety checklists for your fleet." action={<button type="button" onClick={openCreate} style={btnSecondary}>Create Log</button>} />
+        : (
+          <div style={card}>
+            <DataTable
+              columns={[
+                { key: "vehicleIdentifier", label: "Vehicle" },
+                { key: "employeeName", label: "Employee" },
+                { key: "logDateTime", label: "Date/Time", render: v => (v ? new Date(v).toLocaleString() : "—") },
+                { key: "odometerReading", label: "Odometer", render: v => (v ? num(v).toLocaleString() + " mi" : "—") },
+                { key: "brakesChecked", label: "Brakes", render: v => (v ? "✅" : "❌") },
+                { key: "lightsChecked", label: "Lights", render: v => (v ? "✅" : "❌") },
+                { key: "fluidsChecked", label: "Fluids", render: v => (v ? "✅" : "❌") },
+                { key: "overallStatus", label: "Status", render: v => <PassFailBadge value={v} /> },
+              ]}
+              rows={logs}
+              onEdit={item => setModal({ mode: "edit", data: { ...item } })}
+              onDelete={del}
+            />
+          </div>
+        )}
+      {modal && (
+        <Modal title={modal.mode === "create" ? "New Vehicle Log" : "Edit Vehicle Log"} onClose={() => setModal(null)}>
+          <TruckLogForm data={modal.data} onSave={save} onCancel={() => setModal(null)} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function EmployeeLogsPage() {
+  const [entries] = useState(() => db.getAll("timeentries", {}, { limit: 1000 }).items);
+  const employees = useMemo(() => db.getAll("employees").items, []);
+  const [selected, setSelected] = useState("");
+
+  const filtered = entries.filter(e => !selected || e.employeeName === selected);
+  const rateFor = name => {
+    const emp = employees.find(x => x.fullName === name);
+    return emp ? num(emp.hourlyRate) : 0;
+  };
+
+  const byEmployee = filtered.reduce((acc, e) => {
+    const n = e.employeeName || "Unknown";
+    if (!acc[n]) acc[n] = { hours: 0, miles: 0, entries: 0 };
+    acc[n].hours += num(e.hoursWorked);
+    acc[n].miles += num(e.mileageDriven);
+    acc[n].entries += 1;
+    return acc;
+  }, {});
+
+  return (
+    <div>
+      <PageHeader title="Work Logs" subtitle="Per-employee productivity and hours tracked" />
+      <div style={{ ...card, marginBottom: 20 }}>
+        <Field label="Filter by Employee" style={{ marginBottom: 0 }}>
+          <select value={selected} onChange={e => setSelected(e.target.value)} style={{ ...inputCls, maxWidth: 240 }}>
+            <option value="">All Employees</option>
+            {employees.map(emp => <option key={emp._id} value={emp.fullName}>{emp.fullName}</option>)}
+          </select>
+        </Field>
+      </div>
+
+      <div className="grid-auto" style={{ marginBottom: 24 }}>
+        {Object.entries(byEmployee).map(([name, stats]) => (
+          <div key={name} style={{ ...card, marginBottom: 0 }}>
+            <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>{name}</div>
+            {[
+              ["Hours Worked", stats.hours.toFixed(2) + "h"],
+              ["Miles Driven", stats.miles.toFixed(0) + " mi"],
+              ["Log Entries", stats.entries],
+              ["Labour Cost", fmt(stats.hours * rateFor(name))],
+            ].map(([l, v]) => (
+              <div key={l} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid " + C.border }}>
+                <span style={{ fontSize: 12, color: C.textMuted }}>{l}</span>
+                <span style={{ fontSize: 13, fontWeight: 700, color: C.accent }}>{v}</span>
+              </div>
+            ))}
+          </div>
+        ))}
+        {Object.keys(byEmployee).length === 0 && <p style={{ color: C.textMuted, gridColumn: "1/-1" }}>No time entries found.</p>}
+      </div>
+
+      <div style={card}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>All Time Entries</h3>
+        <DataTable
+          columns={[
+            { key: "entryDate", label: "Date" },
+            { key: "employeeName", label: "Employee" },
+            { key: "jobName", label: "Job" },
+            { key: "hoursWorked", label: "Hours", render: v => num(v).toFixed(2) + "h" },
+            { key: "mileageDriven", label: "Miles", render: v => (num(v) ? num(v) + " mi" : "—") },
+            { key: "equipmentUsed", label: "Equipment" },
+          ]}
+          rows={filtered}
+          emptyMessage="No time entries yet."
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ─── Dashboard ──────────────────────────────────────────────────────────── */
+function Dashboard() {
+  const { navigate } = useRouter();
+  const { user } = useAuth();
+  const { company } = useCompany();
+
+  const stats = [
+    { label: "Jobs", col: "jobs", icon: "🏗️", page: "jobs" },
+    { label: "Clients", col: "clients", icon: "👥", page: "clients" },
+    { label: "Quotes/Invoices", col: "quotes", icon: "📄", page: "quotes" },
+    { label: "Employees", col: "employees", icon: "👤", page: "employees" },
+    { label: "Equipment", col: "equipment", icon: "🚛", page: "equipment" },
+    { label: "Time Entries", col: "timeentries", icon: "⏱️", page: "time-entry" },
+  ].map(s => ({ ...s, count: db.getAll(s.col).total }));
+
+  const quotes = db.getAll("quotes", {}, { limit: 5 }).items;
+  const jobs = db.getAll("jobs", {}, { limit: 5 }).items;
+  const allQuotes = db.getAll("quotes").items;
+  const outstanding = allQuotes.filter(q => q.status === "Invoice" || q.status === "Quote").reduce((s, q) => s + num(q.totalAmount), 0);
+  const hoursThisMonth = db.getAll("timeentries", {}, { limit: 1000 }).items
+    .filter(e => (e.entryDate || "").slice(0, 7) === today().slice(0, 7))
+    .reduce((s, e) => s + num(e.hoursWorked), 0);
+
+  return (
+    <div>
+      <PageHeader title={"Welcome back, " + (user?.name || "there") + " 👋"} subtitle={company?.companyName} />
+
+      <div className="grid-2" style={{ marginBottom: 20 }}>
+        <StatCard label="Outstanding (quotes + invoices)" value={fmt(outstanding)} icon="💰" onClick={() => navigate("quotes")} />
+        <StatCard label="Hours logged this month" value={hoursThisMonth.toFixed(1) + "h"} icon="⏱️" onClick={() => navigate("employee-logs")} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 16, marginBottom: 28 }}>
+        {stats.map(s => <StatCard key={s.label} label={s.label} value={s.count} icon={s.icon} onClick={() => navigate(s.page)} />)}
+      </div>
+
+      <div className="grid-2">
+        <div style={card}>
+          <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            Recent Quotes
+            <button type="button" onClick={() => navigate("quotes")} style={{ ...btnOutline, fontSize: 11, padding: "3px 10px" }}>View all</button>
+          </h3>
+          {quotes.length === 0
+            ? <p style={{ color: C.textMuted, fontSize: 13 }}>No quotes yet.</p>
+            : quotes.map(q => (
+              <div key={q._id} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid " + C.border, alignItems: "center", gap: 8 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{q.quoteId || "Quote"}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted }}>{q.clientReference || "—"} · {fmt(q.totalAmount, q.currency)}</div>
+                </div>
+                <StatusBadge status={q.status} />
+              </div>
+            ))}
+        </div>
+
+        <div style={card}>
+          <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            Recent Jobs
+            <button type="button" onClick={() => navigate("jobs")} style={{ ...btnOutline, fontSize: 11, padding: "3px 10px" }}>View all</button>
+          </h3>
+          {jobs.length === 0
+            ? <p style={{ color: C.textMuted, fontSize: 13 }}>No jobs yet.</p>
+            : jobs.map(j => (
+              <div key={j._id} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid " + C.border, alignItems: "center", gap: 8 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{j.jobTitle || "Job"}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted }}>{j.clientName || "—"}</div>
+                </div>
+                <StatusBadge status={j.jobStatus} />
+              </div>
+            ))}
+        </div>
+      </div>
+
+      <div style={card}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>Quick Actions</h3>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          {[
+            { label: "New Quote", page: "quote-editor", icon: "📄" },
+            { label: "New Job", page: "jobs", icon: "🏗️" },
+            { label: "Log Time", page: "time-entry", icon: "⏱️" },
+            { label: "Add Client", page: "clients", icon: "👥" },
+            { label: "Vehicle Check", page: "truck-logs", icon: "🚚" },
+          ].map(a => (
+            <button type="button" key={a.label} onClick={() => navigate(a.page)} style={{ ...btnOutline, display: "flex", alignItems: "center", gap: 6 }}>
+              {a.icon} {a.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Billing & reports ──────────────────────────────────────────────────── */
+function BillingPage() {
+  const entries = useMemo(() => db.getAll("timeentries", {}, { limit: 1000 }).items, []);
+  const employees = useMemo(() => db.getAll("employees").items, []);
+  const [filters, setFilters] = useState({ startDate: "", endDate: "", employee: "", job: "" });
+
+  const rateFor = name => {
+    const emp = employees.find(x => x.fullName === name);
+    return emp ? num(emp.hourlyRate) : 0;
+  };
+
+  const filtered = entries.filter(e => {
+    if (filters.startDate && (e.entryDate || "") < filters.startDate) return false;
+    if (filters.endDate && (e.entryDate || "") > filters.endDate) return false;
+    if (filters.employee && e.employeeName !== filters.employee) return false;
+    if (filters.job && !String(e.jobName || "").toLowerCase().includes(filters.job.toLowerCase())) return false;
+    return true;
+  });
+
+  const totalHours = filtered.reduce((s, e) => s + num(e.hoursWorked), 0);
+  const totalCost = filtered.reduce((s, e) => s + num(e.hoursWorked) * rateFor(e.employeeName), 0);
+  const totalMiles = filtered.reduce((s, e) => s + num(e.mileageDriven), 0);
+
+  const exportCSV = () => {
+    const rows = [
+      ["Date", "Employee", "Job", "Hours", "Rate", "Labour Cost", "Miles", "Equipment", "Description"],
+      ...filtered.map(e => [
+        e.entryDate, e.employeeName, e.jobName, num(e.hoursWorked).toFixed(2),
+        rateFor(e.employeeName).toFixed(2), (num(e.hoursWorked) * rateFor(e.employeeName)).toFixed(2),
+        num(e.mileageDriven), e.equipmentUsed, e.workDescription,
+      ]),
+      [],
+      ["", "", "TOTAL", totalHours.toFixed(2), "", totalCost.toFixed(2), totalMiles],
+    ];
+    downloadFile("billing_report_" + today() + ".csv", toCSV(rows), "text/csv;charset=utf-8");
+  };
+
+  return (
+    <div>
+      <PageHeader
+        title="Billing & Reports"
+        subtitle="Generate billing reports from logged time"
+        action={<button type="button" onClick={exportCSV} style={btnSecondary}>📊 Export CSV</button>}
+      />
+
+      <div style={{ ...card, marginBottom: 20 }}>
+        <div className="row-wrap">
+          <Field label="Start Date" style={{ marginBottom: 0 }}><input type="date" value={filters.startDate} onChange={e => setFilters(f => ({ ...f, startDate: e.target.value }))} style={inputCls} /></Field>
+          <Field label="End Date" style={{ marginBottom: 0 }}><input type="date" value={filters.endDate} onChange={e => setFilters(f => ({ ...f, endDate: e.target.value }))} style={inputCls} /></Field>
+          <Field label="Employee" style={{ marginBottom: 0 }}>
+            <select value={filters.employee} onChange={e => setFilters(f => ({ ...f, employee: e.target.value }))} style={{ ...inputCls, width: 180 }}>
+              <option value="">All employees</option>
+              {[...new Set(entries.map(e => e.employeeName).filter(Boolean))].map(n => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </Field>
+          <Field label="Job contains" style={{ marginBottom: 0 }}>
+            <TextInput value={filters.job} onChange={v => setFilters(f => ({ ...f, job: v }))} placeholder="Job name…" style={{ width: 180 }} />
+          </Field>
+          <button type="button" onClick={() => setFilters({ startDate: "", endDate: "", employee: "", job: "" })} style={btnOutline}>Clear</button>
+        </div>
+      </div>
+
+      <div className="grid-3" style={{ marginBottom: 20 }}>
+        <StatCard label="Total Hours" value={totalHours.toFixed(2)} />
+        <StatCard label="Labour Cost" value={fmt(totalCost)} />
+        <StatCard label="Entries" value={filtered.length} />
+      </div>
+
+      <div style={card}>
+        <DataTable
+          columns={[
+            { key: "entryDate", label: "Date" },
+            { key: "employeeName", label: "Employee" },
+            { key: "jobName", label: "Job" },
+            { key: "hoursWorked", label: "Hours", render: v => num(v).toFixed(2) + "h" },
+            { key: "cost", label: "Labour Cost", render: (_v, row) => fmt(num(row.hoursWorked) * rateFor(row.employeeName)) },
+            { key: "mileageDriven", label: "Miles", render: v => (num(v) ? num(v) + " mi" : "—") },
+            { key: "equipmentUsed", label: "Equipment" },
+          ]}
+          rows={filtered}
+          emptyMessage="No entries match your filters."
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ─── Schedule ───────────────────────────────────────────────────────────── */
+function SchedulePage() {
+  const { navigate } = useRouter();
+  const [cursor, setCursor] = useState(() => new Date());
+  const jobs = useMemo(() => db.getAll("jobs").items, []);
+
+  const year = cursor.getFullYear();
+  const month = cursor.getMonth();
+  const monthStart = new Date(year, month, 1);
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const days = Array.from({ length: daysInMonth }, (_, i) => new Date(year, month, i + 1));
+
+  // A job occupies every day from its start date through its end date.
+  const jobsForDay = day => jobs.filter(j => {
+    if (!j.startDate) return false;
+    const start = new Date(j.startDate + "T00:00:00");
+    const end = j.endDate ? new Date(j.endDate + "T00:00:00") : start;
+    return day >= start && day <= end;
+  });
+
+  return (
+    <div>
+      <PageHeader title="Schedule" subtitle="Jobs plotted across the calendar" />
+      <div style={card}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20, gap: 12, flexWrap: "wrap" }}>
+          <button type="button" onClick={() => setCursor(new Date(year, month - 1, 1))} style={btnOutline}>← Previous</button>
+          <h2 style={{ fontSize: 20, fontWeight: 700 }}>{cursor.toLocaleString("default", { month: "long", year: "numeric" })}</h2>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" onClick={() => setCursor(new Date())} style={btnOutline}>Today</button>
+            <button type="button" onClick={() => setCursor(new Date(year, month + 1, 1))} style={btnOutline}>Next →</button>
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4 }}>
+          {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => (
+            <div key={d} style={{ textAlign: "center", fontSize: 11, fontWeight: 700, color: C.textMuted, padding: "8px 4px", textTransform: "uppercase" }}>{d}</div>
+          ))}
+          {Array.from({ length: monthStart.getDay() }).map((_, i) => <div key={"pad" + i} />)}
+          {days.map(day => {
+            const dayJobs = jobsForDay(day);
+            const isToday = day.toDateString() === new Date().toDateString();
+            return (
+              <div key={day.toISOString()} style={{ minHeight: 84, background: isToday ? "#EEF2FF" : C.surfaceAlt, borderRadius: 8, padding: 6, border: isToday ? "2px solid " + C.accent : "1px solid " + C.border }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: isToday ? C.accent : C.textMuted, marginBottom: 4 }}>{day.getDate()}</div>
+                {dayJobs.slice(0, 2).map(j => (
+                  <div
+                    key={j._id}
+                    onClick={() => navigate("jobs")}
+                    title={j.jobTitle}
+                    style={{ background: C.primary, color: "#fff", borderRadius: 4, padding: "2px 5px", fontSize: 10, fontWeight: 600, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", cursor: "pointer" }}
+                  >
+                    {j.jobTitle}
+                  </div>
+                ))}
+                {dayJobs.length > 2 && <div style={{ fontSize: 10, color: C.textMuted }}>+{dayJobs.length - 2} more</div>}
+              </div>
+            );
+          })}
+        </div>
+        {jobs.length === 0 && (
+          <p style={{ color: C.textMuted, fontSize: 13, marginTop: 16, textAlign: "center" }}>
+            No jobs scheduled yet — add jobs with a start date to see them here.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Access control & roles ─────────────────────────────────────────────── */
+const PERMISSIONS = [
+  { key: "canViewReports", label: "View Reports" },
+  { key: "canEditQuotes", label: "Edit Quotes" },
+  { key: "canManageSubcontractors", label: "Manage Subcontractors" },
+  { key: "canViewManagerLogs", label: "View Manager Logs" },
+  { key: "canEditSettings", label: "Edit Settings" },
+  { key: "canDeleteEntries", label: "Delete Entries" },
+];
+
+function AccessControlPage() {
+  const employees = useMemo(() => db.getAll("employees").items, []);
+  const [permissions, setPermissions] = useState(() => {
+    try { return JSON.parse(storage.get("bmb_permissions") || "{}"); } catch { return {}; }
+  });
+  const [editingId, setEditingId] = useState(null);
+  const [draft, setDraft] = useState({});
+
+  const save = () => {
+    const updated = { ...permissions, [editingId]: draft };
+    setPermissions(updated);
+    storage.set("bmb_permissions", JSON.stringify(updated));
+    setEditingId(null);
+  };
+
+  return (
+    <div>
+      <PageHeader title="Access Control" subtitle="Manage user permissions and role-based access" />
+      {employees.length === 0
+        ? <EmptyState icon="🔒" title="No employees found" subtitle="Add employees first, then set their permissions here." />
+        : employees.map(emp => {
+          const perms = permissions[emp._id] || {};
+          const isEditing = editingId === emp._id;
+          return (
+            <div key={emp._id} style={card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, gap: 12, flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 15 }}>{emp.fullName}</div>
+                  <div style={{ fontSize: 12, color: C.textMuted }}>{emp.role || "Unassigned"}{emp.email ? " — " + emp.email : ""}</div>
+                </div>
+                {!isEditing
+                  ? <button type="button" onClick={() => { setEditingId(emp._id); setDraft({ ...perms }); }} style={btnOutline}>Edit Permissions</button>
+                  : (
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button type="button" onClick={save} style={btnSecondary}>Save</button>
+                      <button type="button" onClick={() => setEditingId(null)} style={btnOutline}>Cancel</button>
+                    </div>
+                  )}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: 8 }}>
+                {PERMISSIONS.map(p => {
+                  const val = isEditing ? draft[p.key] : perms[p.key];
+                  return isEditing
+                    ? <Checkbox key={p.key} checked={val} onChange={v => setDraft(d => ({ ...d, [p.key]: v }))} label={p.label} />
+                    : (
+                      <div key={p.key} style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 12px", background: val ? "#F0FDF4" : C.surfaceAlt, borderRadius: 8, border: "1px solid " + (val ? "#BBF7D0" : C.border) }}>
+                        <span style={{ fontSize: 14 }}>{val ? "✅" : "🔒"}</span>
+                        <span style={{ fontSize: 12, fontWeight: 600 }}>{p.label}</span>
+                      </div>
+                    );
+                })}
+              </div>
+            </div>
+          );
+        })}
+    </div>
+  );
+}
+
+function RoleManagementPage() {
+  const [employees, setEmployees] = useState(() => db.getAll("employees").items);
+  const [editingId, setEditingId] = useState(null);
+  const [editRole, setEditRole] = useState("");
+
+  const saveRole = emp => {
+    db.update("employees", { ...emp, role: editRole });
+    setEmployees(db.getAll("employees").items);
+    setEditingId(null);
+  };
+
+  const roleColors = {
+    Owner: ["#EDE9FE", "#7C3AED"],
+    Manager: ["#EFF6FF", "#2563EB"],
+    Supervisor: ["#FFF7ED", "#EA580C"],
+    "Crew Lead": ["#FEFCE8", "#CA8A04"],
+    Employee: ["#F0FDF4", "#16A34A"],
+  };
+
+  return (
+    <div>
+      <PageHeader title="Role Management" subtitle="Assign and manage roles across your organization" />
+      {employees.length === 0
+        ? <EmptyState icon="🛡️" title="No employees found" subtitle="Add employees to manage their roles." />
+        : employees.map(emp => {
+          const [bg, tx] = roleColors[emp.role] || [C.surfaceAlt, C.textMuted];
+          const isEditing = editingId === emp._id;
+          return (
+            <div key={emp._id} style={card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>{emp.fullName}</div>
+                  <div style={{ fontSize: 12, color: C.textMuted }}>{emp.email || "—"}</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                  {isEditing
+                    ? (
+                      <>
+                        <Select value={editRole} onChange={setEditRole} options={["Owner", "Manager", "Supervisor", "Crew Lead", "Employee"]} style={{ width: 150 }} />
+                        <button type="button" onClick={() => saveRole(emp)} style={btnSecondary}>Save</button>
+                        <button type="button" onClick={() => setEditingId(null)} style={btnOutline}>Cancel</button>
+                      </>
+                    )
+                    : (
+                      <>
+                        <Badge color={bg} textColor={tx}>{emp.role || "Unassigned"}</Badge>
+                        <button type="button" onClick={() => { setEditingId(emp._id); setEditRole(emp.role || "Employee"); }} style={{ ...btnOutline, fontSize: 12, padding: "5px 12px" }}>Assign Role</button>
+                      </>
+                    )}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+    </div>
+  );
+}
+
+/* ─── Demo data ──────────────────────────────────────────────────────────── */
+function seedDemoData() {
+  let saved = null;
+  try { saved = JSON.parse(storage.get("bmb_company") || "null"); } catch { saved = null; }
+  const myName = saved?.companyName || "My Company";
+  const dueDate = new Date();
+  dueDate.setDate(dueDate.getDate() + 30);
+
+  const clients = [
+    { clientName: "Prairie Land Developments", contactPerson: "Dana Whitfield", emailAddress: "dana@prairieland.ca", phoneNumber: "+1 306 555 0142", billingAddress: "44 Grain Ave, Humboldt, SK" },
+    { clientName: "Northgate Properties", contactPerson: "Marcus Reid", emailAddress: "m.reid@northgate.ca", phoneNumber: "+1 306 555 0188", billingAddress: "1200 Northgate Rd, Saskatoon, SK" },
+  ];
+  const jobs = [
+    { jobTitle: "Highway 5 Culvert Replacement", clientName: "Prairie Land Developments", jobAddress: "Hwy 5 & Range Rd 18", startDate: today(), endDate: today(), jobStatus: "Active" },
+    { jobTitle: "Northgate Parking Lot Grade", clientName: "Northgate Properties", jobAddress: "1200 Northgate Rd", startDate: today(), jobStatus: "Pending" },
+  ];
+  const employees = [
+    { fullName: "Cole Bennett", employeeId: "EMP001", role: "Supervisor", email: "cole@example.com", hourlyRate: "42", isActive: true },
+    { fullName: "Rita Alvarez", employeeId: "EMP002", role: "Employee", email: "rita@example.com", hourlyRate: "34", isActive: true },
+  ];
+  const equipment = [
+    { equipmentName: "CAT 320 Excavator", equipmentType: "Excavator", manufacturer: "Caterpillar", yearOfManufacture: "2021", billingRatePerHour: "165", totalHours: "3120" },
+    { equipmentName: "Kenworth T880", equipmentType: "Truck", manufacturer: "Kenworth", yearOfManufacture: "2019", billingRatePerHour: "120", totalHours: "88400" },
+  ];
+  const inventory = [
+    { materialName: "3/4\" Crushed Gravel", currentStock: "480", unitOfMeasure: "tons", unitPrice: "22.50", supplier: "Humboldt Aggregates", warehouse: "Main Yard" },
+    { materialName: "Rebar #4", currentStock: "1200", unitOfMeasure: "lengths", unitPrice: "8.75", supplier: "SteelCo", warehouse: "Main Yard" },
+  ];
+
+  clients.forEach(c => db.create("clients", c));
+  jobs.forEach(j => db.create("jobs", j));
+  employees.forEach(e => db.create("employees", e));
+  equipment.forEach(e => db.create("equipment", e));
+  inventory.forEach(i => db.create("inventory", i));
+
+  db.create("timeentries", { employeeName: "Cole Bennett", jobName: "Highway 5 Culvert Replacement", entryDate: today(), hoursWorked: 8.5, startTime: "07:00", endTime: "15:30", workDescription: "Culvert excavation and backfill", equipmentUsed: "CAT 320 Excavator", mileageDriven: 42 });
+  db.create("timeentries", { employeeName: "Rita Alvarez", jobName: "Highway 5 Culvert Replacement", entryDate: today(), hoursWorked: 8, startTime: "07:00", endTime: "15:00", workDescription: "Traffic control and grade staking", equipmentUsed: "", mileageDriven: 42 });
+
+  db.create("quotes", {
+    quoteId: "Q-" + new Date().getFullYear() + "-0041",
+    status: "Invoice", currency: "CAD", issueDate: today(), dueDate: dateStr(dueDate),
+    from: {
+      name: myName,
+      email: saved?.email || "",
+      phone: saved?.phone || "",
+      address: saved?.address || "",
+      logo: saved?.logoUrl || null,
+    },
+    to: { name: "Prairie Land Developments", email: "dana@prairieland.ca", phone: "", address: "44 Grain Ave, Humboldt, SK" },
+    items: [
+      { id: genId(), description: "Excavation — culvert replacement", unit: "hrs", qty: 34, rate: 165, taxable: true },
+      { id: genId(), description: "3/4\" crushed gravel supplied", unit: "tons", qty: 120, rate: 22.5, taxable: true },
+      { id: genId(), description: "Traffic control", unit: "days", qty: 4, rate: 480, taxable: true },
+    ],
+    taxRate: 5, taxLabel: "GST", discount: 0, discountType: "percent",
+    notes: "Thank you for your business.", terms: "Payment due within 30 days.",
+    clientReference: "Prairie Land Developments", jobReference: "Highway 5 Culvert Replacement",
+    totalAmount: 0,
+  });
+  // Recompute the seeded invoice total with the real calculator.
+  const q = db.getAll("quotes").items[0];
+  db.update("quotes", { _id: q._id, totalAmount: calcTotals(q).total });
+}
+
+/* ─── Settings ───────────────────────────────────────────────────────────── */
+function SettingsPage() {
+  const { company, updateCompany } = useCompany();
+  const { user } = useAuth();
+  const importRef = useRef(null);
+  const [form, setForm] = useState({
+    companyName: company?.companyName || "",
+    address: company?.address || "",
+    phone: company?.phone || "",
+    email: company?.email || "",
+    website: company?.website || "",
+    logoUrl: company?.logoUrl || "",
+    primaryColor: company?.primaryColor || DEFAULT_PRIMARY,
+    secondaryColor: company?.secondaryColor || DEFAULT_SECONDARY,
+  });
+  const [message, setMessage] = useState("");
+
+  const save = () => {
+    updateCompany(form);
+    setMessage("Settings saved.");
+    setTimeout(() => setMessage(""), 2500);
+  };
+
+  const exportAll = () => {
+    const data = { exportedAt: new Date().toISOString(), company, collections: {} };
+    COLLECTIONS.forEach(c => { data.collections[c] = getCol(c); });
+    downloadFile("buildmybill_backup_" + today() + ".json", JSON.stringify(data, null, 2), "application/json");
+  };
+
+  const importAll = e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const parsed = JSON.parse(ev.target.result);
+        const cols = parsed.collections || parsed;
+        if (!cols || typeof cols !== "object") throw new Error("bad format");
+        if (!window.confirm("This replaces all current data with the contents of the backup. Continue?")) return;
+        COLLECTIONS.forEach(c => { if (Array.isArray(cols[c])) setCol(c, cols[c]); });
+        if (parsed.company) { storage.set("bmb_company", JSON.stringify(parsed.company)); }
+        window.location.reload();
+      } catch {
+        window.alert("That file doesn't look like a BuildMyBill backup.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const loadDemo = () => {
+    if (!window.confirm("Add sample clients, jobs, employees, equipment, and an invoice?")) return;
+    seedDemoData();
+    window.location.reload();
+  };
+
+  const clearAll = () => {
+    if (!window.confirm("Delete ALL records? Export a backup first — this cannot be undone.")) return;
+    if (!window.confirm("Really delete everything?")) return;
+    COLLECTIONS.forEach(c => storage.remove("bmb_" + c));
+    window.location.reload();
+  };
+
+  const colorField = (label, key) => (
+    <Field label={label}>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input type="color" value={form[key]} onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))} style={{ width: 48, height: 38, borderRadius: 6, cursor: "pointer", border: "1px solid " + C.border, padding: 2 }} />
+        <TextInput value={form[key]} onChange={v => setForm(f => ({ ...f, [key]: v }))} style={{ fontFamily: "monospace" }} />
+      </div>
+    </Field>
+  );
+
+  return (
+    <div>
+      <PageHeader title="Settings" subtitle="Company details, branding, and your data" />
+      <Toast message={message} />
+
+      <div className="grid-2">
+        <div style={card}>
+          <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>Company Information</h3>
+          <Field label="Company Name"><TextInput value={form.companyName} onChange={v => setForm(f => ({ ...f, companyName: v }))} placeholder="My Construction Company" /></Field>
+          <Field label="Address"><TextInput value={form.address} onChange={v => setForm(f => ({ ...f, address: v }))} placeholder="123 Main St, City, Province" /></Field>
+          <Field label="Phone"><TextInput value={form.phone} onChange={v => setForm(f => ({ ...f, phone: v }))} placeholder="+1 555 000 0000" /></Field>
+          <Field label="Email"><TextInput type="email" value={form.email} onChange={v => setForm(f => ({ ...f, email: v }))} placeholder="info@company.com" /></Field>
+          <Field label="Website"><TextInput value={form.website} onChange={v => setForm(f => ({ ...f, website: v }))} placeholder="https://yourcompany.com" /></Field>
+        </div>
+
+        <div style={card}>
+          <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>Branding</h3>
+          <Field label="Logo URL"><TextInput value={form.logoUrl} onChange={v => setForm(f => ({ ...f, logoUrl: v }))} placeholder="https://…/logo.png" /></Field>
+          {form.logoUrl && <img src={form.logoUrl} alt="Logo preview" style={{ maxHeight: 60, maxWidth: 200, objectFit: "contain", marginBottom: 12, borderRadius: 6, border: "1px solid " + C.border }} />}
+          {colorField("Primary Color", "primaryColor")}
+          {colorField("Secondary Color", "secondaryColor")}
+          <div style={{ padding: 12, background: C.surfaceAlt, borderRadius: 8, fontSize: 12, color: C.textMuted }}>
+            Preview:{" "}
+            <span style={{ background: form.primaryColor, color: "#fff", padding: "3px 10px", borderRadius: 4, marginRight: 6 }}>Primary</span>
+            <span style={{ background: form.secondaryColor, color: "#fff", padding: "3px 10px", borderRadius: 4 }}>Secondary</span>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 20 }}>
+        <button type="button" onClick={save} style={btnSecondary}>Save Settings</button>
+      </div>
+
+      <div className="grid-2">
+        <div style={card}>
+          <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Account</h3>
+          {[["Name", user?.name || "—"], ["Email", user?.email || "—"]].map(([l, v]) => (
+            <div key={l} style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", marginBottom: 4 }}>{l}</div>
+              <div style={{ fontSize: 14, fontWeight: 600 }}>{v}</div>
+            </div>
+          ))}
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", marginBottom: 4 }}>Role</div>
+          <Badge color="#EEF2FF" textColor={C.accent}>{user?.role || "Owner"}</Badge>
+        </div>
+
+        <div style={card}>
+          <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Data Management</h3>
+          <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 16, lineHeight: 1.6 }}>
+            All data lives in this browser's local storage on this computer. Export regularly to back it up.
+          </p>
+          <input ref={importRef} type="file" accept="application/json" style={{ display: "none" }} onChange={importAll} />
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button type="button" onClick={exportAll} style={btnOutline}>📤 Export All Data</button>
+            <button type="button" onClick={() => importRef.current.click()} style={btnOutline}>📥 Import Backup</button>
+            <button type="button" onClick={loadDemo} style={btnOutline}>✨ Load Sample Data</button>
+            <button type="button" onClick={clearAll} style={btnDanger}>Delete All Data</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Subscriptions ──────────────────────────────────────────────────────── */
+const PLANS = [
+  { id: "minimum", name: "Minimum", price: 24.99, users: 5, features: ["Core features", "Up to 5 team members", "Time tracking", "Basic inventory", "Email support"] },
+  { id: "growth", name: "Growth", price: 39.99, users: 20, highlight: true, features: ["Everything in Minimum", "Up to 20 team members", "Equipment management", "Quote generation", "Priority support", "Custom reports"] },
+  { id: "professional", name: "Professional", price: 49.99, users: 50, features: ["Everything in Growth", "Up to 50 team members", "Advanced analytics", "Safety templates", "Audit logs", "Phone support"] },
+];
+
+function SubscriptionsPage({ heading = true }) {
+  const [plan, setPlan] = useState(() => storage.get("bmb_plan") || "growth");
+  const select = id => { setPlan(id); storage.set("bmb_plan", id); };
+
+  return (
+    <div>
+      {heading && <PageHeader title="Subscription Plans" subtitle="Choose the plan that fits your business" />}
+      <div className="grid-3">
+        {PLANS.map(p => (
+          <div key={p.id} style={{ ...card, marginBottom: 0, border: p.highlight ? "2px solid " + C.secondary : "1px solid " + C.border, position: "relative" }}>
+            {p.highlight && (
+              <div style={{ position: "absolute", top: -12, left: "50%", transform: "translateX(-50%)", background: C.secondary, color: "#fff", fontSize: 11, fontWeight: 700, padding: "3px 12px", borderRadius: 20, whiteSpace: "nowrap" }}>
+                MOST POPULAR
+              </div>
+            )}
+            <h3 style={{ fontSize: 20, fontWeight: 800, marginBottom: 4 }}>{p.name}</h3>
+            <div style={{ fontSize: 32, fontWeight: 900, color: C.accent, marginBottom: 4 }}>
+              ${p.price}<span style={{ fontSize: 14, fontWeight: 400, color: C.textMuted }}>/mo</span>
+            </div>
+            <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 16 }}>Up to {p.users} team members</div>
+            <ul style={{ listStyle: "none", padding: 0, marginBottom: 20 }}>
+              {p.features.map(f => (
+                <li key={f} style={{ fontSize: 13, padding: "4px 0", display: "flex", gap: 8 }}>
+                  <span style={{ color: C.green }}>✓</span>{f}
+                </li>
+              ))}
+            </ul>
+            <button type="button" onClick={() => select(p.id)} disabled={plan === p.id} style={{ ...(plan === p.id ? btnPrimary : btnSecondary), width: "100%", opacity: plan === p.id ? 0.65 : 1, cursor: plan === p.id ? "default" : "pointer" }}>
+              {plan === p.id ? "Current Plan" : "Select Plan"}
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PricingPage() {
+  return (
+    <div>
+      <div style={{ textAlign: "center", padding: "40px 20px 32px", background: C.primary, color: "#fff", borderRadius: 16, marginBottom: 32 }}>
+        <h1 style={{ fontSize: 34, fontWeight: 900, marginBottom: 12, letterSpacing: "-1px" }}>Simple, Transparent Pricing</h1>
+        <p style={{ fontSize: 16, opacity: 0.7, marginBottom: 20 }}>Choose the right plan for your construction business.</p>
+        <div style={{ display: "inline-block", padding: "6px 16px", background: C.secondary, borderRadius: 20, fontSize: 13, fontWeight: 700 }}>All plans include a 14-day free trial</div>
+      </div>
+      <SubscriptionsPage heading={false} />
+      <div style={{ ...card, marginTop: 24 }}>
+        <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 12 }}>Frequently Asked Questions</h3>
+        {[
+          ["Can I change my plan anytime?", "Yes — upgrade or downgrade at any time. Changes take effect on your next billing cycle."],
+          ["Is there a long-term contract?", "No, all plans are month-to-month with no long-term commitment."],
+          ["What happens to my data if I cancel?", "Your data is stored locally in your browser and can be exported at any time from Settings."],
+          ["Do you offer annual billing discounts?", "Yes — contact us for annual billing and save 15% on any plan."],
+        ].map(([q, a]) => (
+          <div key={q} style={{ padding: "16px 0", borderBottom: "1px solid " + C.border }}>
+            <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 6 }}>{q}</div>
+            <div style={{ fontSize: 13, color: C.textMuted }}>{a}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProfilePage() {
+  const { user, logout } = useAuth();
+  const { company } = useCompany();
+  return (
+    <div>
+      <PageHeader title="Your Profile" />
+      <div className="grid-2">
+        <div style={{ ...card, background: C.primary, color: "#fff" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 24 }}>
+            <div style={{ width: 64, height: 64, borderRadius: "50%", background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, fontWeight: 800 }}>
+              {(user?.name || user?.email || "U")[0].toUpperCase()}
+            </div>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 800, fontSize: 20 }}>{user?.name || "User"}</div>
+              <div style={{ opacity: 0.7, fontSize: 13, wordBreak: "break-all" }}>{user?.email}</div>
+            </div>
+          </div>
+          {[["Role", user?.role || "Owner"], ["Company", company?.companyName || "—"], ["Plan", (storage.get("bmb_plan") || "growth")]].map(([l, v]) => (
+            <div key={l} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.15)", fontSize: 13 }}>
+              <span style={{ opacity: 0.7 }}>{l}</span><span style={{ fontWeight: 600, textTransform: "capitalize" }}>{v}</span>
+            </div>
+          ))}
+          <button type="button" onClick={logout} style={{ ...btnOutline, marginTop: 20, width: "100%", color: "#fff", borderColor: "rgba(255,255,255,0.3)" }}>Sign Out</button>
+        </div>
+        <div style={card}>
+          <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>Account Status</h3>
+          <div style={{ padding: "12px 16px", background: "#F0FDF4", borderRadius: 8, color: "#16A34A", fontWeight: 700, marginBottom: 12 }}>✅ Account Active</div>
+          <p style={{ color: C.textMuted, fontSize: 13, lineHeight: 1.7 }}>
+            You have access to every BuildMyBill module — quotes and invoices, jobs, time tracking, equipment, inventory, safety checks, and reporting.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Landing / login ────────────────────────────────────────────────────── */
+const FEATURES = [
+  { icon: "📄", title: "Quotes & Invoices", desc: "Build professional quotes and invoices with line items, tax, discounts, and one-click PDF printing." },
+  { icon: "🏗️", title: "Job Management", desc: "Track every project from start to finish — addresses, timelines, clients, and team assignments." },
+  { icon: "⏱️", title: "Time Tracking", desc: "Log daily work hours, equipment usage, and mileage. Export billing reports instantly to CSV." },
+  { icon: "👥", title: "Client & Team", desc: "Manage your clients, employees, and subcontractor network all in one place." },
+  { icon: "📦", title: "Inventory & Equipment", desc: "Track stock levels across warehouses and monitor your full equipment fleet." },
+  { icon: "🦺", title: "Safety & Compliance", desc: "Daily vehicle checklists, safety check templates, and manager log books built in." },
+];
+
+function LoginPage() {
+  const { login } = useAuth();
+  const [showModal, setShowModal] = useState(false);
+  const [isRegister, setIsRegister] = useState(false);
+  const [form, setForm] = useState({ name: "", email: "", password: "", companyName: "" });
+  const [error, setError] = useState("");
+
+  const f = k => v => setForm(p => ({ ...p, [k]: v }));
+  const open = register => { setIsRegister(register); setError(""); setShowModal(true); };
+
+  const handleSubmit = e => {
+    e.preventDefault();
+    if (!form.email.trim() || !form.password) { setError("Email and password are required."); return; }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) { setError("Enter a valid email address."); return; }
+    if (isRegister && !form.companyName.trim()) { setError("Company name is required."); return; }
+    login({
+      name: form.name.trim() || form.email.split("@")[0],
+      email: form.email.trim(),
+      companyName: form.companyName.trim(),
+      role: "Owner",
+    });
+  };
+
+  const s = {
+    page: { minHeight: "100vh", background: "#fff", overflowX: "hidden" },
+    nav: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "0 5%", height: 64, borderBottom: "1px solid #E5E7EB", position: "sticky", top: 0, background: "#fff", zIndex: 100, flexWrap: "wrap" },
+    logoBox: { width: 36, height: 36, borderRadius: 8, background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 18, color: "#fff", flexShrink: 0 },
+    hero: { background: C.primary, color: "#fff", padding: "80px 5% 90px", textAlign: "center" },
+    heroTag: { display: "inline-block", background: C.secondary, color: "#fff", fontSize: 12, fontWeight: 700, padding: "4px 14px", borderRadius: 20, marginBottom: 24, letterSpacing: "0.5px", textTransform: "uppercase" },
+    heroH1: { fontSize: "clamp(34px, 6vw, 68px)", fontWeight: 900, margin: "0 0 20px", lineHeight: 1.05, letterSpacing: "-2px" },
+    heroSub: { fontSize: "clamp(15px, 2vw, 19px)", opacity: 0.7, maxWidth: 580, margin: "0 auto 40px", lineHeight: 1.6 },
+    btnGreen: { padding: "14px 32px", background: C.secondary, color: "#fff", border: "none", borderRadius: 10, fontWeight: 700, fontSize: 15, cursor: "pointer" },
+    btnGhost: { padding: "14px 32px", background: "transparent", color: "#fff", border: "2px solid rgba(255,255,255,0.4)", borderRadius: 10, fontWeight: 700, fontSize: 15, cursor: "pointer" },
+    section: { padding: "72px 5%" },
+    sectionAlt: { padding: "72px 5%", background: "#F9FAFB" },
+    sectionTag: { fontSize: 12, fontWeight: 700, color: C.secondary, textTransform: "uppercase", letterSpacing: "0.8px", marginBottom: 12 },
+    sectionH2: { fontSize: "clamp(26px, 4vw, 38px)", fontWeight: 800, color: C.primary, marginBottom: 12, letterSpacing: "-0.5px" },
+    sectionSub: { fontSize: 16, color: "#6B7280", maxWidth: 540, lineHeight: 1.7, marginBottom: 44 },
+    featCard: { background: "#fff", border: "1px solid #E5E7EB", borderRadius: 14, padding: "28px 24px" },
+  };
+
+  return (
+    <div style={s.page}>
+      <nav style={s.nav}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={s.logoBox}>B</div>
+          <span style={{ fontWeight: 800, fontSize: 18, color: C.primary, letterSpacing: "-0.3px" }}>BuildMyBill</span>
+        </div>
+        <div style={{ display: "flex", gap: 12 }}>
+          <button type="button" onClick={() => open(false)} style={{ padding: "9px 20px", background: "transparent", color: C.primary, border: "1px solid #D1D5DB", borderRadius: 10, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Sign In</button>
+          <button type="button" onClick={() => open(true)} style={{ ...s.btnGreen, padding: "9px 20px", fontSize: 14 }}>Get Started Free</button>
+        </div>
+      </nav>
+
+      <section style={s.hero}>
+        <div style={s.heroTag}>Construction Business Management</div>
+        <h1 style={s.heroH1}>Build My Bill.<br />Run Your Business.</h1>
+        <p style={s.heroSub}>Quotes, invoices, time tracking, jobs, equipment, inventory, and safety checks — all in one platform built for the trades.</p>
+        <div style={{ display: "flex", gap: 14, justifyContent: "center", flexWrap: "wrap" }}>
+          <button type="button" onClick={() => open(true)} style={s.btnGreen}>Get Started Free →</button>
+          <button type="button" onClick={() => open(false)} style={s.btnGhost}>Sign In</button>
+        </div>
+        <div style={{ display: "flex", justifyContent: "center", gap: "clamp(24px, 5vw, 64px)", marginTop: 64, flexWrap: "wrap" }}>
+          {[["20+", "Built-in modules"], ["∞", "Quotes & invoices"], ["$0", "Setup cost"], ["100%", "Your data"]].map(([n, l]) => (
+            <div key={l} style={{ textAlign: "center" }}>
+              <div style={{ fontSize: "clamp(28px, 4vw, 40px)", fontWeight: 900, color: C.secondary }}>{n}</div>
+              <div style={{ fontSize: 13, opacity: 0.6, marginTop: 4 }}>{l}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section style={s.section}>
+        <div style={s.sectionTag}>Everything you need</div>
+        <h2 style={s.sectionH2}>One platform. Every tool.</h2>
+        <p style={s.sectionSub}>Stop juggling spreadsheets, paper logs, and separate apps. BuildMyBill puts your entire operation in one place.</p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 24 }}>
+          {FEATURES.map(ft => (
+            <div key={ft.title} style={s.featCard}>
+              <div style={{ fontSize: 32, marginBottom: 14 }}>{ft.icon}</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: C.primary, marginBottom: 8 }}>{ft.title}</div>
+              <div style={{ fontSize: 14, color: "#6B7280", lineHeight: 1.7 }}>{ft.desc}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section style={{ ...s.sectionAlt, textAlign: "center" }}>
+        <div style={s.sectionTag}>Core Feature</div>
+        <h2 style={{ ...s.sectionH2, maxWidth: 560, margin: "0 auto 16px" }}>Professional quotes in minutes</h2>
+        <p style={{ ...s.sectionSub, margin: "0 auto 40px" }}>Add line items, apply tax rates, attach your logo, and print a PDF — without leaving the app.</p>
+        <div style={{ background: C.primary, borderRadius: 16, padding: 32, maxWidth: 680, margin: "0 auto", textAlign: "left" }}>
+          {[["Quote ID", "Q-2026-0041"], ["Client", "Prairie Land Developments"], ["Status", "Invoice"], ["Subtotal", "$14,250.00"], ["GST (5%)", "$712.50"], ["Total Due", "$14,962.50"]].map(([l, v], i) => (
+            <div key={l} style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "10px 0", borderBottom: i < 5 ? "1px solid rgba(255,255,255,0.1)" : "none" }}>
+              <span style={{ fontSize: 14, color: "rgba(255,255,255,0.5)" }}>{l}</span>
+              <span style={{ fontSize: 14, fontWeight: i === 5 ? 800 : 600, color: i === 5 ? C.secondary : "#fff" }}>{v}</span>
+            </div>
+          ))}
+          <button type="button" onClick={() => open(true)} style={{ ...s.btnGreen, width: "100%", marginTop: 24 }}>Try It Free →</button>
+        </div>
+      </section>
+
+      <section style={{ background: C.secondary, padding: "64px 5%", textAlign: "center" }}>
+        <h2 style={{ fontSize: "clamp(24px, 4vw, 38px)", fontWeight: 900, color: "#fff", marginBottom: 16, letterSpacing: "-0.5px" }}>Ready to build your bill?</h2>
+        <p style={{ fontSize: 16, color: "rgba(255,255,255,0.85)", maxWidth: 480, margin: "0 auto 32px" }}>Everything runs on your own computer — no server, no setup, no monthly bill to start.</p>
+        <button type="button" onClick={() => open(true)} style={{ padding: "16px 40px", background: C.primary, color: "#fff", border: "none", borderRadius: 12, fontWeight: 800, fontSize: 16, cursor: "pointer" }}>Create Free Account →</button>
+      </section>
+
+      <footer style={{ background: C.primary, color: "#fff", padding: "40px 5%", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ ...s.logoBox, width: 28, height: 28, fontSize: 14 }}>B</div>
+          <span style={{ fontWeight: 700, color: "rgba(255,255,255,0.8)" }}>BuildMyBill</span>
+          <span style={{ fontSize: 14, opacity: 0.6 }}>— Humboldt, Saskatchewan</span>
+        </div>
+        <div style={{ fontSize: 14, opacity: 0.6 }}>© {new Date().getFullYear()} BuildMyBill. All rights reserved.</div>
+      </footer>
+
+      {showModal && (
+        <div
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}
+          onMouseDown={e => { if (e.target === e.currentTarget) setShowModal(false); }}
+        >
+          <div style={{ background: "#fff", borderRadius: 20, padding: 36, width: "100%", maxWidth: 420, position: "relative", maxHeight: "90vh", overflowY: "auto" }}>
+            <button type="button" onClick={() => setShowModal(false)} style={{ position: "absolute", top: 16, right: 16, background: "none", border: "none", fontSize: 22, cursor: "pointer", color: "#9CA3AF", lineHeight: 1 }}>×</button>
+            <div style={{ textAlign: "center", marginBottom: 28 }}>
+              <div style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 48, height: 48, borderRadius: 12, background: C.primary, fontSize: 22, fontWeight: 900, color: "#fff", marginBottom: 12 }}>B</div>
+              <h2 style={{ fontSize: 22, fontWeight: 800, color: C.primary }}>{isRegister ? "Create your account" : "Welcome back"}</h2>
+              <p style={{ fontSize: 13, color: "#9CA3AF", marginTop: 4 }}>{isRegister ? "Start your free 14-day trial" : "Sign in to your BuildMyBill account"}</p>
+            </div>
+            {error && <div style={{ background: "#FEF2F2", color: "#DC2626", padding: "10px 14px", borderRadius: 8, marginBottom: 16, fontSize: 13 }}>{error}</div>}
+            <form onSubmit={handleSubmit}>
+              {isRegister && (
+                <>
+                  <Field label="Your Name"><TextInput value={form.name} onChange={f("name")} placeholder="Full name" /></Field>
+                  <Field label="Company Name" required><TextInput value={form.companyName} onChange={f("companyName")} placeholder="Acme Construction Ltd." /></Field>
+                </>
+              )}
+              <Field label="Email" required><TextInput type="email" value={form.email} onChange={f("email")} placeholder="you@company.com" /></Field>
+              <Field label="Password" required><TextInput type="password" value={form.password} onChange={f("password")} placeholder="••••••••" /></Field>
+              <button type="submit" style={{ ...s.btnGreen, width: "100%", padding: 13, marginTop: 8, fontSize: 15 }}>
+                {isRegister ? "Create Account →" : "Sign In →"}
+              </button>
+            </form>
+            <p style={{ textAlign: "center", marginTop: 16, fontSize: 13, color: "#9CA3AF" }}>
+              {isRegister ? "Already have an account? " : "Don't have an account? "}
+              <button type="button" onClick={() => { setIsRegister(r => !r); setError(""); }} style={{ background: "none", border: "none", color: C.secondary, cursor: "pointer", fontWeight: 700, fontSize: 13 }}>
+                {isRegister ? "Sign In" : "Create one free"}
+              </button>
+            </p>
+            <div style={{ marginTop: 16, padding: "10px 14px", background: "#F9FAFB", borderRadius: 8, fontSize: 12, color: "#9CA3AF", textAlign: "center", lineHeight: 1.6 }}>
+              💡 Local demo mode — your account and data stay on this computer. Any email and password works.
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── Sidebar & shell ────────────────────────────────────────────────────── */
+const NAV = [
+  { id: "dashboard", label: "Dashboard", icon: "⊞" },
+  { id: "quotes", label: "Quotes & Invoices", icon: "📄" },
+  { id: "clients", label: "Clients", icon: "👥" },
+  { id: "jobs", label: "Jobs / Projects", icon: "🏗️" },
+  { id: "contracts", label: "Contracts", icon: "📋" },
+  { id: "employees", label: "Employees", icon: "👤" },
+  { id: "subcontractors", label: "Subcontractors", icon: "🔧" },
+  { id: "time-entry", label: "Time Tracking", icon: "⏱️" },
+  { id: "daily-log", label: "Daily Log", icon: "📝" },
+  { id: "employee-logs", label: "Work Logs", icon: "📊" },
+  { id: "manager-logs", label: "Manager Logs", icon: "📖" },
+  { id: "equipment", label: "Equipment", icon: "🚛" },
+  { id: "truck-logs", label: "Vehicle Logs", icon: "🚚" },
+  { id: "safety", label: "Safety Checks", icon: "🦺" },
+  { id: "inventory", label: "Inventory", icon: "📦" },
+  { id: "warehouses", label: "Warehouses", icon: "🏭" },
+  { id: "schedule", label: "Schedule", icon: "📅" },
+  { id: "billing", label: "Billing & Reports", icon: "💰" },
+  { id: "subscriptions", label: "Subscriptions", icon: "💳" },
+  { id: "access-control", label: "Access Control", icon: "🔒" },
+  { id: "role-management", label: "Role Management", icon: "🛡️" },
+  { id: "settings", label: "Settings", icon: "⚙️" },
+  { id: "profile", label: "Profile", icon: "👤" },
+];
+
+function Sidebar({ open, onClose }) {
+  const { page, navigate } = useRouter();
+  const { company } = useCompany();
+  const { logout, user } = useAuth();
+
+  return (
+    <>
+      <div className={"sidebar-backdrop" + (open ? " open" : "")} onClick={onClose} />
+      <aside className={"sidebar" + (open ? " open" : "")}>
+        <div style={{ padding: "18px 16px", borderBottom: "1px solid rgba(255,255,255,0.1)", display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 32, height: 32, borderRadius: 8, background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 800, flexShrink: 0 }}>B</div>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 800, fontSize: 14, letterSpacing: "-0.3px", lineHeight: 1.2 }}>BuildMyBill</div>
+            <div style={{ fontSize: 10, opacity: 0.55, lineHeight: 1.3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {company?.companyName || "My Company"}
+            </div>
+          </div>
+        </div>
+
+        <nav style={{ flex: 1, padding: 8, overflowY: "auto" }}>
+          {NAV.map(item => {
+            const active = page === item.id || (page === "quote-editor" && item.id === "quotes");
+            return (
+              <button
+                type="button"
+                key={item.id}
+                onClick={() => { navigate(item.id); onClose(); }}
+                style={{
+                  width: "100%", display: "flex", alignItems: "center", gap: 8,
+                  padding: "8px 10px", borderRadius: 7, border: "none", cursor: "pointer",
+                  background: active ? "rgba(255,255,255,0.14)" : "transparent",
+                  color: active ? "#fff" : "rgba(255,255,255,0.6)",
+                  fontSize: 12.5, fontWeight: active ? 600 : 400,
+                  marginBottom: 1, textAlign: "left",
+                }}
+              >
+                <span style={{ fontSize: 13, flexShrink: 0 }}>{item.icon}</span>
+                {item.label}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div style={{ padding: "12px 16px", borderTop: "1px solid rgba(255,255,255,0.1)" }}>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.45)", marginBottom: 6, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {user?.name || user?.email}
+          </div>
+          <button type="button" onClick={logout} style={{ width: "100%", padding: 6, background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", borderRadius: 6, color: "rgba(255,255,255,0.7)", fontSize: 11, cursor: "pointer" }}>
+            Sign Out
+          </button>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+const PAGES = {
+  dashboard: () => <Dashboard />,
+  quotes: () => <QuotesPage />,
+  "quote-editor": () => <QuotesPage startNew />,
+  clients: () => <ClientsPage />,
+  jobs: () => <JobsPage />,
+  contracts: () => <ContractsPage />,
+  employees: () => <EmployeesPage />,
+  subcontractors: () => <SubcontractorsPage />,
+  "time-entry": () => <TimeEntryPage />,
+  "daily-log": () => <DailyLogPage />,
+  "employee-logs": () => <EmployeeLogsPage />,
+  "manager-logs": () => <ManagerLogsPage />,
+  equipment: () => <EquipmentPage />,
+  "truck-logs": () => <TruckLogBooksPage />,
+  safety: () => <SafetyPage />,
+  inventory: () => <InventoryPage />,
+  warehouses: () => <WarehousesPage />,
+  schedule: () => <SchedulePage />,
+  billing: () => <BillingPage />,
+  subscriptions: () => <SubscriptionsPage />,
+  pricing: () => <PricingPage />,
+  "access-control": () => <AccessControlPage />,
+  "role-management": () => <RoleManagementPage />,
+  settings: () => <SettingsPage />,
+  profile: () => <ProfilePage />,
+};
+
+function AppShell() {
+  const { page } = useRouter();
+  const { isAuthenticated } = useAuth();
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  useEffect(() => { setMenuOpen(false); }, [page]);
+
+  if (!isAuthenticated) return <LoginPage />;
+
+  const render = PAGES[page] || PAGES.dashboard;
+  const label = (NAV.find(n => n.id === page) || {}).label || "Dashboard";
+  const persistent = storage.isPersistent();
+
+  return (
+    <div className="app">
+      <Sidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
+      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+        <div className="topbar">
+          <button type="button" onClick={() => setMenuOpen(o => !o)} aria-label="Menu" style={{ background: "rgba(255,255,255,0.12)", border: "none", color: "#fff", fontSize: 18, borderRadius: 8, width: 36, height: 36, cursor: "pointer" }}>☰</button>
+          <span style={{ fontWeight: 700, fontSize: 15 }}>{label}</span>
+        </div>
+        {/* key forces a fresh mount per page so each page re-reads storage */}
+        <main className="app-main" key={page}>
+          {!persistent && (
+            <div style={{ background: "#FEF2F2", color: "#991B1B", border: "1px solid #FECACA", padding: "12px 16px", borderRadius: 8, marginBottom: 16, fontSize: 13, lineHeight: 1.6 }}>
+              <strong>Data is not being saved.</strong> This browser is blocking local storage
+              (private/incognito window, or site data disabled). Anything you enter will be lost
+              when you close this tab.
+            </div>
+          )}
+          {render()}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Error boundary ─────────────────────────────────────────────────────── */
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error("BuildMyBill error:", error, info); }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div style={{ padding: 40, fontFamily: "system-ui, sans-serif", maxWidth: 640, margin: "0 auto" }}>
+        <h1 style={{ fontSize: 22, fontWeight: 800, marginBottom: 12 }}>Something went wrong</h1>
+        <pre style={{ background: "#FEF2F2", color: "#991B1B", padding: 16, borderRadius: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
+          {String(this.state.error)}
+        </pre>
+        <button type="button" onClick={() => window.location.reload()} style={{ ...btnPrimary, marginTop: 16 }}>Reload App</button>
+      </div>
+    );
+  }
+}
+
+function App() {
+  return (
+    <ErrorBoundary>
+      <Router>
+        <AuthProvider>
+          <CompanyProvider>
+            <AppShell />
+          </CompanyProvider>
+        </AuthProvider>
+      </Router>
+    </ErrorBoundary>
+  );
+}
+
+const boot = document.getElementById("boot");
+if (boot) boot.remove();
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
