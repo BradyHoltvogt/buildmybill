@@ -107,6 +107,8 @@
 
   <script src="vendor/react.production.min.js"></script>
   <script src="vendor/react-dom.production.min.js"></script>
+  <script src="vendor/supabase.js"></script>
+  <script src="config.js"></script>
   <script src="vendor/babel.min.js"></script>
   <script type="text/babel" data-presets="react">
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -115,33 +117,28 @@
 
 const { useState, useEffect, useRef, useMemo, createContext, useContext } = React;
 
-/* ─── Storage (localStorage-backed tiny DB) ──────────────────────────────── */
-const genId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+/* ─── Supabase client ────────────────────────────────────────────────────── */
+const CFG = window.BMB_CONFIG || {};
+const supa = window.supabase.createClient(CFG.url, CFG.anonKey, {
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+});
 
-// localStorage can throw outright (private mode, file:// restrictions, disabled
-// site data). Fall back to memory so the app still runs instead of white-screening;
-// isPersistent() drives the "data is not being saved" warning in the shell.
-const memoryStore = {};
+// Transient client-only ids (React keys, line items) — never hit the DB.
+const genId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+// Real UUID for DB rows, generated client-side so optimistic updates keep a stable id.
+function uuid() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+// Small localStorage helper — used ONLY for per-browser UI prefs (never company data).
 const storage = {
-  get(key) {
-    try { return localStorage.getItem(key); }
-    catch { return key in memoryStore ? memoryStore[key] : null; }
-  },
-  set(key, value) {
-    try { localStorage.setItem(key, value); return true; }
-    catch { memoryStore[key] = value; return false; }
-  },
-  remove(key) {
-    try { localStorage.removeItem(key); } catch { /* memory-only mode */ }
-    delete memoryStore[key];
-  },
-  isPersistent() {
-    try {
-      localStorage.setItem("bmb_probe", "1");
-      localStorage.removeItem("bmb_probe");
-      return true;
-    } catch { return false; }
-  },
+  get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+  set(key, v) { try { localStorage.setItem(key, v); return true; } catch { return false; } },
+  remove(key) { try { localStorage.removeItem(key); } catch {} },
 };
 
 const COLLECTIONS = [
@@ -150,28 +147,59 @@ const COLLECTIONS = [
   "warehouses", "managerlogs", "doctemplates",
 ];
 
-function getCol(name) {
-  try {
-    const parsed = JSON.parse(storage.get("bmb_" + name) || "[]");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch { return []; }
+/* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
+   All company data lives in the `records` table, isolated per company by the
+   database's Row Level Security. We keep an in-memory mirror of the current
+   company's records so the UI can read synchronously (as it always has); writes
+   go to the database and update the mirror optimistically, rolling back + warning
+   on failure. CURRENT_COMPANY_ID is set at login and stamped on every insert;
+   even so, the DB independently rejects any cross-company access. */
+let CURRENT_COMPANY_ID = null;
+const store = {};
+COLLECTIONS.forEach(c => { store[c] = []; });
+
+// Subscribers (the shell) re-render when a background write rolls back.
+const dataListeners = new Set();
+function notifyData() { dataListeners.forEach(fn => { try { fn(); } catch {} }); }
+function useDataVersion() {
+  const [v, setV] = useState(0);
+  useEffect(() => {
+    const fn = () => setV(x => x + 1);
+    dataListeners.add(fn);
+    return () => dataListeners.delete(fn);
+  }, []);
+  return v;
 }
 
-function setCol(name, items) {
-  const ok = storage.set("bmb_" + name, JSON.stringify(items));
-  if (!ok) {
-    window.alert(
-      "Could not save to browser storage — it may be full or disabled.\n\n" +
-      "Your change is held in memory for this session only. Export your data from " +
-      "Settings before closing this tab."
-    );
-  }
-  return ok;
+const rowToRecord = row => ({ ...(row.data || {}), _id: row.id, _createdDate: row.created_at, _updatedDate: row.updated_at });
+const stripMeta = rec => { const { _id, _createdDate, _updatedDate, ...data } = rec; return data; };
+
+async function loadAllRecords() {
+  COLLECTIONS.forEach(c => { store[c] = []; });
+  const { data, error } = await supa
+    .from("records")
+    .select("id,collection,data,created_at,updated_at")
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  (data || []).forEach(row => {
+    if (!store[row.collection]) store[row.collection] = [];
+    store[row.collection].push(rowToRecord(row));
+  });
 }
+
+function clearStore() { COLLECTIONS.forEach(c => { store[c] = []; }); }
+
+function warnWrite(error) {
+  console.error("Save failed:", error);
+  window.alert("Couldn't save to the server — check your connection and try again.\n\n" + (error?.message || error));
+}
+
+// Read helpers used across the app (and by getCol below).
+function getCol(name) { return (store[name] || []).slice(); }
 
 const db = {
   getAll(col, filters = {}, opts = {}) {
-    let items = getCol(col);
+    let items = (store[col] || []).slice();
     Object.entries(filters).forEach(([k, v]) => {
       if (v !== undefined && v !== null && v !== "") items = items.filter(i => i[k] === v);
     });
@@ -180,24 +208,61 @@ const db = {
     const limit = opts.limit || 1000;
     return { items: items.slice(skip, skip + limit), hasNext: total > skip + limit, total };
   },
-  getById(col, id) { return getCol(col).find(i => i._id === id) || null; },
+  getById(col, id) { return (store[col] || []).find(i => i._id === id) || null; },
+
   create(col, data) {
-    const items = getCol(col);
+    const id = uuid();
     const now = new Date().toISOString();
-    const rec = { ...data, _id: data._id || genId(), _createdDate: now, _updatedDate: now };
-    items.unshift(rec);
-    setCol(col, items);
+    const payload = stripMeta(data);
+    const rec = { ...payload, _id: id, _createdDate: now, _updatedDate: now };
+    if (!store[col]) store[col] = [];
+    store[col].unshift(rec); // optimistic
+    supa.from("records").insert({ id, company_id: CURRENT_COMPANY_ID, collection: col, data: payload })
+      .then(({ error }) => { if (error) { store[col] = (store[col] || []).filter(r => r._id !== id); warnWrite(error); notifyData(); } });
     return rec;
   },
+
   update(col, data) {
-    const items = getCol(col);
-    const idx = items.findIndex(i => i._id === data._id);
+    const arr = store[col] || [];
+    const idx = arr.findIndex(i => i._id === data._id);
     if (idx === -1) return null;
-    items[idx] = { ...items[idx], ...data, _updatedDate: new Date().toISOString() };
-    setCol(col, items);
-    return items[idx];
+    const prev = arr[idx];
+    const merged = { ...prev, ...data, _updatedDate: new Date().toISOString() };
+    arr[idx] = merged; // optimistic
+    supa.from("records").update({ data: stripMeta(merged) }).eq("id", data._id)
+      .then(({ error }) => { if (error) { const a = store[col] || []; const i = a.findIndex(r => r._id === data._id); if (i > -1) a[i] = prev; warnWrite(error); notifyData(); } });
+    return merged;
   },
-  remove(col, id) { setCol(col, getCol(col).filter(i => i._id !== id)); return true; },
+
+  remove(col, id) {
+    const arr = store[col] || [];
+    const idx = arr.findIndex(i => i._id === id);
+    const prev = idx > -1 ? arr[idx] : null;
+    if (idx > -1) arr.splice(idx, 1); // optimistic
+    supa.from("records").delete().eq("id", id)
+      .then(({ error }) => { if (error && prev) { (store[col] || []).splice(Math.min(idx, (store[col] || []).length), 0, prev); warnWrite(error); notifyData(); } });
+    return true;
+  },
+
+  // Awaited bulk ops — used by seed / import / wipe, which reload right after and
+  // therefore must not race the network.
+  async bulkInsert(rowsByCol) {
+    const payload = [];
+    Object.entries(rowsByCol).forEach(([col, rows]) => {
+      (rows || []).forEach(r => payload.push({ id: uuid(), company_id: CURRENT_COMPANY_ID, collection: col, data: stripMeta(r) }));
+    });
+    if (payload.length === 0) return;
+    // Insert in chunks to stay well under any request-size limits.
+    for (let i = 0; i < payload.length; i += 200) {
+      const { error } = await supa.from("records").insert(payload.slice(i, i + 200));
+      if (error) throw error;
+    }
+  },
+  async deleteAllForCompany() {
+    const { error } = await supa.from("records").delete().eq("company_id", CURRENT_COMPANY_ID);
+    if (error) throw error;
+    clearStore();
+  },
 };
 
 /* ─── Shared helpers ─────────────────────────────────────────────────────── */
@@ -279,35 +344,15 @@ const card = {
   padding: 20, marginBottom: 16,
 };
 
-/* ─── Auth context ───────────────────────────────────────────────────────── */
+/* ─── Auth + company context (Supabase) ──────────────────────────────────── */
 const AuthCtx = createContext(null);
 const useAuth = () => useContext(AuthCtx);
-
-function AuthProvider({ children }) {
-  const [user, setUser] = useState(() => {
-    try { return JSON.parse(storage.get("bmb_user") || "null"); } catch { return null; }
-  });
-
-  const login = (userData) => {
-    const u = { ...userData, id: userData.id || genId() };
-    storage.set("bmb_user", JSON.stringify(u));
-    setUser(u);
-  };
-  const logout = () => { storage.remove("bmb_user"); setUser(null); };
-
-  return (
-    <AuthCtx.Provider value={{ user, login, logout, isAuthenticated: !!user }}>
-      {children}
-    </AuthCtx.Provider>
-  );
-}
-
-/* ─── Company context ────────────────────────────────────────────────────── */
 const CompanyCtx = createContext(null);
 const useCompany = () => useContext(CompanyCtx);
 
 const DEFAULT_PRIMARY = "#111827";
 const DEFAULT_SECONDARY = "#16A34A";
+const BRANDING_KEYS = ["primaryColor", "secondaryColor", "logoUrl", "address", "phone", "email", "website"];
 
 function applyBranding(company) {
   const root = document.documentElement;
@@ -315,45 +360,120 @@ function applyBranding(company) {
   root.style.setProperty("--brand-secondary", company?.secondaryColor || DEFAULT_SECONDARY);
 }
 
-function CompanyProvider({ children }) {
-  const { user } = useAuth();
-  const [company, setCompany] = useState(() => {
-    try { return JSON.parse(storage.get("bmb_company") || "null"); } catch { return null; }
-  });
+// DB companies row → the flat shape the app UI expects.
+function companyRowToApp(row) {
+  return { id: row.id, companyName: row.name || "My Company", userRole: "Owner", ...(row.settings || {}) };
+}
 
-  const updateCompany = (data) => {
-    setCompany(prev => {
-      const updated = { ...(prev || {}), ...data };
-      storage.set("bmb_company", JSON.stringify(updated));
-      return updated;
-    });
+function AuthProvider({ children }) {
+  const [session, setSession] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [company, setCompany] = useState(null);
+  const [ready, setReady] = useState(false);       // first auth check finished
+  const [dataReady, setDataReady] = useState(false); // records loaded for this session
+  const companyRef = useRef(null);
+  companyRef.current = company;
+
+  // Load profile + company + all records for a signed-in session.
+  const bootstrap = async (sess) => {
+    if (!sess) { CURRENT_COMPANY_ID = null; clearStore(); setProfile(null); setCompany(null); setDataReady(false); return; }
+    try {
+      let prof = null;
+      for (let attempt = 0; attempt < 3 && !prof; attempt++) {
+        const { data, error } = await supa.from("profiles").select("*").eq("id", sess.user.id).maybeSingle();
+        if (error) throw error;
+        prof = data;
+        if (!prof) await new Promise(r => setTimeout(r, 400)); // signup trigger race — retry
+      }
+      if (!prof) throw new Error("No profile found for this account.");
+      CURRENT_COMPANY_ID = prof.company_id;
+      const { data: comp, error: cErr } = await supa.from("companies").select("*").eq("id", prof.company_id).maybeSingle();
+      if (cErr) throw cErr;
+      setProfile(prof);
+      setCompany(comp ? companyRowToApp(comp) : { id: prof.company_id, companyName: "My Company" });
+      await loadAllRecords();
+      setDataReady(true);
+    } catch (e) {
+      console.error("bootstrap failed:", e);
+      window.alert("Could not load your account data: " + (e.message || e) + "\nTry signing out and back in.");
+      setDataReady(true); // let the app render rather than hang
+    }
   };
 
-  // Create a company record the first time someone signs in.
   useEffect(() => {
-    if (user && !company) {
-      const defaultCompany = {
-        id: genId(),
-        companyName: user.companyName || "My Company",
-        primaryColor: DEFAULT_PRIMARY,
-        secondaryColor: DEFAULT_SECONDARY,
-        logoUrl: "",
-        userRole: "Owner",
-      };
-      storage.set("bmb_company", JSON.stringify(defaultCompany));
-      setCompany(defaultCompany);
-    }
-  }, [user, company]);
+    let lastUserId = null;
+    const { data: sub } = supa.auth.onAuthStateChange((event, sess) => {
+      setSession(sess);
+      const uid = sess?.user?.id || null;
+      if (event === "SIGNED_OUT" || !uid) {
+        lastUserId = null; CURRENT_COMPANY_ID = null; clearStore();
+        setProfile(null); setCompany(null); setDataReady(false); setReady(true);
+        return;
+      }
+      // Only (re)load data when the actual user changes — ignore token refreshes.
+      if (uid !== lastUserId) {
+        lastUserId = uid;
+        setDataReady(false);
+        bootstrap(sess).finally(() => setReady(true));
+      } else {
+        setReady(true);
+      }
+    });
+    return () => { sub.subscription.unsubscribe(); };
+  }, []);
 
-  // Keep CSS variables in sync with saved branding.
   useEffect(() => { applyBranding(company); }, [company]);
 
+  const login = async ({ email, password }) => {
+    const { error } = await supa.auth.signInWithPassword({ email: email.trim(), password });
+    return error ? { ok: false, error: error.message } : { ok: true };
+  };
+
+  const signup = async ({ name, email, password, companyName }) => {
+    const { data, error } = await supa.auth.signUp({
+      email: email.trim(),
+      password,
+      options: { data: { full_name: name, company_name: companyName } },
+    });
+    if (error) return { ok: false, error: error.message };
+    if (!data.session) return { ok: true, needsConfirm: true }; // email confirmation is on
+    return { ok: true };
+  };
+
+  const logout = async () => { await supa.auth.signOut(); };
+
+  const updateCompany = async (patch) => {
+    const next = { ...(companyRef.current || {}), ...patch };
+    setCompany(next);
+    if (!next.id) return;
+    const settings = {};
+    BRANDING_KEYS.forEach(k => { if (next[k] !== undefined) settings[k] = next[k]; });
+    const { error } = await supa.from("companies")
+      .update({ name: next.companyName || "My Company", settings })
+      .eq("id", next.id);
+    if (error) window.alert("Couldn't save company settings: " + error.message);
+  };
+
+  const user = session ? {
+    id: session.user.id,
+    email: session.user.email,
+    name: profile?.full_name || session.user.user_metadata?.full_name || (session.user.email || "").split("@")[0],
+    role: profile?.role || "Owner",
+    companyName: company?.companyName || "",
+  } : null;
+
   return (
-    <CompanyCtx.Provider value={{ company, updateCompany, companyId: company?.id }}>
-      {children}
-    </CompanyCtx.Provider>
+    <AuthCtx.Provider value={{ user, isAuthenticated: !!session, login, signup, logout, ready, dataReady }}>
+      <CompanyCtx.Provider value={{ company, updateCompany, companyId: company?.id }}>
+        {children}
+      </CompanyCtx.Provider>
+    </AuthCtx.Provider>
   );
 }
+
+// CompanyProvider is now folded into AuthProvider; keep a passthrough so the
+// existing <CompanyProvider> wrapper in App() still works.
+function CompanyProvider({ children }) { return children; }
 
 /* ─── Router ─────────────────────────────────────────────────────────────── */
 const RouterCtx = createContext(null);
@@ -2400,52 +2520,20 @@ function RoleManagementPage() {
 }
 
 /* ─── Demo data ──────────────────────────────────────────────────────────── */
-function seedDemoData() {
-  let saved = null;
-  try { saved = JSON.parse(storage.get("bmb_company") || "null"); } catch { saved = null; }
-  const myName = saved?.companyName || "My Company";
+async function seedDemoData(company) {
+  const myName = company?.companyName || "My Company";
   const dueDate = new Date();
   dueDate.setDate(dueDate.getDate() + 30);
 
-  const clients = [
-    { clientName: "Prairie Land Developments", contactPerson: "Dana Whitfield", emailAddress: "dana@prairieland.ca", phoneNumber: "+1 306 555 0142", billingAddress: "44 Grain Ave, Humboldt, SK" },
-    { clientName: "Northgate Properties", contactPerson: "Marcus Reid", emailAddress: "m.reid@northgate.ca", phoneNumber: "+1 306 555 0188", billingAddress: "1200 Northgate Rd, Saskatoon, SK" },
-  ];
-  const jobs = [
-    { jobTitle: "Highway 5 Culvert Replacement", clientName: "Prairie Land Developments", jobAddress: "Hwy 5 & Range Rd 18", startDate: today(), endDate: today(), jobStatus: "Active" },
-    { jobTitle: "Northgate Parking Lot Grade", clientName: "Northgate Properties", jobAddress: "1200 Northgate Rd", startDate: today(), jobStatus: "Pending" },
-  ];
-  const employees = [
-    { fullName: "Cole Bennett", employeeId: "EMP001", role: "Supervisor", email: "cole@example.com", hourlyRate: "42", isActive: true },
-    { fullName: "Rita Alvarez", employeeId: "EMP002", role: "Employee", email: "rita@example.com", hourlyRate: "34", isActive: true },
-  ];
-  const equipment = [
-    { equipmentName: "CAT 320 Excavator", equipmentType: "Excavator", manufacturer: "Caterpillar", yearOfManufacture: "2021", billingRatePerHour: "165", totalHours: "3120" },
-    { equipmentName: "Kenworth T880", equipmentType: "Truck", manufacturer: "Kenworth", yearOfManufacture: "2019", billingRatePerHour: "120", totalHours: "88400" },
-  ];
-  const inventory = [
-    { materialName: "3/4\" Crushed Gravel", currentStock: "480", unitOfMeasure: "tons", unitPrice: "22.50", supplier: "Humboldt Aggregates", warehouse: "Main Yard" },
-    { materialName: "Rebar #4", currentStock: "1200", unitOfMeasure: "lengths", unitPrice: "8.75", supplier: "SteelCo", warehouse: "Main Yard" },
-  ];
-
-  clients.forEach(c => db.create("clients", c));
-  jobs.forEach(j => db.create("jobs", j));
-  employees.forEach(e => db.create("employees", e));
-  equipment.forEach(e => db.create("equipment", e));
-  inventory.forEach(i => db.create("inventory", i));
-
-  db.create("timeentries", { employeeName: "Cole Bennett", jobName: "Highway 5 Culvert Replacement", entryDate: today(), hoursWorked: 8.5, startTime: "07:00", endTime: "15:30", workDescription: "Culvert excavation and backfill", equipmentUsed: "CAT 320 Excavator", mileageDriven: 42 });
-  db.create("timeentries", { employeeName: "Rita Alvarez", jobName: "Highway 5 Culvert Replacement", entryDate: today(), hoursWorked: 8, startTime: "07:00", endTime: "15:00", workDescription: "Traffic control and grade staking", equipmentUsed: "", mileageDriven: 42 });
-
-  db.create("quotes", {
+  const quote = {
     quoteId: "Q-" + new Date().getFullYear() + "-0041",
     status: "Invoice", currency: "CAD", issueDate: today(), dueDate: dateStr(dueDate),
     from: {
       name: myName,
-      email: saved?.email || "",
-      phone: saved?.phone || "",
-      address: saved?.address || "",
-      logo: saved?.logoUrl || null,
+      email: company?.email || "",
+      phone: company?.phone || "",
+      address: company?.address || "",
+      logo: company?.logoUrl || null,
     },
     to: { name: "Prairie Land Developments", email: "dana@prairieland.ca", phone: "", address: "44 Grain Ave, Humboldt, SK" },
     items: [
@@ -2456,11 +2544,36 @@ function seedDemoData() {
     taxRate: 5, taxLabel: "GST", discount: 0, discountType: "percent",
     notes: "Thank you for your business.", terms: "Payment due within 30 days.",
     clientReference: "Prairie Land Developments", jobReference: "Highway 5 Culvert Replacement",
-    totalAmount: 0,
+  };
+  quote.totalAmount = calcTotals(quote).total;
+
+  await db.bulkInsert({
+    clients: [
+      { clientName: "Prairie Land Developments", contactPerson: "Dana Whitfield", emailAddress: "dana@prairieland.ca", phoneNumber: "+1 306 555 0142", billingAddress: "44 Grain Ave, Humboldt, SK" },
+      { clientName: "Northgate Properties", contactPerson: "Marcus Reid", emailAddress: "m.reid@northgate.ca", phoneNumber: "+1 306 555 0188", billingAddress: "1200 Northgate Rd, Saskatoon, SK" },
+    ],
+    jobs: [
+      { jobTitle: "Highway 5 Culvert Replacement", clientName: "Prairie Land Developments", jobAddress: "Hwy 5 & Range Rd 18", startDate: today(), endDate: today(), jobStatus: "Active" },
+      { jobTitle: "Northgate Parking Lot Grade", clientName: "Northgate Properties", jobAddress: "1200 Northgate Rd", startDate: today(), jobStatus: "Pending" },
+    ],
+    employees: [
+      { fullName: "Cole Bennett", employeeId: "EMP001", role: "Supervisor", email: "cole@example.com", hourlyRate: "42", isActive: true },
+      { fullName: "Rita Alvarez", employeeId: "EMP002", role: "Employee", email: "rita@example.com", hourlyRate: "34", isActive: true },
+    ],
+    equipment: [
+      { equipmentName: "CAT 320 Excavator", equipmentType: "Excavator", manufacturer: "Caterpillar", yearOfManufacture: "2021", billingRatePerHour: "165", totalHours: "3120" },
+      { equipmentName: "Kenworth T880", equipmentType: "Truck", manufacturer: "Kenworth", yearOfManufacture: "2019", billingRatePerHour: "120", totalHours: "88400" },
+    ],
+    inventory: [
+      { materialName: "3/4\" Crushed Gravel", currentStock: "480", unitOfMeasure: "tons", unitPrice: "22.50", supplier: "Humboldt Aggregates", warehouse: "Main Yard" },
+      { materialName: "Rebar #4", currentStock: "1200", unitOfMeasure: "lengths", unitPrice: "8.75", supplier: "SteelCo", warehouse: "Main Yard" },
+    ],
+    timeentries: [
+      { employeeName: "Cole Bennett", jobName: "Highway 5 Culvert Replacement", entryDate: today(), hoursWorked: 8.5, startTime: "07:00", endTime: "15:30", workDescription: "Culvert excavation and backfill", equipmentUsed: "CAT 320 Excavator", mileageDriven: 42 },
+      { employeeName: "Rita Alvarez", jobName: "Highway 5 Culvert Replacement", entryDate: today(), hoursWorked: 8, startTime: "07:00", endTime: "15:00", workDescription: "Traffic control and grade staking", equipmentUsed: "", mileageDriven: 42 },
+    ],
+    quotes: [quote],
   });
-  // Recompute the seeded invoice total with the real calculator.
-  const q = db.getAll("quotes").items[0];
-  db.update("quotes", { _id: q._id, totalAmount: calcTotals(q).total });
 }
 
 /* ─── Settings ───────────────────────────────────────────────────────────── */
@@ -2492,38 +2605,50 @@ function SettingsPage() {
     downloadFile("buildmybill_backup_" + today() + ".json", JSON.stringify(data, null, 2), "application/json");
   };
 
+  const [busy, setBusy] = useState("");
+
   const importAll = e => {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = ev => {
+    reader.onload = async ev => {
+      let parsed;
       try {
-        const parsed = JSON.parse(ev.target.result);
-        const cols = parsed.collections || parsed;
-        if (!cols || typeof cols !== "object") throw new Error("bad format");
-        if (!window.confirm("This replaces all current data with the contents of the backup. Continue?")) return;
-        COLLECTIONS.forEach(c => { if (Array.isArray(cols[c])) setCol(c, cols[c]); });
-        if (parsed.company) { storage.set("bmb_company", JSON.stringify(parsed.company)); }
+        parsed = JSON.parse(ev.target.result);
+      } catch { window.alert("That file doesn't look like a BuildMyBill backup."); return; }
+      const cols = parsed.collections || parsed;
+      if (!cols || typeof cols !== "object") { window.alert("That file doesn't look like a BuildMyBill backup."); return; }
+      if (!window.confirm("This REPLACES all of your company's current data with the backup. Continue?")) return;
+      setBusy("Importing…");
+      try {
+        await db.deleteAllForCompany();
+        const rowsByCol = {};
+        COLLECTIONS.forEach(c => { if (Array.isArray(cols[c])) rowsByCol[c] = cols[c]; });
+        await db.bulkInsert(rowsByCol);
+        if (parsed.company) await updateCompany(parsed.company);
         window.location.reload();
-      } catch {
-        window.alert("That file doesn't look like a BuildMyBill backup.");
+      } catch (err) {
+        setBusy("");
+        window.alert("Import failed: " + (err.message || err));
       }
     };
     reader.readAsText(file);
     e.target.value = "";
   };
 
-  const loadDemo = () => {
-    if (!window.confirm("Add sample clients, jobs, employees, equipment, and an invoice?")) return;
-    seedDemoData();
-    window.location.reload();
+  const loadDemo = async () => {
+    if (!window.confirm("Add sample clients, jobs, employees, equipment, and an invoice to your account?")) return;
+    setBusy("Adding sample data…");
+    try { await seedDemoData(company); window.location.reload(); }
+    catch (err) { setBusy(""); window.alert("Couldn't add sample data: " + (err.message || err)); }
   };
 
-  const clearAll = () => {
-    if (!window.confirm("Delete ALL records? Export a backup first — this cannot be undone.")) return;
+  const clearAll = async () => {
+    if (!window.confirm("Delete ALL of your company's records? Export a backup first — this cannot be undone.")) return;
     if (!window.confirm("Really delete everything?")) return;
-    COLLECTIONS.forEach(c => storage.remove("bmb_" + c));
-    window.location.reload();
+    setBusy("Deleting…");
+    try { await db.deleteAllForCompany(); window.location.reload(); }
+    catch (err) { setBusy(""); window.alert("Delete failed: " + (err.message || err)); }
   };
 
   const colorField = (label, key) => (
@@ -2584,14 +2709,15 @@ function SettingsPage() {
         <div style={card}>
           <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Data Management</h3>
           <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 16, lineHeight: 1.6 }}>
-            All data lives in this browser's local storage on this computer. Export regularly to back it up.
+            Your data is stored securely in your company's private database. Export any time for your own backup.
           </p>
           <input ref={importRef} type="file" accept="application/json" style={{ display: "none" }} onChange={importAll} />
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button type="button" onClick={exportAll} style={btnOutline}>📤 Export All Data</button>
-            <button type="button" onClick={() => importRef.current.click()} style={btnOutline}>📥 Import Backup</button>
-            <button type="button" onClick={loadDemo} style={btnOutline}>✨ Load Sample Data</button>
-            <button type="button" onClick={clearAll} style={btnDanger}>Delete All Data</button>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <button type="button" onClick={exportAll} disabled={!!busy} style={btnOutline}>📤 Export All Data</button>
+            <button type="button" onClick={() => importRef.current.click()} disabled={!!busy} style={btnOutline}>📥 Import Backup</button>
+            <button type="button" onClick={loadDemo} disabled={!!busy} style={btnOutline}>✨ Load Sample Data</button>
+            <button type="button" onClick={clearAll} disabled={!!busy} style={btnDanger}>Delete All Data</button>
+            {busy && <span style={{ fontSize: 13, color: C.textMuted, fontWeight: 600 }}>{busy}</span>}
           </div>
         </div>
       </div>
@@ -2717,26 +2843,38 @@ const FEATURES = [
 ];
 
 function LoginPage() {
-  const { login } = useAuth();
+  const { login, signup } = useAuth();
   const [showModal, setShowModal] = useState(false);
   const [isRegister, setIsRegister] = useState(false);
   const [form, setForm] = useState({ name: "", email: "", password: "", companyName: "" });
   const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   const f = k => v => setForm(p => ({ ...p, [k]: v }));
-  const open = register => { setIsRegister(register); setError(""); setShowModal(true); };
+  const open = register => { setIsRegister(register); setError(""); setInfo(""); setShowModal(true); };
 
-  const handleSubmit = e => {
+  const handleSubmit = async e => {
     e.preventDefault();
+    setError(""); setInfo("");
     if (!form.email.trim() || !form.password) { setError("Email and password are required."); return; }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) { setError("Enter a valid email address."); return; }
+    if (isRegister && form.password.length < 6) { setError("Password must be at least 6 characters."); return; }
     if (isRegister && !form.companyName.trim()) { setError("Company name is required."); return; }
-    login({
-      name: form.name.trim() || form.email.split("@")[0],
-      email: form.email.trim(),
-      companyName: form.companyName.trim(),
-      role: "Owner",
-    });
+
+    setSubmitting(true);
+    const result = isRegister
+      ? await signup({ name: form.name.trim() || form.email.split("@")[0], email: form.email, password: form.password, companyName: form.companyName.trim() })
+      : await login({ email: form.email, password: form.password });
+    setSubmitting(false);
+
+    if (!result.ok) { setError(result.error || "Something went wrong. Please try again."); return; }
+    if (result.needsConfirm) {
+      setInfo("Account created! Check your email to confirm it, then sign in.");
+      setIsRegister(false);
+      return;
+    }
+    // On success the auth listener swaps the whole app to the dashboard.
   };
 
   const s = {
@@ -2846,6 +2984,7 @@ function LoginPage() {
               <p style={{ fontSize: 13, color: "#9CA3AF", marginTop: 4 }}>{isRegister ? "Start your free 14-day trial" : "Sign in to your BuildMyBill account"}</p>
             </div>
             {error && <div style={{ background: "#FEF2F2", color: "#DC2626", padding: "10px 14px", borderRadius: 8, marginBottom: 16, fontSize: 13 }}>{error}</div>}
+            {info && <div style={{ background: "#F0FDF4", color: "#16A34A", padding: "10px 14px", borderRadius: 8, marginBottom: 16, fontSize: 13 }}>{info}</div>}
             <form onSubmit={handleSubmit}>
               {isRegister && (
                 <>
@@ -2855,18 +2994,18 @@ function LoginPage() {
               )}
               <Field label="Email" required><TextInput type="email" value={form.email} onChange={f("email")} placeholder="you@company.com" /></Field>
               <Field label="Password" required><TextInput type="password" value={form.password} onChange={f("password")} placeholder="••••••••" /></Field>
-              <button type="submit" style={{ ...s.btnGreen, width: "100%", padding: 13, marginTop: 8, fontSize: 15 }}>
-                {isRegister ? "Create Account →" : "Sign In →"}
+              <button type="submit" disabled={submitting} style={{ ...s.btnGreen, width: "100%", padding: 13, marginTop: 8, fontSize: 15, opacity: submitting ? 0.7 : 1, cursor: submitting ? "wait" : "pointer" }}>
+                {submitting ? "Please wait…" : (isRegister ? "Create Account →" : "Sign In →")}
               </button>
             </form>
             <p style={{ textAlign: "center", marginTop: 16, fontSize: 13, color: "#9CA3AF" }}>
               {isRegister ? "Already have an account? " : "Don't have an account? "}
-              <button type="button" onClick={() => { setIsRegister(r => !r); setError(""); }} style={{ background: "none", border: "none", color: C.secondary, cursor: "pointer", fontWeight: 700, fontSize: 13 }}>
+              <button type="button" onClick={() => { setIsRegister(r => !r); setError(""); setInfo(""); }} style={{ background: "none", border: "none", color: C.secondary, cursor: "pointer", fontWeight: 700, fontSize: 13 }}>
                 {isRegister ? "Sign In" : "Create one free"}
               </button>
             </p>
             <div style={{ marginTop: 16, padding: "10px 14px", background: "#F9FAFB", borderRadius: 8, fontSize: 12, color: "#9CA3AF", textAlign: "center", lineHeight: 1.6 }}>
-              💡 Local demo mode — your account and data stay on this computer. Any email and password works.
+              🔒 Your company's data is private and encrypted, isolated from every other company.
             </div>
           </div>
         </div>
@@ -2986,18 +3125,29 @@ const PAGES = {
   profile: () => <ProfilePage />,
 };
 
+function FullScreenLoader({ label }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, background: C.primary, color: "#fff", fontFamily: "system-ui, sans-serif" }}>
+      <div style={{ width: 56, height: 56, borderRadius: 14, background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26, fontWeight: 800 }}>B</div>
+      <div style={{ fontSize: 13, opacity: 0.6 }}>{label}</div>
+    </div>
+  );
+}
+
 function AppShell() {
   const { page } = useRouter();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, ready, dataReady } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
+  const dataVersion = useDataVersion();
 
   useEffect(() => { setMenuOpen(false); }, [page]);
 
+  if (!ready) return <FullScreenLoader label="Starting BuildMyBill…" />;
   if (!isAuthenticated) return <LoginPage />;
+  if (!dataReady) return <FullScreenLoader label="Loading your company data…" />;
 
   const render = PAGES[page] || PAGES.dashboard;
   const label = (NAV.find(n => n.id === page) || {}).label || "Dashboard";
-  const persistent = storage.isPersistent();
 
   return (
     <div className="app">
@@ -3007,15 +3157,8 @@ function AppShell() {
           <button type="button" onClick={() => setMenuOpen(o => !o)} aria-label="Menu" style={{ background: "rgba(255,255,255,0.12)", border: "none", color: "#fff", fontSize: 18, borderRadius: 8, width: 36, height: 36, cursor: "pointer" }}>☰</button>
           <span style={{ fontWeight: 700, fontSize: 15 }}>{label}</span>
         </div>
-        {/* key forces a fresh mount per page so each page re-reads storage */}
-        <main className="app-main" key={page}>
-          {!persistent && (
-            <div style={{ background: "#FEF2F2", color: "#991B1B", border: "1px solid #FECACA", padding: "12px 16px", borderRadius: 8, marginBottom: 16, fontSize: 13, lineHeight: 1.6 }}>
-              <strong>Data is not being saved.</strong> This browser is blocking local storage
-              (private/incognito window, or site data disabled). Anything you enter will be lost
-              when you close this tab.
-            </div>
-          )}
+        {/* key includes dataVersion so a rolled-back background write re-reads the store */}
+        <main className="app-main" key={page + ":" + dataVersion}>
           {render()}
         </main>
       </div>
