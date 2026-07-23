@@ -433,7 +433,12 @@ function AuthProvider({ children }) {
     const { data, error } = await supa.auth.signUp({
       email: email.trim(),
       password,
-      options: { data: { full_name: name, company_name: companyName } },
+      options: {
+        data: { full_name: name, company_name: companyName },
+        // After the user clicks the confirmation link, return them to this site
+        // (not Supabase's default localhost). Must be in the Redirect URLs allowlist.
+        emailRedirectTo: window.location.origin + window.location.pathname,
+      },
     });
     if (error) return { ok: false, error: error.message };
     if (!data.session) return { ok: true, needsConfirm: true }; // email confirmation is on
