@@ -362,34 +362,42 @@ function applyBranding(company) {
 
 // DB companies row → the flat shape the app UI expects.
 function companyRowToApp(row) {
-  return { id: row.id, companyName: row.name || "My Company", userRole: "Owner", ...(row.settings || {}) };
+  return { id: row.id, companyName: row.name || "My Company", joinCode: row.join_code || "", userRole: "Owner", ...(row.settings || {}) };
 }
 
 function AuthProvider({ children }) {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
   const [company, setCompany] = useState(null);
+  const [noAccess, setNoAccess] = useState(false); // signed in but no membership (removed/denied)
   const [ready, setReady] = useState(false);       // first auth check finished
   const [dataReady, setDataReady] = useState(false); // records loaded for this session
   const companyRef = useRef(null);
   companyRef.current = company;
+  const sessionRef = useRef(null);
+  sessionRef.current = session;
 
   // Load profile + company + all records for a signed-in session.
   const bootstrap = async (sess) => {
-    if (!sess) { CURRENT_COMPANY_ID = null; clearStore(); setProfile(null); setCompany(null); setDataReady(false); return; }
+    if (!sess) { CURRENT_COMPANY_ID = null; clearStore(); setProfile(null); setCompany(null); setNoAccess(false); setDataReady(false); return; }
     try {
       let prof = null;
-      for (let attempt = 0; attempt < 3 && !prof; attempt++) {
+      for (let attempt = 0; attempt < 4 && !prof; attempt++) {
         const { data, error } = await supa.from("profiles").select("*").eq("id", sess.user.id).maybeSingle();
         if (error) throw error;
         prof = data;
-        if (!prof) await new Promise(r => setTimeout(r, 400)); // signup trigger race — retry
+        if (!prof) await new Promise(r => setTimeout(r, 500)); // signup trigger race — retry
       }
-      if (!prof) throw new Error("No profile found for this account.");
+      setProfile(prof);
+      // No membership row → removed, denied, or link broken.
+      if (!prof) { CURRENT_COMPANY_ID = null; clearStore(); setCompany(null); setNoAccess(true); setDataReady(true); return; }
+      setNoAccess(false);
+      // Pending approval → the DB blocks all company data; show the waiting screen.
+      // (A missing status — e.g. before the team migration runs — counts as active.)
+      if (prof.status && prof.status !== "active") { CURRENT_COMPANY_ID = null; clearStore(); setCompany(null); setDataReady(true); return; }
       CURRENT_COMPANY_ID = prof.company_id;
       const { data: comp, error: cErr } = await supa.from("companies").select("*").eq("id", prof.company_id).maybeSingle();
       if (cErr) throw cErr;
-      setProfile(prof);
       setCompany(comp ? companyRowToApp(comp) : { id: prof.company_id, companyName: "My Company" });
       await loadAllRecords();
       setDataReady(true);
@@ -407,7 +415,7 @@ function AuthProvider({ children }) {
       const uid = sess?.user?.id || null;
       if (event === "SIGNED_OUT" || !uid) {
         lastUserId = null; CURRENT_COMPANY_ID = null; clearStore();
-        setProfile(null); setCompany(null); setDataReady(false); setReady(true);
+        setProfile(null); setCompany(null); setNoAccess(false); setDataReady(false); setReady(true);
         return;
       }
       // Only (re)load data when the actual user changes — ignore token refreshes.
@@ -424,28 +432,39 @@ function AuthProvider({ children }) {
 
   useEffect(() => { applyBranding(company); }, [company]);
 
+  // Re-check membership (used by the pending screen's "Check again").
+  const refresh = async () => { if (sessionRef.current) { setDataReady(false); await bootstrap(sessionRef.current); } };
+
   const login = async ({ email, password }) => {
     const { error } = await supa.auth.signInWithPassword({ email: email.trim(), password });
     return error ? { ok: false, error: error.message } : { ok: true };
   };
 
-  const signup = async ({ name, email, password, companyName }) => {
+  const signup = async ({ name, email, password, companyName, joinCode }) => {
+    const meta = { full_name: name };
+    if (joinCode) meta.join_code = joinCode.trim(); else meta.company_name = companyName;
     const { data, error } = await supa.auth.signUp({
       email: email.trim(),
       password,
       options: {
-        data: { full_name: name, company_name: companyName },
-        // After the user clicks the confirmation link, return them to this site
-        // (not Supabase's default localhost). Must be in the Redirect URLs allowlist.
+        data: meta,
+        // After the user clicks the confirmation link, return them to this site.
         emailRedirectTo: window.location.origin + window.location.pathname,
       },
     });
     if (error) return { ok: false, error: error.message };
-    if (!data.session) return { ok: true, needsConfirm: true }; // email confirmation is on
-    return { ok: true };
+    if (!data.session) return { ok: true, needsConfirm: true, joined: !!joinCode };
+    return { ok: true, joined: !!joinCode };
   };
 
   const logout = async () => { await supa.auth.signOut(); };
+
+  // Given a join code, return the company name (for the "you're joining X" confirm).
+  const checkCompanyCode = async (code) => {
+    const { data, error } = await supa.rpc("company_name_for_code", { code: (code || "").trim() });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true, companyName: data || null };
+  };
 
   const updateCompany = async (patch) => {
     const next = { ...(companyRef.current || {}), ...patch };
@@ -459,17 +478,62 @@ function AuthProvider({ children }) {
     if (error) window.alert("Couldn't save company settings: " + error.message);
   };
 
+  const regenerateJoinCode = async () => {
+    const code = String(Math.floor(Math.random() * 1000000)).padStart(6, "0");
+    const { error } = await supa.from("companies").update({ join_code: code }).eq("id", companyRef.current.id);
+    if (error) { window.alert("Couldn't regenerate the code: " + error.message); return null; }
+    setCompany(c => ({ ...c, joinCode: code }));
+    return code;
+  };
+
+  // ── Team management (owner) ──
+  const fetchTeam = async () => {
+    const { data, error } = await supa.from("profiles").select("*").eq("company_id", companyRef.current?.id).order("created_at", { ascending: true });
+    if (error) { console.error(error); return []; }
+    return data || [];
+  };
+  const approveMember = async (id) => {
+    const { error } = await supa.from("profiles").update({ status: "active" }).eq("id", id);
+    if (error) window.alert("Approve failed: " + error.message);
+    return !error;
+  };
+  const removeMember = async (id) => {
+    const { error } = await supa.from("profiles").delete().eq("id", id);
+    if (error) window.alert("Remove failed: " + error.message);
+    return !error;
+  };
+  const setMemberRole = async (id, role) => {
+    const { error } = await supa.from("profiles").update({ role }).eq("id", id);
+    if (error) window.alert("Couldn't change role: " + error.message);
+    return !error;
+  };
+  const setMemberPermissions = async (id, permissions) => {
+    const { error } = await supa.from("profiles").update({ permissions }).eq("id", id);
+    if (error) window.alert("Couldn't save permissions: " + error.message);
+    return !error;
+  };
+
   const user = session ? {
     id: session.user.id,
     email: session.user.email,
     name: profile?.full_name || session.user.user_metadata?.full_name || (session.user.email || "").split("@")[0],
     role: profile?.role || "Owner",
+    status: profile?.status || null,
+    permissions: profile?.permissions || {},
+    companyId: profile?.company_id || null,
+    isOwner: profile?.role === "Owner",
     companyName: company?.companyName || "",
   } : null;
 
+  const pending = !!session && !noAccess && profile && profile.status && profile.status !== "active";
+
   return (
-    <AuthCtx.Provider value={{ user, isAuthenticated: !!session, login, signup, logout, ready, dataReady }}>
-      <CompanyCtx.Provider value={{ company, updateCompany, companyId: company?.id }}>
+    <AuthCtx.Provider value={{
+      user, isAuthenticated: !!session, pending, noAccess, ready, dataReady,
+      login, signup, logout, refresh, checkCompanyCode,
+      fetchTeam, approveMember, removeMember, setMemberRole, setMemberPermissions,
+    }}>
+      <CompanyCtx.Provider value={{ company, updateCompany, companyId: company?.id, regenerateJoinCode }}>
         {children}
       </CompanyCtx.Provider>
     </AuthCtx.Provider>
@@ -2524,6 +2588,147 @@ function RoleManagementPage() {
   );
 }
 
+/* ─── Team (owner: join code, approvals, roles, permissions) ─────────────── */
+function TeamPage() {
+  const { user, fetchTeam, approveMember, removeMember, setMemberRole, setMemberPermissions } = useAuth();
+  const { company, regenerateJoinCode } = useCompany();
+  const [members, setMembers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(null);
+  const [draftPerms, setDraftPerms] = useState({});
+  const [busyId, setBusyId] = useState(null);
+  const [copied, setCopied] = useState(false);
+
+  const load = async () => { setLoading(true); setMembers(await fetchTeam()); setLoading(false); };
+  useEffect(() => { load(); }, []);
+
+  if (!user?.isOwner) {
+    return <EmptyState icon="🔒" title="Owners only" subtitle="Only the company owner can manage the team." />;
+  }
+
+  const pending = members.filter(m => m.status && m.status !== "active");
+  const active = members.filter(m => !m.status || m.status === "active");
+  const grantable = NAV.filter(n => GRANTABLE.includes(n.id));
+
+  const doApprove = async (m) => { setBusyId(m.id); await approveMember(m.id); await load(); setBusyId(null); };
+  const doRemove = async (m, verb) => {
+    if (!window.confirm(verb + " " + (m.full_name || m.email) + "?")) return;
+    setBusyId(m.id); await removeMember(m.id); await load(); setBusyId(null);
+  };
+  const doRole = async (m, role) => { setBusyId(m.id); await setMemberRole(m.id, role); await load(); setBusyId(null); };
+  const openPerms = (m) => { setEditing(m.id); setDraftPerms({ ...(m.permissions || {}) }); };
+  const savePerms = async (m) => { setBusyId(m.id); await setMemberPermissions(m.id, draftPerms); await load(); setEditing(null); setBusyId(null); };
+
+  const copyCode = () => {
+    if (navigator.clipboard) navigator.clipboard.writeText(company?.joinCode || "").then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
+  };
+  const regen = async () => { if (window.confirm("Generate a new join code? The current one stops working immediately.")) await regenerateJoinCode(); };
+
+  return (
+    <div>
+      <PageHeader title="Team" subtitle="Invite people to your company and control what each person can see" action={<button type="button" onClick={load} style={{ ...btnOutline, fontSize: 12, padding: "6px 12px" }}>↻ Refresh</button>} />
+
+      {/* Join code */}
+      <div style={card}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 8 }}>Company Join Code</h3>
+        <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 16, lineHeight: 1.6 }}>
+          Share this private code with people you want on your team. They choose <strong>“Join a company”</strong> when signing up and enter it — then you approve them below. Keep it private; regenerate anytime.
+        </p>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ fontSize: 30, fontWeight: 800, letterSpacing: "6px", fontFamily: "monospace", background: C.surfaceAlt, padding: "10px 20px", borderRadius: 10, border: "1px solid " + C.border }}>
+            {company?.joinCode || "——————"}
+          </div>
+          <button type="button" onClick={copyCode} style={btnSecondary}>{copied ? "Copied ✓" : "Copy"}</button>
+          <button type="button" onClick={regen} style={btnOutline}>Regenerate</button>
+        </div>
+      </div>
+
+      {/* Pending approvals */}
+      <div style={card}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>
+          Pending Requests {pending.length > 0 && <Badge color="#FEFCE8" textColor="#CA8A04">{pending.length}</Badge>}
+        </h3>
+        {loading
+          ? <p style={{ color: C.textMuted, fontSize: 13 }}>Loading…</p>
+          : pending.length === 0
+            ? <p style={{ color: C.textMuted, fontSize: 13 }}>No one is waiting to join right now.</p>
+            : pending.map(m => (
+              <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, padding: "12px 14px", border: "1px solid " + C.border, borderRadius: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{m.full_name || "(no name)"}</div>
+                  <div style={{ fontSize: 12, color: C.textMuted }}>{m.email}</div>
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button type="button" disabled={busyId === m.id} onClick={() => doApprove(m)} style={btnSecondary}>Approve</button>
+                  <button type="button" disabled={busyId === m.id} onClick={() => doRemove(m, "Deny the request from")} style={btnDanger}>Deny</button>
+                </div>
+              </div>
+            ))}
+      </div>
+
+      {/* Active members */}
+      <div style={card}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Team Members</h3>
+        {active.length === 0 && <p style={{ color: C.textMuted, fontSize: 13 }}>No active members yet.</p>}
+        {active.map(m => {
+          const isMe = m.id === user.id;
+          const isOwnerRow = m.role === "Owner";
+          const isEditing = editing === m.id;
+          return (
+            <div key={m.id} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 14, marginBottom: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{m.full_name || "(no name)"} {isMe && <span style={{ fontSize: 11, color: C.textMuted }}>(you)</span>}</div>
+                  <div style={{ fontSize: 12, color: C.textMuted }}>{m.email}</div>
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  {isOwnerRow
+                    ? <Badge color="#EDE9FE" textColor="#7C3AED">Owner</Badge>
+                    : (
+                      <>
+                        <Select value={m.role} onChange={v => doRole(m, v)} options={["Employee", "Manager", "Owner"]} style={{ width: 130 }} />
+                        {!isEditing
+                          ? <button type="button" onClick={() => openPerms(m)} style={{ ...btnOutline, fontSize: 12, padding: "6px 12px" }}>Edit Access</button>
+                          : (
+                            <>
+                              <button type="button" disabled={busyId === m.id} onClick={() => savePerms(m)} style={{ ...btnSecondary, fontSize: 12, padding: "6px 12px" }}>Save</button>
+                              <button type="button" onClick={() => setEditing(null)} style={{ ...btnOutline, fontSize: 12, padding: "6px 12px" }}>Cancel</button>
+                            </>
+                          )}
+                        {!isMe && <button type="button" disabled={busyId === m.id} onClick={() => doRemove(m, "Remove")} style={btnDanger}>Remove</button>}
+                      </>
+                    )}
+                </div>
+              </div>
+
+              {!isOwnerRow && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 8 }}>
+                    Can access {isEditing ? "(tick to allow)" : ""}
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 8 }}>
+                    {grantable.map(g => {
+                      const on = isEditing ? draftPerms[g.id] : (m.permissions && m.permissions[g.id]);
+                      return isEditing
+                        ? <Checkbox key={g.id} checked={!!on} onChange={v => setDraftPerms(d => ({ ...d, [g.id]: v }))} label={g.label} />
+                        : (
+                          <div key={g.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: on ? "#F0FDF4" : C.surfaceAlt, borderRadius: 8, border: "1px solid " + (on ? "#BBF7D0" : C.border) }}>
+                            <span>{on ? "✅" : "🔒"}</span>
+                            <span style={{ fontSize: 12, fontWeight: 600 }}>{g.label}</span>
+                          </div>
+                        );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /* ─── Demo data ──────────────────────────────────────────────────────────── */
 async function seedDemoData(company) {
   const myName = company?.companyName || "My Company";
@@ -2848,16 +3053,32 @@ const FEATURES = [
 ];
 
 function LoginPage() {
-  const { login, signup } = useAuth();
+  const { login, signup, checkCompanyCode } = useAuth();
   const [showModal, setShowModal] = useState(false);
   const [isRegister, setIsRegister] = useState(false);
-  const [form, setForm] = useState({ name: "", email: "", password: "", companyName: "" });
+  const [joinMode, setJoinMode] = useState(false);          // register: join existing vs create new
+  const [form, setForm] = useState({ name: "", email: "", password: "", companyName: "", joinCode: "" });
+  const [codeCompany, setCodeCompany] = useState(null);     // verified company name for the code
+  const [verifying, setVerifying] = useState(false);
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   const f = k => v => setForm(p => ({ ...p, [k]: v }));
-  const open = register => { setIsRegister(register); setError(""); setInfo(""); setShowModal(true); };
+  const open = register => { setIsRegister(register); setJoinMode(false); setCodeCompany(null); setError(""); setInfo(""); setShowModal(true); };
+  const switchJoin = (join) => { setJoinMode(join); setCodeCompany(null); setError(""); };
+
+  const verifyCode = async () => {
+    setError(""); setCodeCompany(null);
+    const code = form.joinCode.trim();
+    if (!/^\d{6}$/.test(code)) { setError("Enter the 6-digit code from your company owner."); return; }
+    setVerifying(true);
+    const r = await checkCompanyCode(code);
+    setVerifying(false);
+    if (!r.ok) { setError(r.error || "Couldn't check that code right now."); return; }
+    if (!r.companyName) { setError("That code doesn't match any company — double-check it with your owner."); return; }
+    setCodeCompany(r.companyName);
+  };
 
   const handleSubmit = async e => {
     e.preventDefault();
@@ -2865,21 +3086,26 @@ function LoginPage() {
     if (!form.email.trim() || !form.password) { setError("Email and password are required."); return; }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) { setError("Enter a valid email address."); return; }
     if (isRegister && form.password.length < 6) { setError("Password must be at least 6 characters."); return; }
-    if (isRegister && !form.companyName.trim()) { setError("Company name is required."); return; }
+    if (isRegister && joinMode && !codeCompany) { setError("Verify your company code first."); return; }
+    if (isRegister && !joinMode && !form.companyName.trim()) { setError("Company name is required."); return; }
 
     setSubmitting(true);
-    const result = isRegister
-      ? await signup({ name: form.name.trim() || form.email.split("@")[0], email: form.email, password: form.password, companyName: form.companyName.trim() })
-      : await login({ email: form.email, password: form.password });
+    let result;
+    const name = form.name.trim() || form.email.split("@")[0];
+    if (!isRegister) result = await login({ email: form.email, password: form.password });
+    else if (joinMode) result = await signup({ name, email: form.email, password: form.password, joinCode: form.joinCode.trim() });
+    else result = await signup({ name, email: form.email, password: form.password, companyName: form.companyName.trim() });
     setSubmitting(false);
 
     if (!result.ok) { setError(result.error || "Something went wrong. Please try again."); return; }
     if (result.needsConfirm) {
-      setInfo("Account created! Check your email to confirm it, then sign in.");
-      setIsRegister(false);
+      setInfo(result.joined
+        ? "Account created! Confirm your email, then sign in — your owner will approve your access."
+        : "Account created! Check your email to confirm it, then sign in.");
+      setIsRegister(false); setJoinMode(false);
       return;
     }
-    // On success the auth listener swaps the whole app to the dashboard.
+    // On success the auth listener swaps the whole app to the dashboard (or the pending screen).
   };
 
   const s = {
@@ -2993,14 +3219,43 @@ function LoginPage() {
             <form onSubmit={handleSubmit}>
               {isRegister && (
                 <>
-                  <Field label="Your Name"><TextInput value={form.name} onChange={f("name")} placeholder="Full name" /></Field>
-                  <Field label="Company Name" required><TextInput value={form.companyName} onChange={f("companyName")} placeholder="Acme Construction Ltd." /></Field>
+                  {/* Create-new vs join-existing toggle */}
+                  <div style={{ display: "flex", gap: 6, padding: 4, background: "#F3F4F6", borderRadius: 10, marginBottom: 16 }}>
+                    {[["Create a company", false], ["Join a company", true]].map(([lbl, jm]) => (
+                      <button key={lbl} type="button" onClick={() => switchJoin(jm)}
+                        style={{ flex: 1, padding: "8px 6px", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 12.5, fontWeight: 700, background: joinMode === jm ? "#fff" : "transparent", color: joinMode === jm ? C.primary : "#9CA3AF", boxShadow: joinMode === jm ? "0 1px 3px rgba(0,0,0,0.1)" : "none" }}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+
+                  {joinMode ? (
+                    <>
+                      <Field label="Company Join Code" required>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <TextInput value={form.joinCode} onChange={v => { f("joinCode")(v.replace(/\D/g, "").slice(0, 6)); setCodeCompany(null); }} placeholder="6-digit code" style={{ letterSpacing: "3px", fontFamily: "monospace" }} />
+                          <button type="button" onClick={verifyCode} disabled={verifying} style={{ ...s.btnGreen, padding: "9px 16px", fontSize: 13, whiteSpace: "nowrap" }}>{verifying ? "…" : "Verify"}</button>
+                        </div>
+                      </Field>
+                      {codeCompany && (
+                        <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", color: "#166534", padding: "10px 14px", borderRadius: 8, marginBottom: 14, fontSize: 13 }}>
+                          You're joining <strong>{codeCompany}</strong>. The owner will approve your access after you sign up.
+                        </div>
+                      )}
+                      <Field label="Your Name"><TextInput value={form.name} onChange={f("name")} placeholder="Full name" /></Field>
+                    </>
+                  ) : (
+                    <>
+                      <Field label="Your Name"><TextInput value={form.name} onChange={f("name")} placeholder="Full name" /></Field>
+                      <Field label="Company Name" required><TextInput value={form.companyName} onChange={f("companyName")} placeholder="Acme Construction Ltd." /></Field>
+                    </>
+                  )}
                 </>
               )}
               <Field label="Email" required><TextInput type="email" value={form.email} onChange={f("email")} placeholder="you@company.com" /></Field>
               <Field label="Password" required><TextInput type="password" value={form.password} onChange={f("password")} placeholder="••••••••" /></Field>
               <button type="submit" disabled={submitting} style={{ ...s.btnGreen, width: "100%", padding: 13, marginTop: 8, fontSize: 15, opacity: submitting ? 0.7 : 1, cursor: submitting ? "wait" : "pointer" }}>
-                {submitting ? "Please wait…" : (isRegister ? "Create Account →" : "Sign In →")}
+                {submitting ? "Please wait…" : (isRegister ? (joinMode ? "Request to Join →" : "Create Account →") : "Sign In →")}
               </button>
             </form>
             <p style={{ textAlign: "center", marginTop: 16, fontSize: 13, color: "#9CA3AF" }}>
@@ -3039,12 +3294,25 @@ const NAV = [
   { id: "warehouses", label: "Warehouses", icon: "🏭" },
   { id: "schedule", label: "Schedule", icon: "📅" },
   { id: "billing", label: "Billing & Reports", icon: "💰" },
+  { id: "team", label: "Team", icon: "🧑‍🤝‍🧑" },
   { id: "subscriptions", label: "Subscriptions", icon: "💳" },
-  { id: "access-control", label: "Access Control", icon: "🔒" },
-  { id: "role-management", label: "Role Management", icon: "🛡️" },
   { id: "settings", label: "Settings", icon: "⚙️" },
   { id: "profile", label: "Profile", icon: "👤" },
 ];
+
+// Every signed-in member sees these; owner-only areas are admin.
+const ALWAYS_VISIBLE = ["dashboard", "profile"];
+const OWNER_ONLY = ["team", "settings", "subscriptions"];
+// Nav items an owner can grant to employees (everything not always/owner-only).
+const GRANTABLE = NAV.map(n => n.id).filter(id => !ALWAYS_VISIBLE.includes(id) && !OWNER_ONLY.includes(id));
+
+function canAccess(navId, user) {
+  if (!user) return false;
+  if (user.isOwner) return true;                    // owner sees everything
+  if (ALWAYS_VISIBLE.includes(navId)) return true;
+  if (OWNER_ONLY.includes(navId)) return false;
+  return !!(user.permissions && user.permissions[navId]);
+}
 
 function Sidebar({ open, onClose }) {
   const { page, navigate } = useRouter();
@@ -3066,7 +3334,7 @@ function Sidebar({ open, onClose }) {
         </div>
 
         <nav style={{ flex: 1, padding: 8, overflowY: "auto" }}>
-          {NAV.map(item => {
+          {NAV.filter(item => canAccess(item.id, user)).map(item => {
             const active = page === item.id || (page === "quote-editor" && item.id === "quotes");
             return (
               <button
@@ -3124,8 +3392,7 @@ const PAGES = {
   billing: () => <BillingPage />,
   subscriptions: () => <SubscriptionsPage />,
   pricing: () => <PricingPage />,
-  "access-control": () => <AccessControlPage />,
-  "role-management": () => <RoleManagementPage />,
+  team: () => <TeamPage />,
   settings: () => <SettingsPage />,
   profile: () => <ProfilePage />,
 };
@@ -3139,9 +3406,54 @@ function FullScreenLoader({ label }) {
   );
 }
 
+function CenteredCard({ emoji, title, children }) {
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, background: C.bg }}>
+      <div style={{ ...card, maxWidth: 460, width: "100%", textAlign: "center", padding: "36px 28px", marginBottom: 0 }}>
+        <div style={{ fontSize: 44, marginBottom: 12 }}>{emoji}</div>
+        <h1 style={{ fontSize: 22, fontWeight: 800, marginBottom: 10 }}>{title}</h1>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function PendingScreen() {
+  const { user, logout, refresh } = useAuth();
+  const [checking, setChecking] = useState(false);
+  const check = async () => { setChecking(true); await refresh(); setChecking(false); };
+  return (
+    <CenteredCard emoji="⏳" title="Waiting for approval">
+      <p style={{ color: C.textMuted, fontSize: 14, lineHeight: 1.7, marginBottom: 20 }}>
+        Your request to join has been sent to the company owner. Once they approve you,
+        you'll be able to sign in and see everything they've given you access to.
+      </p>
+      <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+        <button type="button" onClick={check} disabled={checking} style={btnSecondary}>{checking ? "Checking…" : "Check again"}</button>
+        <button type="button" onClick={logout} style={btnOutline}>Sign out</button>
+      </div>
+      <div style={{ marginTop: 18, fontSize: 12, color: C.textMuted }}>Signed in as {user?.email}</div>
+    </CenteredCard>
+  );
+}
+
+function NoAccessScreen() {
+  const { user, logout } = useAuth();
+  return (
+    <CenteredCard emoji="🔒" title="No access">
+      <p style={{ color: C.textMuted, fontSize: 14, lineHeight: 1.7, marginBottom: 20 }}>
+        This account isn't linked to a company (it may have been removed or declined).
+        If you think this is a mistake, ask your company owner to re-invite you.
+      </p>
+      <button type="button" onClick={logout} style={btnOutline}>Sign out</button>
+      <div style={{ marginTop: 18, fontSize: 12, color: C.textMuted }}>Signed in as {user?.email}</div>
+    </CenteredCard>
+  );
+}
+
 function AppShell() {
-  const { page } = useRouter();
-  const { isAuthenticated, ready, dataReady } = useAuth();
+  const { page, navigate } = useRouter();
+  const { user, isAuthenticated, pending, noAccess, ready, dataReady } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
   const dataVersion = useDataVersion();
 
@@ -3149,9 +3461,14 @@ function AppShell() {
 
   if (!ready) return <FullScreenLoader label="Starting BuildMyBill…" />;
   if (!isAuthenticated) return <LoginPage />;
+  if (noAccess) return <NoAccessScreen />;
+  if (pending) return <PendingScreen />;
   if (!dataReady) return <FullScreenLoader label="Loading your company data…" />;
 
-  const render = PAGES[page] || PAGES.dashboard;
+  const allowed = page === "pricing" ? true
+    : page === "quote-editor" ? canAccess("quotes", user)
+    : canAccess(page, user);
+  const render = allowed ? (PAGES[page] || PAGES.dashboard) : null;
   const label = (NAV.find(n => n.id === page) || {}).label || "Dashboard";
 
   return (
@@ -3164,7 +3481,16 @@ function AppShell() {
         </div>
         {/* key includes dataVersion so a rolled-back background write re-reads the store */}
         <main className="app-main" key={page + ":" + dataVersion}>
-          {render()}
+          {render
+            ? render()
+            : (
+              <EmptyState
+                icon="🔒"
+                title="You don't have access to this section"
+                subtitle="Your company owner controls which areas you can see. Ask them if you need access."
+                action={<button type="button" onClick={() => navigate("dashboard")} style={btnSecondary}>Back to Dashboard</button>}
+              />
+            )}
         </main>
       </div>
     </div>
