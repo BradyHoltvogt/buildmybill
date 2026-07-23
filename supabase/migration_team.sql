@@ -80,7 +80,7 @@ begin
     values (new.id, target_company,
             coalesce(new.raw_user_meta_data->>'full_name',''), new.email,
             'Employee', 'pending',
-            '{"dashboard":true,"time-entry":true,"daily-log":true,"profile":true}'::jsonb);
+            jsonb_build_object('dashboard', true, 'time-entry', true, 'daily-log', true, 'profile', true));
   else
     -- No code → brand-new company, this user is its active Owner.
     insert into public.companies (name, join_code)
