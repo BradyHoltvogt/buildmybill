@@ -792,6 +792,31 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
             </div>
           );
         }
+        if (f.type === "multiselect") {
+          const selected = Array.isArray(form[f.key]) ? form[f.key] : [];
+          const toggle = (val, on) => set(f.key, on ? [...selected, val] : selected.filter(x => x !== val));
+          const opts = (f.options || []).map(o => (typeof o === "string" ? { value: o, label: o } : o));
+          return (
+            <Field key={f.key} label={f.label + (selected.length ? " (" + selected.length + ")" : "")}>
+              {opts.length === 0
+                ? <div style={{ fontSize: 13, color: C.textMuted, padding: "8px 0" }}>{f.emptyHint || "None available yet."}</div>
+                : (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 6, maxHeight: 180, overflowY: "auto" }}>
+                    {opts.map(o => <Checkbox key={o.value} checked={selected.includes(o.value)} onChange={on => toggle(o.value, on)} label={o.label} />)}
+                  </div>
+                )}
+            </Field>
+          );
+        }
+        if (f.type === "datalist") {
+          const listId = f.key + "-options";
+          return (
+            <Field key={f.key} label={f.label} required={f.required}>
+              <input list={listId} value={form[f.key] || ""} onChange={e => set(f.key, e.target.value)} placeholder={f.placeholder} style={inputCls} />
+              <datalist id={listId}>{(f.options || []).map(o => <option key={o} value={o} />)}</datalist>
+            </Field>
+          );
+        }
         return (
           <Field key={f.key} label={f.label} required={f.required}>
             {f.type === "select"
@@ -810,9 +835,10 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
   );
 }
 
-function CRUDPage({ title, singular, subtitle, collection, columns, formFields, emptyIcon, defaultValues = {} }) {
+function CRUDPage({ title, singular, subtitle, collection, columns, formFields, emptyIcon, defaultValues = {}, detail }) {
   const [items, setItems] = useState(() => db.getAll(collection).items);
   const [modal, setModal] = useState(null);
+  const [viewing, setViewing] = useState(null);
   const [query, setQuery] = useState("");
   const noun = singular || title.replace(/ies$/, "y").replace(/s$/, "");
 
@@ -859,13 +885,23 @@ function CRUDPage({ title, singular, subtitle, collection, columns, formFields, 
               <TextInput value={query} onChange={setQuery} placeholder={"Search " + title.toLowerCase() + "…"} style={{ maxWidth: 280 }} />
               <span style={{ fontSize: 12, color: C.textMuted }}>{filtered.length} of {items.length}</span>
             </div>
-            <DataTable columns={columns} rows={filtered} onEdit={openEdit} onDelete={del} emptyMessage="No matches for your search." />
+            <DataTable columns={columns} rows={filtered} onView={detail ? setViewing : undefined} onEdit={openEdit} onDelete={del} emptyMessage="No matches for your search." />
           </div>
         )}
 
       {modal && (
         <Modal title={(modal.mode === "create" ? "New " : "Edit ") + noun} onClose={() => setModal(null)}>
           <CRUDForm fields={formFields} data={modal.data} onSave={save} onCancel={() => setModal(null)} />
+        </Modal>
+      )}
+
+      {viewing && detail && (
+        <Modal title={noun + " Details"} width={640} onClose={() => setViewing(null)}>
+          {detail(viewing)}
+          <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+            <button type="button" onClick={() => { setViewing(null); openEdit(viewing); }} style={{ ...btnOutline, flex: 1 }}>Edit</button>
+            <button type="button" onClick={() => setViewing(null)} style={{ ...btnSecondary, flex: 1 }}>Close</button>
+          </div>
         </Modal>
       )}
     </div>
@@ -875,15 +911,69 @@ function CRUDPage({ title, singular, subtitle, collection, columns, formFields, 
 const money = v => (v === "" || v === null || v === undefined ? "—" : "$" + num(v).toFixed(2));
 
 /* ─── Record pages ───────────────────────────────────────────────────────── */
+// Jobs done for this client, matched by name (case-insensitive).
+function jobsForClient(clientName) {
+  const key = (clientName || "").trim().toLowerCase();
+  if (!key) return [];
+  return db.getAll("jobs").items.filter(j => (j.clientName || "").trim().toLowerCase() === key);
+}
+
+function ClientProfile({ client }) {
+  const jobs = jobsForClient(client.clientName);
+  const totalInvoiced = db.getAll("quotes").items
+    .filter(q => (q.clientReference || "").trim().toLowerCase() === (client.clientName || "").trim().toLowerCase())
+    .reduce((s, q) => s + num(q.totalAmount), 0);
+  const field = (label, value) => value ? (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</div>
+      <div style={{ fontSize: 14, whiteSpace: "pre-line" }}>{value}</div>
+    </div>
+  ) : null;
+
+  return (
+    <div>
+      <div style={{ background: C.surfaceAlt, borderRadius: 10, padding: 16, marginBottom: 16 }}>
+        <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 10 }}>{client.clientName}</div>
+        <div className="grid-2" style={{ gap: 8 }}>
+          {field("Contact", client.contactPerson)}
+          {field("Email", client.emailAddress)}
+          {field("Phone", client.phoneNumber)}
+          {field("Address", client.billingAddress)}
+        </div>
+        {field("Notes", client.notes)}
+      </div>
+
+      <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+        <StatCard label="Jobs" value={jobs.length} icon="🏗️" />
+        <StatCard label="Total Invoiced" value={fmt(totalInvoiced)} icon="💰" />
+      </div>
+
+      <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>Job History</div>
+      {jobs.length === 0
+        ? <p style={{ color: C.textMuted, fontSize: 13 }}>No jobs recorded for this client yet. Create a job and pick this client to build their history.</p>
+        : <DataTable
+            columns={[
+              { key: "jobTitle", label: "Job" },
+              { key: "startDate", label: "Start" },
+              { key: "endDate", label: "End" },
+              { key: "jobStatus", label: "Status", render: v => <StatusBadge status={v} /> },
+            ]}
+            rows={jobs}
+          />}
+    </div>
+  );
+}
+
 function ClientsPage() {
   return <CRUDPage
     title="Clients" singular="Client" subtitle="Manage your client relationships" collection="clients" emptyIcon="👥"
+    detail={client => <ClientProfile client={client} />}
     columns={[
       { key: "clientName", label: "Name" },
       { key: "contactPerson", label: "Contact" },
       { key: "emailAddress", label: "Email" },
       { key: "phoneNumber", label: "Phone" },
-      { key: "billingAddress", label: "Address" },
+      { key: "_jobs", label: "Jobs", render: (_v, row) => jobsForClient(row.clientName).length || "—" },
     ]}
     formFields={[
       { key: "clientName", label: "Client / Business Name", required: true, placeholder: "Acme Corp" },
@@ -897,25 +987,43 @@ function ClientsPage() {
 }
 
 function JobsPage() {
+  const { user } = useAuth();
+  const clientNames = useMemo(() => db.getAll("clients").items.map(c => c.clientName).filter(Boolean), []);
+  const employeeNames = useMemo(() => db.getAll("employees").items.filter(e => e.isActive !== false).map(e => e.fullName).filter(Boolean), []);
+  const canPrivate = user?.role === "Owner" || user?.role === "Manager";
+
+  const crew = v => (Array.isArray(v) && v.length ? v.join(", ") : "—");
+
+  const formFields = [
+    { key: "jobTitle", label: "Job Title", required: true, placeholder: "Site Renovation" },
+    { key: "clientName", label: "Client", type: "datalist", options: clientNames, placeholder: "Type or pick a registered client" },
+    { key: "jobAddress", label: "Job Address", placeholder: "Site address" },
+    { key: "startDate", label: "Start Date", type: "date" },
+    { key: "endDate", label: "End Date", type: "date" },
+    { key: "jobStatus", label: "Status", type: "select", options: ["Pending", "Active", "In Progress", "Completed", "On Hold"] },
+    { key: "assignedEmployees", label: "Assign Employees", type: "multiselect", options: employeeNames, emptyHint: "Add employees on the Employees page first." },
+    ...(canPrivate ? [{
+      key: "visibility", label: "Visibility", type: "select",
+      options: [{ value: "all", label: "Everyone in the company" }, { value: "private", label: "Private — hidden from employees" }],
+    }] : []),
+    { key: "jobDescription", label: "Description", type: "textarea", placeholder: "Project details…" },
+  ];
+
+  const columns = [
+    { key: "jobTitle", label: "Job Title", render: (v, row) => (
+      <span>{v} {row.visibility === "private" && <Badge color="#FEF2F2" textColor="#DC2626">Private</Badge>}</span>
+    ) },
+    { key: "clientName", label: "Client" },
+    { key: "assignedEmployees", label: "Crew", render: crew },
+    { key: "startDate", label: "Start Date" },
+    { key: "jobStatus", label: "Status", render: v => <StatusBadge status={v} /> },
+  ];
+
   return <CRUDPage
     title="Jobs" singular="Job" subtitle="Manage construction projects and track progress" collection="jobs" emptyIcon="🏗️"
-    defaultValues={{ jobStatus: "Pending" }}
-    columns={[
-      { key: "jobTitle", label: "Job Title" },
-      { key: "clientName", label: "Client" },
-      { key: "jobAddress", label: "Address" },
-      { key: "startDate", label: "Start Date" },
-      { key: "jobStatus", label: "Status", render: v => <StatusBadge status={v} /> },
-    ]}
-    formFields={[
-      { key: "jobTitle", label: "Job Title", required: true, placeholder: "Site Renovation" },
-      { key: "clientName", label: "Client", placeholder: "Client name" },
-      { key: "jobAddress", label: "Job Address", placeholder: "Site address" },
-      { key: "startDate", label: "Start Date", type: "date" },
-      { key: "endDate", label: "End Date", type: "date" },
-      { key: "jobStatus", label: "Status", type: "select", options: ["Pending", "Active", "In Progress", "Completed", "On Hold"] },
-      { key: "jobDescription", label: "Description", type: "textarea", placeholder: "Project details…" },
-    ]}
+    defaultValues={{ jobStatus: "Pending", visibility: "all", assignedEmployees: [] }}
+    columns={columns}
+    formFields={formFields}
   />;
 }
 
