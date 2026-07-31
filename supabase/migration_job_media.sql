@@ -44,8 +44,20 @@ create policy "job-media delete" on storage.objects
          and (storage.foldername(name))[1] = public.current_company_id()::text);
 
 -- ── 3. Hide private-job media from employees (extends the records select rule)
---  Same company scoping as before, plus: an Employee can't see 'jobs' rows that
---  are private, NOR 'job_media' rows whose parent job is private.
+--  A policy on `records` may NOT run a subquery against `records` directly — that
+--  recurses into this same policy (Postgres error 42P17). So the private-job
+--  lookup lives in a SECURITY DEFINER function, which bypasses RLS and therefore
+--  doesn't recurse.
+create or replace function public.job_is_private(job_id uuid)
+returns boolean
+language sql stable security definer set search_path = public as $$
+  select coalesce(
+    (select coalesce(j.data->>'visibility', 'all') = 'private'
+       from public.records j
+      where j.id = job_id and j.collection = 'jobs'),
+    false);
+$$;
+
 drop policy if exists "company records - select" on public.records;
 create policy "company records - select" on public.records
   for select using (
@@ -58,12 +70,7 @@ create policy "company records - select" on public.records
     and not (
       collection = 'job_media'
       and public.current_role() = 'Employee'
-      and exists (
-        select 1 from public.records j
-        where j.id = (records.data->>'jobId')::uuid
-          and j.collection = 'jobs'
-          and coalesce(j.data->>'visibility', 'all') = 'private'
-      )
+      and public.job_is_private((data->>'jobId')::uuid)
     )
   );
 
