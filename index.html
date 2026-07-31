@@ -171,7 +171,7 @@ const storage = {
 const COLLECTIONS = [
   "quotes", "clients", "jobs", "employees", "subcontractors", "equipment",
   "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
-  "warehouses", "managerlogs", "doctemplates",
+  "warehouses", "managerlogs", "doctemplates", "job_media",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -289,6 +289,53 @@ const db = {
     const { error } = await supa.from("records").delete().eq("company_id", CURRENT_COMPANY_ID);
     if (error) throw error;
     clearStore();
+  },
+};
+
+/* ─── Job media (photos & videos) ────────────────────────────────────────────
+   Files live in a PRIVATE Supabase Storage bucket, foldered by company then job:
+     {company_id}/{job_id}/{uuid}.{ext}
+   The bucket's security policies only let a company touch its own folder, so
+   media is isolated exactly like the rest of a company's data. A lightweight
+   record in the `job_media` collection tracks each file (path, type, whether
+   it's authorized to show the customer on a quote). */
+const MEDIA_BUCKET = "job-media";
+const MEDIA_MAX_BYTES = 50 * 1024 * 1024; // 50 MB per file — keeps storage in check
+
+const bmbMedia = {
+  async upload(jobId, file, uploader) {
+    if (file.size > MEDIA_MAX_BYTES) {
+      throw new Error("File is too large (" + (file.size / 1048576).toFixed(0) + " MB). Max is 50 MB — try a shorter video or a smaller photo.");
+    }
+    const ext = (file.name.split(".").pop() || "bin").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const path = CURRENT_COMPANY_ID + "/" + jobId + "/" + uuid() + "." + ext;
+    const { error } = await supa.storage.from(MEDIA_BUCKET).upload(path, file, { contentType: file.type || undefined, upsert: false });
+    if (error) throw error;
+    const type = (file.type || "").startsWith("video") ? "video" : "image";
+    return db.create("job_media", {
+      jobId, path, type, name: file.name, size: file.size,
+      customerVisible: false, uploadedBy: uploader?.id || null, uploadedByName: uploader?.name || "",
+    });
+  },
+  async signedUrl(path, expires = 3600) {
+    const { data, error } = await supa.storage.from(MEDIA_BUCKET).createSignedUrl(path, expires);
+    return error || !data ? null : data.signedUrl;
+  },
+  // Full data URL — used for the printed quote so photos are embedded in the PDF
+  // (and don't depend on a signed URL that could expire after saving).
+  async dataUrl(path) {
+    const { data, error } = await supa.storage.from(MEDIA_BUCKET).download(path);
+    if (error || !data) return null;
+    return await new Promise(res => {
+      const r = new FileReader();
+      r.onload = () => res(r.result);
+      r.onerror = () => res(null);
+      r.readAsDataURL(data);
+    });
+  },
+  async remove(rec) {
+    try { await supa.storage.from(MEDIA_BUCKET).remove([rec.path]); } catch (e) {}
+    db.remove("job_media", rec._id);
   },
 };
 
@@ -1058,6 +1105,114 @@ function ClientsPage() {
   />;
 }
 
+// Photos & videos for a job. Anyone who can see the job can view and add media
+// (so crews can document work as it happens); owners/managers decide which
+// photos are shown to the customer on a quote.
+function JobMediaGallery({ job }) {
+  const { user } = useAuth();
+  const ver = useDataVersion();
+  const canAuthorize = user?.isOwner || user?.role === "Manager";
+  const media = getCol("job_media").filter(m => m.jobId === job._id);
+  const [urls, setUrls] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const fileRef = useRef(null);
+
+  const pathsKey = media.map(m => m.path).join(",");
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const missing = media.filter(m => !urls[m.path]);
+      if (!missing.length) return;
+      const entries = await Promise.all(missing.map(async m => [m.path, await bmbMedia.signedUrl(m.path)]));
+      if (!alive) return;
+      setUrls(u => { const n = { ...u }; entries.forEach(([p, url]) => { if (url) n[p] = url; }); return n; });
+    })();
+    return () => { alive = false; };
+  }, [pathsKey, ver]);
+
+  const onFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setBusy(true); setNote("");
+    let ok = 0;
+    for (const file of files) {
+      try { await bmbMedia.upload(job._id, file, user); ok++; }
+      catch (e) { window.alert("Couldn't upload " + file.name + ":\n" + (e.message || e)); }
+    }
+    setBusy(false);
+    setNote(ok ? ok + " file" + (ok > 1 ? "s" : "") + " uploaded." : "");
+    notifyData();
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  const toggleCustomer = (m) => db.update("job_media", { ...m, customerVisible: !m.customerVisible });
+  const del = (m) => { if (window.confirm("Remove this " + m.type + "? This can't be undone.")) bmbMedia.remove(m); };
+
+  const canDelete = (m) => canAuthorize || m.uploadedBy === user?.id;
+  const shown = customerCount(media);
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+        <div style={{ fontSize: 13, fontWeight: 700 }}>
+          Photos &amp; Videos {media.length > 0 && <span style={{ color: C.textMuted, fontWeight: 500 }}>({media.length})</span>}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {note && <span style={{ fontSize: 12, color: C.green }}>{note}</span>}
+          <button type="button" onClick={() => fileRef.current && fileRef.current.click()} disabled={busy} style={{ ...btnOutline, padding: "7px 14px", opacity: busy ? 0.6 : 1, cursor: busy ? "wait" : "pointer" }}>
+            {busy ? "Uploading…" : "＋ Add photos / videos"}
+          </button>
+          <input ref={fileRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={e => onFiles(e.target.files)} />
+        </div>
+      </div>
+
+      {media.length === 0
+        ? <div style={{ fontSize: 13, color: C.textMuted, background: C.surfaceAlt, borderRadius: 8, padding: "16px", textAlign: "center" }}>
+            No media yet. Add photos or videos to document this job — your crew can see them here as work progresses.
+          </div>
+        : (
+          <>
+            {canAuthorize && <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 8 }}>Tick “Show to customer” on any photo to include it on quotes for this job. {shown > 0 && <strong>{shown} shared.</strong>}</div>}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 10 }}>
+              {media.map(m => {
+                const url = urls[m.path];
+                return (
+                  <div key={m._id} style={{ border: "1px solid " + C.border, borderRadius: 10, overflow: "hidden", background: C.surfaceAlt }}>
+                    <div style={{ position: "relative", height: 120, background: "#0F172A", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      {!url
+                        ? <span style={{ color: "#64748B", fontSize: 12 }}>Loading…</span>
+                        : m.type === "video"
+                          ? <video src={url} controls style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                          : <a href={url} target="_blank" rel="noopener noreferrer" style={{ width: "100%", height: "100%" }}><img src={url} alt={m.name || "Job photo"} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} /></a>}
+                      {m.customerVisible && m.type === "image" && (
+                        <span style={{ position: "absolute", top: 6, left: 6, background: C.green, color: "#fff", fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 20 }}>On quote</span>
+                      )}
+                    </div>
+                    <div style={{ padding: "7px 9px" }}>
+                      <div style={{ fontSize: 11, color: C.textMuted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={m.name}>{m.type === "video" ? "🎬 " : "🖼 "}{m.name || m.type}</div>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginTop: 6 }}>
+                        {m.type === "image" && canAuthorize
+                          ? <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, cursor: "pointer" }}>
+                              <input type="checkbox" checked={!!m.customerVisible} onChange={() => toggleCustomer(m)} style={{ accentColor: C.green, cursor: "pointer" }} />
+                              Show to customer
+                            </label>
+                          : <span style={{ fontSize: 11, color: C.textMuted }}>{m.type === "video" ? "In-app only" : (m.customerVisible ? "Shared on quotes" : "Team only")}</span>}
+                        {canDelete(m) && <button type="button" onClick={() => del(m)} title="Remove" style={{ background: "none", border: "none", color: "#DC2626", cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 2 }}>🗑</button>}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+    </div>
+  );
+}
+
+const customerCount = (media) => media.filter(m => m.type === "image" && m.customerVisible).length;
+
 function JobsPage() {
   const { user } = useAuth();
   const clientNames = useMemo(() => db.getAll("clients").items.map(c => c.clientName).filter(Boolean), []);
@@ -1088,6 +1243,10 @@ function JobsPage() {
     { key: "clientName", label: "Client" },
     { key: "jobAddress", label: "Location", render: v => <MapLink query={v} label="Map" /> },
     { key: "assignedEmployees", label: "Crew", render: crew },
+    { key: "_media", label: "Media", render: (_v, row) => {
+      const m = getCol("job_media").filter(x => x.jobId === row._id);
+      return m.length ? <span title={m.length + " file(s) — open to view"}>📷 {m.length}</span> : "—";
+    } },
     { key: "startDate", label: "Start Date" },
     { key: "jobStatus", label: "Status", render: v => <StatusBadge status={v} /> },
   ];
@@ -1118,6 +1277,9 @@ function JobsPage() {
           </div>
         )}
         {field("Description", job.jobDescription)}
+        <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
+          <JobMediaGallery job={job} />
+        </div>
       </div>
     );
   };
@@ -1627,6 +1789,40 @@ function TotalsBlock({ doc, update }) {
   );
 }
 
+// Customer-facing photos for the printed quote: the images an owner/manager
+// flagged "Show to customer" on the referenced job. Loaded as data URLs so they
+// embed in the saved/printed PDF (no dependence on a signed URL that expires).
+function AuthorizedPhotos({ jobReference }) {
+  const [photos, setPhotos] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const ref = (jobReference || "").trim();
+      const job = ref ? getCol("jobs").find(j => (j.jobTitle || "").trim() === ref) : null;
+      if (!job) { if (alive) setPhotos([]); return; }
+      const imgs = getCol("job_media").filter(m => m.jobId === job._id && m.type === "image" && m.customerVisible);
+      if (!imgs.length) { if (alive) setPhotos([]); return; }
+      const withData = await Promise.all(imgs.map(async m => ({ ...m, url: await bmbMedia.dataUrl(m.path) })));
+      if (alive) setPhotos(withData.filter(p => p.url));
+    })();
+    return () => { alive = false; };
+  }, [jobReference]);
+
+  if (!photos || photos.length === 0) return null;
+  return (
+    <div style={{ paddingTop: 24, marginBottom: 8, borderTop: "1px solid #E2E8F0" }}>
+      <div style={{ fontSize: 16, fontWeight: 800, color: "#0F172A", marginBottom: 12 }}>Job Photos</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 10 }}>
+        {photos.map(p => (
+          <div key={p._id} style={{ borderRadius: 8, overflow: "hidden", border: "1px solid #E2E8F0", breakInside: "avoid" }}>
+            <img src={p.url} alt={p.name || "Job photo"} style={{ width: "100%", height: 150, objectFit: "cover", display: "block" }} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function PreviewModal({ doc, onClose }) {
   const { subtotal, discountAmt, taxAmt, total } = calcTotals(doc);
   const visibleItems = doc.items.filter(it => it.description || num(it.rate) || num(it.qty) !== 1);
@@ -1720,6 +1916,8 @@ function PreviewModal({ doc, onClose }) {
               <div className="rte-print" style={{ fontSize: 13, color: "#334155", lineHeight: 1.7 }} dangerouslySetInnerHTML={{ __html: doc.documentHtml }} />
             </div>
           )}
+
+          <AuthorizedPhotos jobReference={doc.jobReference} />
 
           {(doc.notes || doc.terms) && (
             <div style={{ display: "flex", gap: 24, paddingTop: 20, borderTop: "1px solid #E2E8F0", flexWrap: "wrap" }}>
