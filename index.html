@@ -3371,44 +3371,84 @@ function SettingsPage() {
 }
 
 /* ─── Subscriptions ──────────────────────────────────────────────────────── */
+// Monthly list price per tier. Annual billing (toggle on the page) bills ~2 months
+// free (≈17% off). `users` = seats included; `extra` = $/mo per seat beyond that.
 const PLANS = [
-  { id: "minimum", name: "Minimum", price: 24.99, users: 5, features: ["Core features", "Up to 5 team members", "Time tracking", "Basic inventory", "Email support"] },
-  { id: "growth", name: "Growth", price: 39.99, users: 20, highlight: true, features: ["Everything in Minimum", "Up to 20 team members", "Equipment management", "Quote generation", "Priority support", "Custom reports"] },
-  { id: "professional", name: "Professional", price: 49.99, users: 50, features: ["Everything in Growth", "Up to 50 team members", "Advanced analytics", "Safety templates", "Audit logs", "Phone support"] },
+  { id: "free", name: "Free", price: 0, users: 1, extra: null, tagline: "Try it out",
+    features: ["Quotes & invoices with PDF", "Client CRM", "Up to 5 active jobs", "1 user"] },
+  { id: "starter", name: "Starter", price: 39, users: 3, extra: 15, tagline: "Solo & small crews",
+    features: ["Everything in Free", "Unlimited jobs", "Photos & videos on jobs", "Map locations & crew assignment", "Scheduling", "Up to 3 users"] },
+  { id: "crew", name: "Crew", price: 129, users: 10, extra: 13, highlight: true, tagline: "Growing teams",
+    features: ["Everything in Starter", "Time tracking & daily / work logs", "Equipment & vehicle logs", "Safety checks & inspections", "Granular team permissions", "Up to 10 users"] },
+  { id: "business", name: "Business", price: 249, users: 25, extra: 12, tagline: "Full operation",
+    features: ["Everything in Crew", "Inventory & warehouses", "Contracts & subcontractors", "Manager logs & reports", "Multi-company & private jobs", "Up to 25 users"] },
 ];
 
 function SubscriptionsPage({ heading = true }) {
-  const [plan, setPlan] = useState(() => storage.get("bmb_plan") || "growth");
+  const [plan, setPlan] = useState(() => {
+    const s = storage.get("bmb_plan");
+    return PLANS.some(p => p.id === s) ? s : "crew";
+  });
+  const [annual, setAnnual] = useState(true);
   const select = id => { setPlan(id); storage.set("bmb_plan", id); };
+  const perMonth = p => (annual ? Math.round(p.price * 10 / 12) : p.price); // ~2 months free
 
   return (
     <div>
       {heading && <PageHeader title="Subscription Plans" subtitle="Choose the plan that fits your business" />}
-      <div className="grid-3">
-        {PLANS.map(p => (
-          <div key={p.id} style={{ ...card, marginBottom: 0, border: p.highlight ? "2px solid " + C.secondary : "1px solid " + C.border, position: "relative" }}>
-            {p.highlight && (
-              <div style={{ position: "absolute", top: -12, left: "50%", transform: "translateX(-50%)", background: C.secondary, color: "#fff", fontSize: 11, fontWeight: 700, padding: "3px 12px", borderRadius: 20, whiteSpace: "nowrap" }}>
-                MOST POPULAR
+
+      {/* Monthly / Annual billing toggle */}
+      <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 12, marginBottom: 26 }}>
+        <span style={{ fontSize: 13, fontWeight: annual ? 400 : 700, color: annual ? C.textMuted : C.text }}>Monthly</span>
+        <button type="button" onClick={() => setAnnual(a => !a)} aria-label="Toggle billing period"
+          style={{ width: 46, height: 26, borderRadius: 20, border: "none", background: annual ? C.secondary : C.border, position: "relative", cursor: "pointer", padding: 0 }}>
+          <span style={{ position: "absolute", top: 3, left: annual ? 23 : 3, width: 20, height: 20, borderRadius: "50%", background: "#fff", transition: "left .15s" }} />
+        </button>
+        <span style={{ fontSize: 13, fontWeight: annual ? 700 : 400, color: annual ? C.text : C.textMuted }}>
+          Annual <span style={{ color: C.green, fontWeight: 700 }}>· save 17%</span>
+        </span>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(215px, 1fr))", gap: 16 }}>
+        {PLANS.map(p => {
+          const per = perMonth(p);
+          const isCurrent = plan === p.id;
+          return (
+            <div key={p.id} style={{ ...card, marginBottom: 0, border: p.highlight ? "2px solid " + C.secondary : "1px solid " + C.border, position: "relative", display: "flex", flexDirection: "column" }}>
+              {p.highlight && (
+                <div style={{ position: "absolute", top: -12, left: "50%", transform: "translateX(-50%)", background: C.secondary, color: "#fff", fontSize: 11, fontWeight: 700, padding: "3px 12px", borderRadius: 20, whiteSpace: "nowrap" }}>
+                  MOST POPULAR
+                </div>
+              )}
+              <h3 style={{ fontSize: 20, fontWeight: 800, marginBottom: 2 }}>{p.name}</h3>
+              <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>{p.tagline}</div>
+              <div style={{ fontSize: 32, fontWeight: 900, color: C.accent, marginBottom: 2 }}>
+                ${per}<span style={{ fontSize: 14, fontWeight: 400, color: C.textMuted }}>/mo</span>
               </div>
-            )}
-            <h3 style={{ fontSize: 20, fontWeight: 800, marginBottom: 4 }}>{p.name}</h3>
-            <div style={{ fontSize: 32, fontWeight: 900, color: C.accent, marginBottom: 4 }}>
-              ${p.price}<span style={{ fontSize: 14, fontWeight: 400, color: C.textMuted }}>/mo</span>
+              <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 12, minHeight: 15 }}>
+                {p.price === 0 ? "Free forever" : annual ? "billed annually · $" + (per * 12) + "/yr" : "billed monthly"}
+              </div>
+              <div style={{ fontSize: 12, color: C.text, fontWeight: 600, marginBottom: 14 }}>
+                {p.users === 1 ? "1 user" : "Up to " + p.users + " users"}
+                {p.extra ? <span style={{ color: C.textMuted, fontWeight: 400 }}> · +${p.extra}/extra seat</span> : null}
+              </div>
+              <ul style={{ listStyle: "none", padding: 0, marginBottom: 20, flex: 1 }}>
+                {p.features.map(f => (
+                  <li key={f} style={{ fontSize: 13, padding: "4px 0", display: "flex", gap: 8 }}>
+                    <span style={{ color: C.green }}>✓</span>{f}
+                  </li>
+                ))}
+              </ul>
+              <button type="button" onClick={() => select(p.id)} disabled={isCurrent} style={{ ...(isCurrent ? btnPrimary : btnSecondary), width: "100%", opacity: isCurrent ? 0.65 : 1, cursor: isCurrent ? "default" : "pointer" }}>
+                {isCurrent ? "Current Plan" : (p.price === 0 ? "Switch to Free" : "Choose " + p.name)}
+              </button>
             </div>
-            <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 16 }}>Up to {p.users} team members</div>
-            <ul style={{ listStyle: "none", padding: 0, marginBottom: 20 }}>
-              {p.features.map(f => (
-                <li key={f} style={{ fontSize: 13, padding: "4px 0", display: "flex", gap: 8 }}>
-                  <span style={{ color: C.green }}>✓</span>{f}
-                </li>
-              ))}
-            </ul>
-            <button type="button" onClick={() => select(p.id)} disabled={plan === p.id} style={{ ...(plan === p.id ? btnPrimary : btnSecondary), width: "100%", opacity: plan === p.id ? 0.65 : 1, cursor: plan === p.id ? "default" : "pointer" }}>
-              {plan === p.id ? "Current Plan" : "Select Plan"}
-            </button>
-          </div>
-        ))}
+          );
+        })}
+      </div>
+
+      <div style={{ textAlign: "center", fontSize: 12, color: C.textMuted, marginTop: 18 }}>
+        Selecting a plan sets your preference — online payment &amp; billing is coming soon, and no card is charged today.
       </div>
     </div>
   );
