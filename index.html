@@ -817,6 +817,30 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
             </Field>
           );
         }
+        if (f.type === "maps") {
+          const val = form[f.key] || "";
+          const has = val.trim().length > 0;
+          const useCurrent = () => {
+            if (!navigator.geolocation) { setError("Location isn't available on this device."); return; }
+            setError("");
+            navigator.geolocation.getCurrentPosition(
+              pos => set(f.key, pos.coords.latitude.toFixed(6) + ", " + pos.coords.longitude.toFixed(6)),
+              () => setError("Couldn't get your location — check that location access is allowed."),
+              { enableHighAccuracy: true, timeout: 10000 }
+            );
+          };
+          return (
+            <Field key={f.key} label={f.label} required={f.required}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <input value={val} onChange={e => set(f.key, e.target.value)} placeholder={f.placeholder || "Address or lat, lng"} style={{ ...inputCls, flex: "1 1 200px" }} />
+                <button type="button" onClick={useCurrent} style={{ ...btnOutline, whiteSpace: "nowrap" }}>📍 Use my location</button>
+                <a href={has ? mapsUrl(val) : undefined} target="_blank" rel="noopener noreferrer"
+                   style={{ ...btnOutline, textDecoration: "none", whiteSpace: "nowrap", pointerEvents: has ? "auto" : "none", opacity: has ? 1 : 0.45 }}>🗺️ Open</a>
+              </div>
+              <div style={{ fontSize: 11, color: C.textMuted, marginTop: 5 }}>Type an address, paste a pin (lat, lng), or drop your current location.</div>
+            </Field>
+          );
+        }
         return (
           <Field key={f.key} label={f.label} required={f.required}>
             {f.type === "select"
@@ -910,6 +934,18 @@ function CRUDPage({ title, singular, subtitle, collection, columns, formFields, 
 
 const money = v => (v === "" || v === null || v === undefined ? "—" : "$" + num(v).toFixed(2));
 
+// Universal maps link: opens the native maps app on phones, Google Maps in a
+// browser on desktop. Works with either a street address or "lat, lng" pin.
+const mapsUrl = q => "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(String(q || "").trim());
+function MapLink({ query, label }) {
+  if (!query || !String(query).trim()) return <span>—</span>;
+  return (
+    <a href={mapsUrl(query)} target="_blank" rel="noopener noreferrer"
+       style={{ color: C.accent, textDecoration: "none", fontWeight: 600, whiteSpace: "nowrap" }}
+       title={"Open in Maps: " + query}>📍 {label || "Open in Maps"}</a>
+  );
+}
+
 /* ─── Record pages ───────────────────────────────────────────────────────── */
 // Jobs done for this client, matched by name (case-insensitive).
 function jobsForClient(clientName) {
@@ -938,7 +974,13 @@ function ClientProfile({ client }) {
           {field("Contact", client.contactPerson)}
           {field("Email", client.emailAddress)}
           {field("Phone", client.phoneNumber)}
-          {field("Address", client.billingAddress)}
+          {client.billingAddress && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>Address</div>
+              <div style={{ fontSize: 14, whiteSpace: "pre-line" }}>{client.billingAddress}</div>
+              <div style={{ marginTop: 4 }}><MapLink query={client.billingAddress} /></div>
+            </div>
+          )}
         </div>
         {field("Notes", client.notes)}
       </div>
@@ -980,7 +1022,7 @@ function ClientsPage() {
       { key: "contactPerson", label: "Contact Person", placeholder: "Jane Smith" },
       { key: "emailAddress", label: "Email", type: "email", placeholder: "jane@acme.com" },
       { key: "phoneNumber", label: "Phone", placeholder: "+1 555 000 0000" },
-      { key: "billingAddress", label: "Billing Address", type: "textarea", placeholder: "123 Main St, City, Province" },
+      { key: "billingAddress", label: "Billing Address", type: "maps", placeholder: "123 Main St, City, Province" },
       { key: "notes", label: "Notes", type: "textarea", placeholder: "Additional notes…" },
     ]}
   />;
@@ -997,7 +1039,7 @@ function JobsPage() {
   const formFields = [
     { key: "jobTitle", label: "Job Title", required: true, placeholder: "Site Renovation" },
     { key: "clientName", label: "Client", type: "datalist", options: clientNames, placeholder: "Type or pick a registered client" },
-    { key: "jobAddress", label: "Job Address", placeholder: "Site address" },
+    { key: "jobAddress", label: "Job Location", type: "maps", placeholder: "Site address or pin (lat, lng)" },
     { key: "startDate", label: "Start Date", type: "date" },
     { key: "endDate", label: "End Date", type: "date" },
     { key: "jobStatus", label: "Status", type: "select", options: ["Pending", "Active", "In Progress", "Completed", "On Hold"] },
@@ -1014,16 +1056,48 @@ function JobsPage() {
       <span>{v} {row.visibility === "private" && <Badge color="#FEF2F2" textColor="#DC2626">Private</Badge>}</span>
     ) },
     { key: "clientName", label: "Client" },
+    { key: "jobAddress", label: "Location", render: v => <MapLink query={v} label="Map" /> },
     { key: "assignedEmployees", label: "Crew", render: crew },
     { key: "startDate", label: "Start Date" },
     { key: "jobStatus", label: "Status", render: v => <StatusBadge status={v} /> },
   ];
+
+  const detail = job => {
+    const field = (label, value, node) => (value || node) ? (
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</div>
+        <div style={{ fontSize: 14, whiteSpace: "pre-line" }}>{node || value}</div>
+      </div>
+    ) : null;
+    return (
+      <div>
+        <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 4 }}>
+          {job.jobTitle} {job.visibility === "private" && <Badge color="#FEF2F2" textColor="#DC2626">Private</Badge>}
+        </div>
+        <div style={{ marginBottom: 14 }}><StatusBadge status={job.jobStatus} /></div>
+        <div className="grid-2" style={{ gap: 8 }}>
+          {field("Client", job.clientName)}
+          {field("Start", job.startDate)}
+          {field("End", job.endDate)}
+          {field("Crew", crew(job.assignedEmployees))}
+        </div>
+        {job.jobAddress && field("Location", null,
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <span>{job.jobAddress}</span>
+            <a href={mapsUrl(job.jobAddress)} target="_blank" rel="noopener noreferrer" style={{ ...btnOutline, textDecoration: "none", padding: "6px 12px" }}>🗺️ Open in Maps</a>
+          </div>
+        )}
+        {field("Description", job.jobDescription)}
+      </div>
+    );
+  };
 
   return <CRUDPage
     title="Jobs" singular="Job" subtitle="Manage construction projects and track progress" collection="jobs" emptyIcon="🏗️"
     defaultValues={{ jobStatus: "Pending", visibility: "all", assignedEmployees: [] }}
     columns={columns}
     formFields={formFields}
+    detail={detail}
   />;
 }
 
