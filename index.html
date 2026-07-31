@@ -454,7 +454,9 @@ function AuthProvider({ children }) {
   // Load profile + company + all records for a signed-in session.
   const bootstrap = async (sess) => {
     if (!sess) { CURRENT_COMPANY_ID = null; clearStore(); setProfile(null); setCompany(null); setNoAccess(false); setDataReady(false); return; }
-    try {
+
+    // The actual data load. Any query error bubbles up to the retry logic below.
+    const loadData = async () => {
       let prof = null;
       for (let attempt = 0; attempt < 4 && !prof; attempt++) {
         const { data, error } = await supa.from("profiles").select("*").eq("id", sess.user.id).maybeSingle();
@@ -475,10 +477,31 @@ function AuthProvider({ children }) {
       setCompany(comp ? companyRowToApp(comp) : { id: prof.company_id, companyName: "My Company" });
       await loadAllRecords();
       setDataReady(true);
-    } catch (e) {
+    };
+
+    // An expired/invalid access token surfaces as a 401 / "JWT expired" error.
+    const isAuthErr = (e) => {
+      const msg = String((e && (e.message || e.error_description)) || "").toLowerCase();
+      const code = e && (e.code || e.status);
+      return code === 401 || code === "PGRST303" || msg.includes("jwt") || msg.includes("expired") || (msg.includes("token") && msg.includes("invalid"));
+    };
+    const fail = (e) => {
       console.error("bootstrap failed:", e);
       window.alert("Could not load your account data: " + (e.message || e) + "\nTry signing out and back in.");
       setDataReady(true); // let the app render rather than hang
+    };
+
+    try {
+      await loadData();
+    } catch (e) {
+      // Only an auth error is worth retrying — anything else is a real failure.
+      if (!isAuthErr(e)) { fail(e); return; }
+      // The stored token was stale at startup: refresh it once, then retry so a
+      // returning user isn't shown an empty account.
+      let refreshed = false;
+      try { const { data: rr, error: re } = await supa.auth.refreshSession(); refreshed = !re && !!(rr && rr.session); } catch (_) {}
+      if (!refreshed) { await supa.auth.signOut(); return; } // session truly gone → clean sign-in
+      try { await loadData(); } catch (e2) { fail(e2); }
     }
   };
 
