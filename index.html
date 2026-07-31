@@ -119,8 +119,35 @@ const { useState, useEffect, useRef, useMemo, createContext, useContext } = Reac
 
 /* ─── Supabase client ────────────────────────────────────────────────────── */
 const CFG = window.BMB_CONFIG || {};
+/* ─── Session persistence ("Remember me") ────────────────────────────────────
+   Remember me ON  → the login lives in localStorage: you stay signed in across
+                     browser restarts (until you sign out). This is the default,
+                     so you're not re-typing your password all the time.
+   Remember me OFF → the login lives in sessionStorage: it's wiped when you close
+                     the browser, which is safer on a shared/public computer.
+   The preference itself is a tiny flag; the adapter below reads it to decide
+   where the real session token is written. Reads check both stores, so flipping
+   the setting never drops the session you already have. */
+const REMEMBER_KEY = "bmb-remember";
+const rememberOn = () => localStorage.getItem(REMEMBER_KEY) !== "0"; // default: remember
+function setRememberPref(on) { try { localStorage.setItem(REMEMBER_KEY, on ? "1" : "0"); } catch (e) {} }
+
+const authStorage = {
+  getItem(k) {
+    try { const v = localStorage.getItem(k); if (v !== null) return v; return sessionStorage.getItem(k); }
+    catch (e) { return null; }
+  },
+  setItem(k, v) {
+    try {
+      if (rememberOn()) { localStorage.setItem(k, v); sessionStorage.removeItem(k); }
+      else { sessionStorage.setItem(k, v); localStorage.removeItem(k); }
+    } catch (e) {}
+  },
+  removeItem(k) { try { localStorage.removeItem(k); sessionStorage.removeItem(k); } catch (e) {} },
+};
+
 const supa = window.supabase.createClient(CFG.url, CFG.anonKey, {
-  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storage: authStorage },
 });
 
 // Transient client-only ids (React keys, line items) — never hit the DB.
@@ -435,7 +462,10 @@ function AuthProvider({ children }) {
   // Re-check membership (used by the pending screen's "Check again").
   const refresh = async () => { if (sessionRef.current) { setDataReady(false); await bootstrap(sessionRef.current); } };
 
-  const login = async ({ email, password }) => {
+  const login = async ({ email, password, remember = true }) => {
+    // Set the preference BEFORE signing in, so the new session token is written
+    // to the right store (localStorage if remembering, sessionStorage if not).
+    setRememberPref(remember);
     const { error } = await supa.auth.signInWithPassword({ email: email.trim(), password });
     return error ? { ok: false, error: error.message } : { ok: true };
   };
@@ -3239,7 +3269,7 @@ function LoginPage() {
   const [showModal, setShowModal] = useState(false);
   const [isRegister, setIsRegister] = useState(false);
   const [joinMode, setJoinMode] = useState(false);          // register: join existing vs create new
-  const [form, setForm] = useState({ name: "", email: "", password: "", companyName: "", joinCode: "" });
+  const [form, setForm] = useState({ name: "", email: "", password: "", companyName: "", joinCode: "", remember: true });
   const [codeCompany, setCodeCompany] = useState(null);     // verified company name for the code
   const [verifying, setVerifying] = useState(false);
   const [error, setError] = useState("");
@@ -3274,7 +3304,7 @@ function LoginPage() {
     setSubmitting(true);
     let result;
     const name = form.name.trim() || form.email.split("@")[0];
-    if (!isRegister) result = await login({ email: form.email, password: form.password });
+    if (!isRegister) result = await login({ email: form.email, password: form.password, remember: form.remember });
     else if (joinMode) result = await signup({ name, email: form.email, password: form.password, joinCode: form.joinCode.trim() });
     else result = await signup({ name, email: form.email, password: form.password, companyName: form.companyName.trim() });
     setSubmitting(false);
@@ -3436,6 +3466,16 @@ function LoginPage() {
               )}
               <Field label="Email" required><TextInput type="email" value={form.email} onChange={f("email")} placeholder="you@company.com" /></Field>
               <Field label="Password" required><TextInput type="password" value={form.password} onChange={f("password")} placeholder="••••••••" /></Field>
+              {!isRegister && (
+                <div style={{ marginBottom: 4 }}>
+                  <Checkbox checked={form.remember} onChange={v => setForm(p => ({ ...p, remember: v }))} label="Keep me signed in on this device" />
+                  <p style={{ fontSize: 11, color: "#9CA3AF", margin: "6px 2px 0", lineHeight: 1.5 }}>
+                    {form.remember
+                      ? "You'll stay signed in until you sign out — even after closing the browser."
+                      : "You'll be signed out when you close the browser (better for shared computers)."}
+                  </p>
+                </div>
+              )}
               <button type="submit" disabled={submitting} style={{ ...s.btnGreen, width: "100%", padding: 13, marginTop: 8, fontSize: 15, opacity: submitting ? 0.7 : 1, cursor: submitting ? "wait" : "pointer" }}>
                 {submitting ? "Please wait…" : (isRegister ? (joinMode ? "Request to Join →" : "Create Account →") : "Sign In →")}
               </button>
