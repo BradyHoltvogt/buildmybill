@@ -1146,8 +1146,10 @@ function JobMediaGallery({ job }) {
     if (fileRef.current) fileRef.current.value = "";
   };
 
-  const toggleCustomer = (m) => db.update("job_media", { ...m, customerVisible: !m.customerVisible });
-  const del = (m) => { if (window.confirm("Remove this " + m.type + "? This can't be undone.")) bmbMedia.remove(m); };
+  // db.update / db.remove mutate the store but only notify on rollback, so nudge
+  // a re-render here to reflect the toggle / removal immediately.
+  const toggleCustomer = (m) => { db.update("job_media", { ...m, customerVisible: !m.customerVisible }); notifyData(); };
+  const del = (m) => { if (window.confirm("Remove this " + m.type + "? This can't be undone.")) { bmbMedia.remove(m); notifyData(); } };
 
   const canDelete = (m) => canAuthorize || m.uploadedBy === user?.id;
   const shown = customerCount(media);
