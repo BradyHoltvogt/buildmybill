@@ -964,6 +964,7 @@ function Toast({ message }) {
 function CRUDForm({ fields, data, onSave, onCancel }) {
   const [form, setForm] = useState({ ...data });
   const [error, setError] = useState("");
+  const [lookupKey, setLookupKey] = useState(null); // which maps field is picking a location
   const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
 
   const submit = () => {
@@ -1011,24 +1012,15 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
         if (f.type === "maps") {
           const val = form[f.key] || "";
           const has = val.trim().length > 0;
-          const useCurrent = () => {
-            if (!navigator.geolocation) { setError("Location isn't available on this device."); return; }
-            setError("");
-            navigator.geolocation.getCurrentPosition(
-              pos => set(f.key, pos.coords.latitude.toFixed(6) + ", " + pos.coords.longitude.toFixed(6)),
-              () => setError("Couldn't get your location — check that location access is allowed."),
-              { enableHighAccuracy: true, timeout: 10000 }
-            );
-          };
           return (
             <Field key={f.key} label={f.label} required={f.required}>
               <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                <input value={val} onChange={e => set(f.key, e.target.value)} placeholder={f.placeholder || "Address or lat, lng"} style={{ ...inputCls, flex: "1 1 200px" }} />
-                <button type="button" onClick={useCurrent} style={{ ...btnOutline, whiteSpace: "nowrap" }}>📍 Use my location</button>
+                <input value={val} onChange={e => set(f.key, e.target.value)} placeholder={f.placeholder || "Address, lat/long, or look it up →"} style={{ ...inputCls, flex: "1 1 180px" }} />
+                <button type="button" onClick={() => setLookupKey(f.key)} style={{ ...btnSecondary, whiteSpace: "nowrap" }}>🔍 Look up</button>
                 <a href={has ? mapsUrl(val) : undefined} target="_blank" rel="noopener noreferrer"
                    style={{ ...btnOutline, textDecoration: "none", whiteSpace: "nowrap", pointerEvents: has ? "auto" : "none", opacity: has ? 1 : 0.45 }}>🗺️ Open</a>
               </div>
-              <div style={{ fontSize: 11, color: C.textMuted, marginTop: 5 }}>Type an address, paste a pin (lat, lng), or drop your current location.</div>
+              <div style={{ fontSize: 11, color: C.textMuted, marginTop: 5 }}>Search an address/town, convert a land location (SW-14-32-20-W2), or drop your GPS — no need to leave the app.</div>
             </Field>
           );
         }
@@ -1046,6 +1038,7 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
         <button type="button" onClick={onCancel} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
         <button type="button" onClick={submit} style={{ ...btnSecondary, flex: 1 }}>Save</button>
       </div>
+      {lookupKey && <LocationPicker onClose={() => setLookupKey(null)} onPick={(v) => { set(lookupKey, v); setLookupKey(null); }} />}
     </div>
   );
 }
@@ -1134,6 +1127,181 @@ function MapLink({ query, label }) {
     <a href={mapsUrl(query)} target="_blank" rel="noopener noreferrer"
        style={{ color: C.accent, textDecoration: "none", fontWeight: 600, whiteSpace: "nowrap" }}
        title={"Open in Maps: " + query}>📍 {label || "Open in Maps"}</a>
+  );
+}
+
+/* ─── Location lookup ─────────────────────────────────────────────────────────
+   Three ways to get a lat/long into an address field without leaving the app:
+   1. Legal land description (Dominion Land Survey) → lat/long by grid math.
+      Works offline, no API key. Prairie provinces (SK/AB/MB). Approximate
+      (~1–2 km — a road correction lines aren't modelled), so it drops a pin in
+      the right neighbourhood for directions; verify on the map.
+   2. Address / town search via OpenStreetMap (Nominatim) — exact, no key.
+   3. Current GPS location.
+──────────────────────────────────────────────────────────────────────────────*/
+const MERIDIAN_LON = { 1: -97.457, 2: -102, 3: -106, 4: -110, 5: -114, 6: -118 };
+
+// Parse "SW-14-32-20-W2" (and forgiving variants, optional "LSD n-…") into parts.
+function parseLandDescription(input) {
+  if (!input) return null;
+  const s = String(input).toUpperCase().replace(/\s+/g, " ").trim();
+  // Optional leading LSD number, then quarter (or none), sec, twp, rge, meridian.
+  // Accept separators - , space or dot.
+  let m = s.match(/^(?:LSD\s*(\d{1,2})[\s\-.]+)?(NE|NW|SE|SW)?[\s\-.]*(\d{1,2})[\s\-.]+(\d{1,3})[\s\-.]+(\d{1,2})[\s\-.]+W?\s*([1-6])$/);
+  if (!m) return null;
+  const [, lsd, quarter, section, township, range, meridian] = m;
+  const sec = +section, twp = +township, rge = +range, mer = +meridian;
+  if (sec < 1 || sec > 36 || rge < 1 || twp < 1 || !MERIDIAN_LON[mer]) return null;
+  if (!quarter && !lsd) return null; // need at least a quarter or an LSD to place it
+  return { lsd: lsd ? +lsd : null, quarter: quarter || null, section: sec, township: twp, range: rge, meridian: mer };
+}
+
+// DLS grid math → approximate { lat, lng }. Township ≈ 6 mi, section ≈ 1 mi,
+// quarter ≈ ½ mi, LSD ≈ ¼ mi, boustrophedon numbering from the SE corner.
+function landToLatLng(p) {
+  if (!p) return null;
+  const MILE = 1.60934, LAT_PER_MI = MILE / 111.2;
+  const TWP_H = 0.0873; // deg latitude per township (calibrated incl. road allowances)
+  // Section position within the township (col from west, row from south).
+  const rowFromSouth = Math.floor((p.section - 1) / 6);
+  const idx = (p.section - 1) % 6;
+  const colFromEast = rowFromSouth % 2 === 0 ? idx : 5 - idx; // row 0 numbers E→W
+  const colFromWest = 5 - colFromEast;
+  let xMi = colFromWest + 0.5;      // miles east of township west edge
+  let yMi = rowFromSouth + 0.5;      // miles north of township south edge
+  // Quarter offset (½-mile quarters).
+  if (p.quarter) {
+    xMi += p.quarter.includes("E") ? 0.25 : -0.25;
+    yMi += p.quarter.includes("N") ? 0.25 : -0.25;
+  }
+  // LSD offset (¼-mile grid, 1–16, snake from SE) — refines within the quarter/section.
+  if (p.lsd) {
+    const lr = Math.floor((p.lsd - 1) / 4), li = (p.lsd - 1) % 4;
+    const lcolE = lr % 2 === 0 ? li : 3 - li;
+    const lcolW = 3 - lcolE;
+    xMi = (lcolW + 0.5) * 0.25 * 4 / 4; // 0..4 mi grid → but LSD spans whole section
+    xMi = lcolW * 0.25 + 0.125;
+    yMi = lr * 0.25 + 0.125;
+    // place within the section origin (section west/south edge)
+    xMi += colFromWest;
+    yMi += rowFromSouth;
+  }
+  const lat = 49 + (p.township - 1) * TWP_H + yMi * LAT_PER_MI;
+  const lonPerMi = MILE / (111.32 * Math.cos(lat * Math.PI / 180));
+  // West edge of the range = meridian minus (range * 6) miles.
+  const westEdgeLon = MERIDIAN_LON[p.meridian] - (p.range * 6) * lonPerMi;
+  const lng = westEdgeLon + xMi * lonPerMi;
+  return { lat: +lat.toFixed(6), lng: +lng.toFixed(6) };
+}
+
+// Address / town → lat/long via OpenStreetMap Nominatim (keyless, low volume).
+async function geocodeAddress(query) {
+  const q = String(query || "").trim();
+  if (!q) return null;
+  const url = "https://nominatim.openstreetmap.org/search?format=json&limit=5&countrycodes=ca,us&q=" + encodeURIComponent(q);
+  try {
+    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!r.ok) return [];
+    const data = await r.json();
+    return (data || []).map(d => ({ label: d.display_name, lat: +(+d.lat).toFixed(6), lng: +(+d.lon).toFixed(6) }));
+  } catch (e) { return []; }
+}
+
+// A lat/long string ready for the address field / maps link.
+const latLngStr = (lat, lng) => (+lat).toFixed(6) + ", " + (+lng).toFixed(6);
+
+// Modal to find a location by address/town search, legal land description, or GPS.
+function LocationPicker({ onPick, onClose }) {
+  const [mode, setMode] = useState("address");
+  const [addr, setAddr] = useState("");
+  const [results, setResults] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [land, setLand] = useState("");
+  const [err, setErr] = useState("");
+
+  const parsed = mode === "land" ? parseLandDescription(land) : null;
+  const landLL = parsed ? landToLatLng(parsed) : null;
+
+  const doSearch = async () => {
+    if (!addr.trim()) return;
+    setSearching(true); setErr(""); setResults(null);
+    const r = await geocodeAddress(addr);
+    setSearching(false); setResults(r);
+    if (!r.length) setErr("No matches — try adding the town and province, e.g. “Humboldt, SK”.");
+  };
+  const useGps = () => {
+    setErr("");
+    if (!navigator.geolocation) { setErr("GPS isn't available on this device."); return; }
+    navigator.geolocation.getCurrentPosition(
+      pos => onPick(latLngStr(pos.coords.latitude, pos.coords.longitude)),
+      () => setErr("Couldn't get your location — allow location access and try again."),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  };
+
+  const tab = (id, label) => (
+    <button type="button" onClick={() => { setMode(id); setErr(""); }}
+      style={{ flex: 1, padding: "9px 6px", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 12.5, fontWeight: 700, background: mode === id ? "#fff" : "transparent", color: mode === id ? C.primary : C.textMuted, boxShadow: mode === id ? "0 1px 3px rgba(0,0,0,0.1)" : "none" }}>
+      {label}
+    </button>
+  );
+
+  return (
+    <Modal title="Find a location" width={480} onClose={onClose}>
+      <div style={{ display: "flex", gap: 6, padding: 4, background: "#F3F4F6", borderRadius: 10, marginBottom: 16 }}>
+        {tab("address", "Address / town")}
+        {tab("land", "Land location")}
+        {tab("gps", "My GPS")}
+      </div>
+
+      {err && <div style={{ background: "#FEF2F2", color: "#DC2626", padding: "9px 12px", borderRadius: 8, marginBottom: 12, fontSize: 13 }}>{err}</div>}
+
+      {mode === "address" && (
+        <div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={addr} onChange={e => setAddr(e.target.value)} onKeyDown={e => e.key === "Enter" && doSearch()} placeholder="123 Main St, Humboldt, SK" style={{ ...inputCls, flex: 1 }} autoFocus />
+            <button type="button" onClick={doSearch} disabled={searching} style={{ ...btnSecondary, whiteSpace: "nowrap" }}>{searching ? "…" : "Search"}</button>
+          </div>
+          <div style={{ marginTop: 12, maxHeight: 260, overflowY: "auto" }}>
+            {results && results.map((r, i) => (
+              <button key={i} type="button" onClick={() => onPick(r.label)} style={{ display: "block", width: "100%", textAlign: "left", background: "none", border: "1px solid " + C.border, borderRadius: 8, padding: "10px 12px", marginBottom: 8, cursor: "pointer", fontSize: 13 }}>
+                {r.label}
+                <span style={{ display: "block", fontSize: 11, color: C.textMuted, marginTop: 2 }}>{latLngStr(r.lat, r.lng)}</span>
+              </button>
+            ))}
+          </div>
+          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>Powered by OpenStreetMap. Best for street addresses and towns.</div>
+        </div>
+      )}
+
+      {mode === "land" && (
+        <div>
+          <label style={{ fontSize: 12, fontWeight: 600, color: C.textMuted }}>Legal land description</label>
+          <input value={land} onChange={e => setLand(e.target.value)} placeholder="SW-14-32-20-W2" style={{ ...inputCls, marginTop: 4, fontFamily: "monospace", letterSpacing: 1 }} autoFocus />
+          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>Quarter–Section–Township–Range–Meridian (LSD optional). Prairie provinces.</div>
+          {land.trim() && !parsed && <div style={{ color: "#DC2626", fontSize: 12, marginTop: 8 }}>Couldn't read that — try a format like <strong>SW-14-32-20-W2</strong>.</div>}
+          {parsed && landLL && (
+            <div style={{ background: C.surfaceAlt, borderRadius: 10, padding: 14, marginTop: 12 }}>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{parsed.lsd ? "LSD " + parsed.lsd + "-" : ""}{parsed.quarter ? parsed.quarter + "-" : ""}{parsed.section}-{parsed.township}-{parsed.range}-W{parsed.meridian}</div>
+              <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>≈ {latLngStr(landLL.lat, landLL.lng)}</div>
+              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                <a href={mapsUrl(latLngStr(landLL.lat, landLL.lng))} target="_blank" rel="noopener noreferrer" style={{ ...btnOutline, textDecoration: "none", flex: 1, textAlign: "center" }}>🗺️ Verify on map</a>
+                <button type="button" onClick={() => onPick(latLngStr(landLL.lat, landLL.lng))} style={{ ...btnSecondary, flex: 1 }}>Use this</button>
+              </div>
+              <div style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>Approximate — puts you in the right section/township. Always tap “Verify on map” and nudge if needed.</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {mode === "gps" && (
+        <div style={{ textAlign: "center", padding: "20px 0" }}>
+          <div style={{ fontSize: 34, marginBottom: 8 }}>📍</div>
+          <p style={{ fontSize: 13, color: C.textMuted, marginBottom: 16 }}>Drop a pin at where you are right now.</p>
+          <button type="button" onClick={useGps} style={{ ...btnSecondary, width: "100%" }}>Use my current location</button>
+        </div>
+      )}
+    </Modal>
   );
 }
 
@@ -1347,8 +1515,10 @@ function JobsPage() {
     { key: "assignedEmployees", label: "Assign Employees", type: "multiselect", options: employeeNames, emptyHint: "Add employees on the Employees page first." },
     ...(canPrivate ? [{
       key: "visibility", label: "Visibility", type: "select",
-      options: [{ value: "all", label: "Everyone in the company" }, { value: "private", label: "Private — hidden from employees" }],
+      options: [{ value: "private", label: "Private — only owners, managers & assigned crew" }, { value: "all", label: "Everyone in the company" }],
     }] : []),
+    { key: "mobilization", label: "Charge a mobilization fee for this job", type: "boolean" },
+    { key: "mobilizationCost", label: "Mobilization cost ($)", type: "number", placeholder: "e.g. 500" },
     { key: "jobDescription", label: "Description", type: "textarea", placeholder: "Project details…" },
   ];
 
@@ -1385,6 +1555,7 @@ function JobsPage() {
           {field("Start", job.startDate)}
           {field("End", job.endDate)}
           {field("Crew", crew(job.assignedEmployees))}
+          {job.mobilization && field("Mobilization", num(job.mobilizationCost) > 0 ? "$" + num(job.mobilizationCost).toFixed(2) : "Yes")}
         </div>
         {job.jobAddress && field("Location", null,
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
@@ -1402,7 +1573,7 @@ function JobsPage() {
 
   return <CRUDPage
     title="Jobs" singular="Job" subtitle="Manage construction projects and track progress" collection="jobs" emptyIcon="🏗️"
-    defaultValues={{ jobStatus: "Pending", visibility: "all", assignedEmployees: [] }}
+    defaultValues={{ jobStatus: "Pending", visibility: canPrivate ? "private" : "all", assignedEmployees: [] }}
     columns={columns}
     formFields={formFields}
     detail={detail}
