@@ -53,7 +53,7 @@
     }
     .topbar {
       display: flex; align-items: center; gap: 12px;
-      padding: 10px 16px; background: var(--brand-primary); color: #fff;
+      padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 10px; background: var(--brand-primary); color: #fff;
       position: sticky; top: 0; z-index: 100;
     }
     .app { flex-direction: column; }
@@ -75,10 +75,12 @@
   .mshell { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; background: #F3F4F6; }
   .mtopbar {
     background: var(--brand-primary); color: #fff;
-    padding: calc(10px + env(safe-area-inset-top)) 16px 10px;
+    padding: calc(12px + env(safe-area-inset-top, 0px)) 16px 12px;
     display: flex; align-items: center; justify-content: space-between; gap: 10px;
     position: sticky; top: 0; z-index: 20;
   }
+  /* Installed on an iPhone: extra room so the header clears the status bar / notch. */
+  .ios-standalone .mtopbar { padding-top: calc(20px + env(safe-area-inset-top, 0px)); }
   .mmain { flex: 1; padding: 16px 14px calc(88px + env(safe-area-inset-bottom)); }
   .mtabbar {
     position: fixed; left: 0; right: 0; bottom: 0; display: flex;
@@ -4582,6 +4584,14 @@ if (boot) boot.remove();
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   </script>
   <script>
+    // Tag the root when launched as an installed app (and specifically on iOS),
+    // so CSS can add safe-area / status-bar breathing room only where needed.
+    (function () {
+      var standalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+      var ios = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+      if (standalone) document.documentElement.classList.add("standalone");
+      if (standalone && ios) document.documentElement.classList.add("ios-standalone");
+    })();
     // Register the service worker so the app is installable and loads offline.
     // (Network-first inside the worker, so new deploys still show up.)
     if ("serviceWorker" in navigator) {
