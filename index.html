@@ -203,7 +203,7 @@ const storage = {
 const COLLECTIONS = [
   "quotes", "clients", "jobs", "employees", "subcontractors", "equipment",
   "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
-  "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs",
+  "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs", "quote_docs",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -408,21 +408,26 @@ const bmbMedia = {
   },
 };
 
-/* ─── Job documents (PDFs of locates, permits, etc.) — kept SEPARATE from photos.
-   Private bucket, foldered by company/job, same isolation as media. */
+/* ─── Documents (PDFs of locates, permits, etc.) — kept SEPARATE from photos.
+   Private bucket, foldered by company. Used for jobs (job_docs) AND quotes
+   (quote_docs) — both live in the same bucket, isolated per company. */
 const DOCS_BUCKET = "job-docs";
 const DOC_MAX_BYTES = 25 * 1024 * 1024; // 25 MB per file
 const bmbDocs = {
-  async upload(jobId, file, uploader) {
+  // ownerId = the job or quote id; opts.collection/idField/folder parameterize it.
+  async upload(ownerId, file, uploader, opts = {}) {
     if (file.size > DOC_MAX_BYTES) {
       throw new Error("File is too large (" + (file.size / 1048576).toFixed(0) + " MB). Max is 25 MB.");
     }
+    const collection = opts.collection || "job_docs";
+    const idField = opts.idField || "jobId";
+    const folder = opts.folder || ownerId;
     const ext = (file.name.split(".").pop() || "bin").toLowerCase().replace(/[^a-z0-9]/g, "");
-    const path = CURRENT_COMPANY_ID + "/" + jobId + "/" + uuid() + "." + ext;
+    const path = CURRENT_COMPANY_ID + "/" + folder + "/" + uuid() + "." + ext;
     const { error } = await supa.storage.from(DOCS_BUCKET).upload(path, file, { contentType: file.type || undefined, upsert: false });
     if (error) throw error;
-    return db.create("job_docs", {
-      jobId, path, name: file.name, size: file.size, mime: file.type || "",
+    return db.create(collection, {
+      [idField]: ownerId, path, name: file.name, size: file.size, mime: file.type || "",
       uploadedBy: uploader?.id || null, uploadedByName: uploader?.name || "",
     });
   },
@@ -430,9 +435,9 @@ const bmbDocs = {
     const { data, error } = await supa.storage.from(DOCS_BUCKET).createSignedUrl(path, expires);
     return error || !data ? null : data.signedUrl;
   },
-  async remove(rec) {
+  async remove(rec, collection = "job_docs") {
     try { await supa.storage.from(DOCS_BUCKET).remove([rec.path]); } catch (e) {}
-    db.remove("job_docs", rec._id);
+    db.remove(collection, rec._id);
   },
 };
 
@@ -1535,12 +1540,12 @@ const fileIcon = (name, mime) => {
 };
 const prettySize = b => (b > 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1024)) + " KB");
 
-// Documents attached to a job — PDFs of locates, permits, etc. Separate from photos.
-function JobDocsList({ job }) {
+// Reusable document list — used for both jobs (job_docs) and quotes (quote_docs).
+function DocsList({ ownerId, collection = "job_docs", idField = "jobId", folder, emptyHint }) {
   const { user } = useAuth();
-  const ver = useDataVersion();
+  useDataVersion();
   const canDeleteAny = user?.isOwner || user?.role === "Manager";
-  const docs = getCol("job_docs").filter(d => d.jobId === job._id);
+  const docs = getCol(collection).filter(d => d[idField] === ownerId);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
   const fileRef = useRef(null);
@@ -1550,13 +1555,13 @@ function JobDocsList({ job }) {
     if (!files.length) return;
     setBusy(true); setNote("");
     let ok = 0;
-    for (const f of files) { try { await bmbDocs.upload(job._id, f, user); ok++; } catch (e) { window.alert("Couldn't upload " + f.name + ":\n" + (e.message || e)); } }
+    for (const f of files) { try { await bmbDocs.upload(ownerId, f, user, { collection, idField, folder }); ok++; } catch (e) { window.alert("Couldn't upload " + f.name + ":\n" + (e.message || e)); } }
     setBusy(false); notifyData();
     setNote(ok ? ok + " document" + (ok > 1 ? "s" : "") + " added." : "");
     if (fileRef.current) fileRef.current.value = "";
   };
   const open = async (d) => { const url = await bmbDocs.signedUrl(d.path); if (url) window.open(url, "_blank", "noopener"); else window.alert("Couldn't open that file."); };
-  const del = (d) => { if (window.confirm("Remove “" + (d.name || "this file") + "”?")) { bmbDocs.remove(d); notifyData(); } };
+  const del = (d) => { if (window.confirm("Remove “" + (d.name || "this file") + "”?")) { bmbDocs.remove(d, collection); notifyData(); } };
 
   return (
     <div style={{ marginTop: 4 }}>
@@ -1571,7 +1576,7 @@ function JobDocsList({ job }) {
         </div>
       </div>
       {docs.length === 0
-        ? <div style={{ fontSize: 13, color: C.textMuted, background: C.surfaceAlt, borderRadius: 8, padding: "14px", textAlign: "center" }}>No documents yet. Add locates, permits, drawings, or any PDF for this job.</div>
+        ? <div style={{ fontSize: 13, color: C.textMuted, background: C.surfaceAlt, borderRadius: 8, padding: "14px", textAlign: "center" }}>{emptyHint || "No documents yet. Add locates, permits, drawings, or any PDF."}</div>
         : docs.map(d => (
             <div key={d._id} style={{ display: "flex", alignItems: "center", gap: 10, border: "1px solid " + C.border, borderRadius: 8, padding: "10px 12px", marginBottom: 8 }}>
               <span style={{ fontSize: 20 }}>{fileIcon(d.name, d.mime)}</span>
@@ -1584,6 +1589,11 @@ function JobDocsList({ job }) {
           ))}
     </div>
   );
+}
+
+// Job documents — thin wrapper over the reusable list.
+function JobDocsList({ job }) {
+  return <DocsList ownerId={job._id} collection="job_docs" idField="jobId" emptyHint="No documents yet. Add locates, permits, drawings, or any PDF for this job." />;
 }
 
 function JobsPage() {
@@ -1730,7 +1740,9 @@ function EquipmentPage() {
       { key: "manufacturer", label: "Manufacturer" },
       { key: "yearOfManufacture", label: "Year" },
       { key: "billingRatePerHour", label: "$/hr", render: money },
-      { key: "totalHours", label: "Hours/KM" },
+      { key: "totalHours", label: "Engine Hrs" },
+      { key: "currentMileage", label: "Mileage (km)", render: v => (v === "" || v === undefined || v === null ? "—" : num(v).toLocaleString()) },
+      { key: "lastServiceDate", label: "Last Service", render: v => v || "—" },
     ]}
     formFields={[
       { key: "equipmentName", label: "Equipment Name", required: true, placeholder: "Excavator CAT 320" },
@@ -1738,7 +1750,9 @@ function EquipmentPage() {
       { key: "manufacturer", label: "Manufacturer", placeholder: "Caterpillar, John Deere…" },
       { key: "yearOfManufacture", label: "Year", type: "number", placeholder: "2020" },
       { key: "billingRatePerHour", label: "Billing Rate ($/hr)", type: "number", placeholder: "150.00" },
-      { key: "totalHours", label: "Total Hours / KM", type: "number", placeholder: "0" },
+      { key: "totalHours", label: "Engine Hours", type: "number", placeholder: "0" },
+      { key: "currentMileage", label: "Current Mileage (km)", type: "number", placeholder: "0" },
+      { key: "lastServiceDate", label: "Last Service Date", type: "date" },
       { key: "vinNumber", label: "VIN Number", placeholder: "1HGBH41JXMN109186" },
       { key: "description", label: "Description", type: "textarea", placeholder: "Equipment notes…" },
       { key: "maintenanceNotes", label: "Maintenance Notes", type: "textarea", placeholder: "Recent maintenance…" },
@@ -2502,6 +2516,15 @@ function QuoteEditor({ docId, onClose }) {
             {sectionTitle("Terms & Conditions")}
             <TextInput value={doc.terms} onChange={v => update({ terms: v })} placeholder="Payment terms, late fees…" rows={4} />
           </div>
+        </div>
+
+        {/* Attachments — supporting files for this quote (internal, not printed). */}
+        <div style={{ ...card, marginTop: 20 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>Attachments <span style={{ fontSize: 11, fontWeight: 600, color: C.textMuted }}>(internal — not printed on the quote)</span></div>
+          <div style={{ fontSize: 12, color: C.textMuted, margin: "2px 0 12px" }}>Spec sheets, reference PDFs, supplier quotes — kept with this quote for your team.</div>
+          {savedId
+            ? <DocsList ownerId={savedId} collection="quote_docs" idField="quoteId" folder={"quote-" + savedId} emptyHint="No attachments yet. Add supporting PDFs or reference files for this quote." />
+            : <div style={{ fontSize: 13, color: C.textMuted, background: C.surfaceAlt, borderRadius: 8, padding: "14px", textAlign: "center" }}>Save the quote first (button below), then you can attach documents.</div>}
         </div>
       </div>
     </div>
@@ -4696,6 +4719,17 @@ function MobileDailyLog() {
       isMaintenance: !!draft.maintenance, maintUnit: draft.maintUnit, maintMileage: draft.maintMileage, maintHours: draft.maintHours,
       source: "mobile-log",
     });
+    // Push the latest mileage/hours reading onto the matching equipment record,
+    // so each machine keeps its running totals up to date.
+    if (draft.maintenance && draft.maintUnit && (draft.maintHours || draft.maintMileage)) {
+      const eq = getCol("equipment").find(e => (e.equipmentName || "").trim() === draft.maintUnit.trim());
+      if (eq) {
+        const patch = { ...eq, lastServiceDate: today() };
+        if (draft.maintHours) patch.totalHours = num(draft.maintHours);
+        if (draft.maintMileage) patch.currentMileage = num(draft.maintMileage);
+        db.update("equipment", patch);
+      }
+    }
     notifyData();
     setDraft({ ...emptyDraft }); storage.remove(DL_DRAFT_KEY);
     setMsg("Saved ✓");
