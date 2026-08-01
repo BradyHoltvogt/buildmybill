@@ -203,7 +203,7 @@ const storage = {
 const COLLECTIONS = [
   "quotes", "clients", "jobs", "employees", "subcontractors", "equipment",
   "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
-  "warehouses", "managerlogs", "doctemplates", "job_media", "shifts",
+  "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -405,6 +405,34 @@ const bmbMedia = {
   async remove(rec) {
     try { await supa.storage.from(MEDIA_BUCKET).remove([rec.path]); } catch (e) {}
     db.remove("job_media", rec._id);
+  },
+};
+
+/* ─── Job documents (PDFs of locates, permits, etc.) — kept SEPARATE from photos.
+   Private bucket, foldered by company/job, same isolation as media. */
+const DOCS_BUCKET = "job-docs";
+const DOC_MAX_BYTES = 25 * 1024 * 1024; // 25 MB per file
+const bmbDocs = {
+  async upload(jobId, file, uploader) {
+    if (file.size > DOC_MAX_BYTES) {
+      throw new Error("File is too large (" + (file.size / 1048576).toFixed(0) + " MB). Max is 25 MB.");
+    }
+    const ext = (file.name.split(".").pop() || "bin").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const path = CURRENT_COMPANY_ID + "/" + jobId + "/" + uuid() + "." + ext;
+    const { error } = await supa.storage.from(DOCS_BUCKET).upload(path, file, { contentType: file.type || undefined, upsert: false });
+    if (error) throw error;
+    return db.create("job_docs", {
+      jobId, path, name: file.name, size: file.size, mime: file.type || "",
+      uploadedBy: uploader?.id || null, uploadedByName: uploader?.name || "",
+    });
+  },
+  async signedUrl(path, expires = 3600) {
+    const { data, error } = await supa.storage.from(DOCS_BUCKET).createSignedUrl(path, expires);
+    return error || !data ? null : data.signedUrl;
+  },
+  async remove(rec) {
+    try { await supa.storage.from(DOCS_BUCKET).remove([rec.path]); } catch (e) {}
+    db.remove("job_docs", rec._id);
   },
 };
 
@@ -1497,6 +1525,67 @@ function JobMediaGallery({ job }) {
 
 const customerCount = (media) => media.filter(m => m.type === "image" && m.customerVisible).length;
 
+const fileIcon = (name, mime) => {
+  const ext = (name || "").split(".").pop().toLowerCase();
+  if ((mime || "").includes("pdf") || ext === "pdf") return "📄";
+  if (["doc", "docx"].includes(ext)) return "📝";
+  if (["xls", "xlsx", "csv"].includes(ext)) return "📊";
+  if ((mime || "").startsWith("image")) return "🖼";
+  return "📎";
+};
+const prettySize = b => (b > 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1024)) + " KB");
+
+// Documents attached to a job — PDFs of locates, permits, etc. Separate from photos.
+function JobDocsList({ job }) {
+  const { user } = useAuth();
+  const ver = useDataVersion();
+  const canDeleteAny = user?.isOwner || user?.role === "Manager";
+  const docs = getCol("job_docs").filter(d => d.jobId === job._id);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const fileRef = useRef(null);
+
+  const onFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setBusy(true); setNote("");
+    let ok = 0;
+    for (const f of files) { try { await bmbDocs.upload(job._id, f, user); ok++; } catch (e) { window.alert("Couldn't upload " + f.name + ":\n" + (e.message || e)); } }
+    setBusy(false); notifyData();
+    setNote(ok ? ok + " document" + (ok > 1 ? "s" : "") + " added." : "");
+    if (fileRef.current) fileRef.current.value = "";
+  };
+  const open = async (d) => { const url = await bmbDocs.signedUrl(d.path); if (url) window.open(url, "_blank", "noopener"); else window.alert("Couldn't open that file."); };
+  const del = (d) => { if (window.confirm("Remove “" + (d.name || "this file") + "”?")) { bmbDocs.remove(d); notifyData(); } };
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+        <div style={{ fontSize: 13, fontWeight: 700 }}>Documents {docs.length > 0 && <span style={{ color: C.textMuted, fontWeight: 500 }}>({docs.length})</span>}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {note && <span style={{ fontSize: 12, color: C.green }}>{note}</span>}
+          <button type="button" onClick={() => fileRef.current && fileRef.current.click()} disabled={busy} style={{ ...btnOutline, padding: "7px 14px", opacity: busy ? 0.6 : 1, cursor: busy ? "wait" : "pointer" }}>
+            {busy ? "Uploading…" : "＋ Add documents"}
+          </button>
+          <input ref={fileRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,application/pdf,image/*" multiple style={{ display: "none" }} onChange={e => onFiles(e.target.files)} />
+        </div>
+      </div>
+      {docs.length === 0
+        ? <div style={{ fontSize: 13, color: C.textMuted, background: C.surfaceAlt, borderRadius: 8, padding: "14px", textAlign: "center" }}>No documents yet. Add locates, permits, drawings, or any PDF for this job.</div>
+        : docs.map(d => (
+            <div key={d._id} style={{ display: "flex", alignItems: "center", gap: 10, border: "1px solid " + C.border, borderRadius: 8, padding: "10px 12px", marginBottom: 8 }}>
+              <span style={{ fontSize: 20 }}>{fileIcon(d.name, d.mime)}</span>
+              <button type="button" onClick={() => open(d)} style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.accent, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{d.name}</div>
+                <div style={{ fontSize: 11, color: C.textMuted }}>{prettySize(d.size)}{d.uploadedByName ? " · " + d.uploadedByName : ""}</div>
+              </button>
+              {(canDeleteAny || d.uploadedBy === user?.id) && <button type="button" onClick={() => del(d)} title="Remove" style={{ background: "none", border: "none", color: "#DC2626", cursor: "pointer", fontSize: 14 }}>🗑</button>}
+            </div>
+          ))}
+    </div>
+  );
+}
+
 function JobsPage() {
   const { user } = useAuth();
   const clientNames = useMemo(() => db.getAll("clients").items.map(c => c.clientName).filter(Boolean), []);
@@ -1566,6 +1655,9 @@ function JobsPage() {
         {field("Description", job.jobDescription)}
         <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
           <JobMediaGallery job={job} />
+        </div>
+        <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
+          <JobDocsList job={job} />
         </div>
       </div>
     );
@@ -4569,11 +4661,12 @@ function MobileTimeClock() {
 // The in-progress entry is saved to a draft (so switching tabs never loses it),
 // and photos/videos can be attached straight to the picked job.
 const DL_DRAFT_KEY = "bmb_dl_draft";
-const emptyDraft = { job: "", jobId: "", work: "", start: "", end: "", notes: "" };
+const emptyDraft = { job: "", jobId: "", work: "", start: "", end: "", notes: "", maintenance: false, maintUnit: "", maintMileage: "", maintHours: "" };
 function MobileDailyLog() {
   const { user } = useAuth();
   useDataVersion();
   const jobs = getCol("jobs");
+  const equipment = getCol("equipment");
   const employee = user?.name || "Me";
   const [draft, setDraft] = useState(() => {
     try { const d = JSON.parse(storage.get(DL_DRAFT_KEY) || "null"); return d && typeof d === "object" ? { ...emptyDraft, ...d } : { ...emptyDraft }; }
@@ -4593,11 +4686,15 @@ function MobileDailyLog() {
   const hrs = hoursBetween(draft.start, draft.end);
 
   const save = () => {
-    if (!draft.job && !draft.work.trim()) { setMsg("Pick a job or describe the work first."); return; }
+    if (draft.maintenance && !draft.maintUnit.trim()) { setMsg("Pick or enter the equipment unit for the maintenance."); return; }
+    if (!draft.job && !draft.work.trim() && !draft.maintenance) { setMsg("Pick a job or describe the work first."); return; }
     db.create("timeentries", {
       employeeName: employee, jobName: draft.job, entryDate: today(),
       startTime: draft.start, endTime: draft.end, hoursWorked: hrs,
-      workDescription: draft.work, notes: draft.notes, equipmentUsed: "", mileageDriven: 0, source: "mobile-log",
+      workDescription: draft.work, notes: draft.notes,
+      equipmentUsed: draft.maintenance ? draft.maintUnit : "", mileageDriven: draft.maintenance ? num(draft.maintMileage) : 0,
+      isMaintenance: !!draft.maintenance, maintUnit: draft.maintUnit, maintMileage: draft.maintMileage, maintHours: draft.maintHours,
+      source: "mobile-log",
     });
     notifyData();
     setDraft({ ...emptyDraft }); storage.remove(DL_DRAFT_KEY);
@@ -4627,7 +4724,7 @@ function MobileDailyLog() {
       <div style={mCard}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
           <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 4 }}>Log today's work</div>
-          {(draft.job || draft.work || draft.start || draft.notes) && <button type="button" onClick={clearDraft} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12, cursor: "pointer" }}>Clear</button>}
+          {(draft.job || draft.work || draft.start || draft.notes || draft.maintenance) && <button type="button" onClick={clearDraft} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12, cursor: "pointer" }}>Clear</button>}
         </div>
         <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>{new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
         <label style={mLbl}>Job</label>
@@ -4644,6 +4741,24 @@ function MobileDailyLog() {
         {hrs > 0 && <div style={{ textAlign: "center", marginTop: 8, fontSize: 13, color: C.textMuted }}>{draft.start}–{draft.end} · <strong style={{ color: C.accent }}>{hmm(hrs)}</strong> ({hrs.toFixed(2)} h)</div>}
         <label style={mLbl}>Notes</label>
         <input value={draft.notes} onChange={e => set("notes", e.target.value)} placeholder="Anything worth noting…" style={mInput} />
+
+        {/* Equipment maintenance — prompts for unit, mileage & hours. */}
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+          <input type="checkbox" checked={draft.maintenance} onChange={e => set("maintenance", e.target.checked)} style={{ accentColor: C.secondary, width: 18, height: 18 }} />
+          🔧 This is equipment maintenance
+        </label>
+        {draft.maintenance && (
+          <div style={{ background: C.surfaceAlt, borderRadius: 10, padding: 12, marginTop: 8 }}>
+            <label style={{ ...mLbl, marginTop: 0 }}>Unit / equipment</label>
+            <input list="dl-equipment" value={draft.maintUnit} onChange={e => set("maintUnit", e.target.value)} placeholder="Unit number, or pick equipment" style={mInput} />
+            <datalist id="dl-equipment">{equipment.map(eq => <option key={eq._id} value={eq.equipmentName} />)}</datalist>
+            <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
+              <div style={{ flex: 1 }}><label style={mLbl}>Mileage (km)</label><input type="number" inputMode="numeric" value={draft.maintMileage} onChange={e => set("maintMileage", e.target.value)} placeholder="0" style={mInput} /></div>
+              <div style={{ flex: 1 }}><label style={mLbl}>Engine hours</label><input type="number" inputMode="decimal" value={draft.maintHours} onChange={e => set("maintHours", e.target.value)} placeholder="0" style={mInput} /></div>
+            </div>
+            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>Describe the maintenance in “Work done” above.</div>
+          </div>
+        )}
 
         {/* Photos & videos attach to the picked job. */}
         <button type="button" onClick={() => fileRef.current && fileRef.current.click()} disabled={busy}
@@ -4668,6 +4783,7 @@ function MobileDailyLog() {
               </div>
               {(e.startTime || e.endTime) && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>{e.startTime || "?"}–{e.endTime || "?"}{num(e.hoursWorked) > 0 ? " · " + num(e.hoursWorked).toFixed(2) + " h" : ""}</div>}
               {e.workDescription && <div style={{ fontSize: 13, color: C.text, marginTop: 3 }}>{e.workDescription}</div>}
+              {e.isMaintenance && <div style={{ fontSize: 12, color: "#D97706", marginTop: 3, fontWeight: 600 }}>🔧 {e.maintUnit}{e.maintMileage ? " · " + e.maintMileage + " km" : ""}{e.maintHours ? " · " + e.maintHours + " hrs" : ""}</div>}
               {e.notes && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>{e.notes}</div>}
             </div>
           ))}
@@ -4733,6 +4849,7 @@ function MobilePhotos() {
         <button type="button" onClick={() => setJobId(null)} style={{ background: "none", border: "none", color: C.accent, fontWeight: 700, fontSize: 14, cursor: "pointer", marginBottom: 8, padding: 0 }}>‹ All jobs</button>
         <div style={{ fontWeight: 800, fontSize: 17, marginBottom: 10 }}>{job.jobTitle}</div>
         <div style={mCard}><JobMediaGallery job={job} /></div>
+        <div style={mCard}><JobDocsList job={job} /></div>
       </div>
     );
   }
