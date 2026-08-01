@@ -2,9 +2,17 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>BuildMyBill — Construction Business Management</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2316A34A'/><text x='16' y='23' font-size='20' font-family='system-ui' font-weight='800' fill='white' text-anchor='middle'>B</text></svg>" />
+<!-- PWA / installable field app -->
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#111827" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="BuildMyBill" />
 <style>
   :root {
     --brand-primary: #111827;
@@ -62,6 +70,28 @@
 
   .row-wrap { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
   .scroll-x { overflow-x: auto; }
+
+  /* ── Mobile / field app ── */
+  .mshell { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; background: #F3F4F6; }
+  .mtopbar {
+    background: var(--brand-primary); color: #fff;
+    padding: calc(10px + env(safe-area-inset-top)) 16px 10px;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    position: sticky; top: 0; z-index: 20;
+  }
+  .mmain { flex: 1; padding: 16px 14px calc(88px + env(safe-area-inset-bottom)); }
+  .mtabbar {
+    position: fixed; left: 0; right: 0; bottom: 0; display: flex;
+    background: #fff; border-top: 1px solid #E5E7EB;
+    padding-bottom: env(safe-area-inset-bottom); z-index: 40;
+  }
+  .mtab {
+    flex: 1; background: none; border: none; padding: 8px 2px 10px;
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    font-size: 10.5px; font-weight: 600; color: #9CA3AF; cursor: pointer;
+  }
+  .mtab.active { color: var(--brand-secondary); }
+  .mtab .ico { font-size: 21px; line-height: 1; }
 
   /* Rich-text editor + printed document: restore heading/list styling the reset removes */
   .rte-surface h2, .rte-print h2 { font-size: 20px; font-weight: 800; margin: 10px 0 6px; }
@@ -3936,11 +3966,450 @@ function NoAccessScreen() {
   );
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   MOBILE / FIELD APP — a phone-first experience for crews: clock in/out (the
+   heart of it), daily logs, schedule, and job photos. Shown automatically on
+   small screens and when installed as a PWA. The desktop app is untouched.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const FORCE_DESKTOP_KEY = "bmb_force_desktop";
+const ACTIVE_CLOCK_KEY = "bmb_active_clock";
+
+function useIsMobile() {
+  const q = "(max-width: 820px)";
+  const val = () => storage.get(FORCE_DESKTOP_KEY) !== "1" && window.matchMedia(q).matches;
+  const [mobile, setMobile] = useState(val);
+  useEffect(() => {
+    const mq = window.matchMedia(q);
+    const on = () => setMobile(val());
+    mq.addEventListener ? mq.addEventListener("change", on) : mq.addListener(on);
+    return () => { mq.removeEventListener ? mq.removeEventListener("change", on) : mq.removeListener(on); };
+  }, []);
+  return mobile;
+}
+
+// Current position as "lat, lng", or null. Never blocks the caller for long.
+function getGeo(timeout = 8000) {
+  return new Promise(resolve => {
+    if (!navigator.geolocation) return resolve(null);
+    navigator.geolocation.getCurrentPosition(
+      p => resolve(p.coords.latitude.toFixed(6) + ", " + p.coords.longitude.toFixed(6)),
+      () => resolve(null),
+      { enableHighAccuracy: true, timeout, maximumAge: 60000 }
+    );
+  });
+}
+
+const timeHM = d => { const p = n => String(n).padStart(2, "0"); return p(d.getHours()) + ":" + p(d.getMinutes()); };
+const fmtDur = ms => {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const p = n => String(n).padStart(2, "0");
+  return Math.floor(s / 3600) + ":" + p(Math.floor((s % 3600) / 60)) + ":" + p(s % 60);
+};
+
+const mBtn = { width: "100%", border: "none", borderRadius: 14, padding: "17px", fontSize: 17, fontWeight: 800, cursor: "pointer" };
+const mCard = { background: C.surface, border: "1px solid " + C.border, borderRadius: 14, padding: 16, marginBottom: 12 };
+const mLbl = { display: "block", fontSize: 12, fontWeight: 600, color: C.textMuted, margin: "10px 0 4px" };
+const mInput = { width: "100%", padding: "12px", border: "1px solid " + C.border, borderRadius: 10, fontSize: 15, background: C.surface, color: C.text, WebkitAppearance: "none" };
+const sheetRow = { display: "block", width: "100%", textAlign: "left", background: "none", border: "none", borderBottom: "1px solid " + C.border, padding: "15px 16px", fontSize: 15, cursor: "pointer", color: C.text };
+
+// Bottom sheet used for job pickers and quick forms.
+function MobileSheet({ title, onClose, children }) {
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", zIndex: 60, display: "flex", alignItems: "flex-end" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: C.surface, width: "100%", borderRadius: "18px 18px 0 0", maxHeight: "82vh", overflowY: "auto", paddingBottom: "env(safe-area-inset-bottom)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px", borderBottom: "1px solid " + C.border, position: "sticky", top: 0, background: C.surface }}>
+          <span style={{ fontWeight: 800, fontSize: 16 }}>{title}</span>
+          <button type="button" onClick={onClose} style={{ background: "none", border: "none", fontSize: 24, color: C.textMuted, cursor: "pointer", lineHeight: 1 }}>×</button>
+        </div>
+        <div>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function MobileLocked() {
+  return (
+    <div style={{ ...mCard, textAlign: "center", padding: "30px 18px" }}>
+      <div style={{ fontSize: 34, marginBottom: 8 }}>🔒</div>
+      <div style={{ fontWeight: 700, marginBottom: 4 }}>No access to this section</div>
+      <div style={{ fontSize: 13, color: C.textMuted }}>Your company owner controls what you can see. Ask them to enable it for you.</div>
+    </div>
+  );
+}
+
+// Add a past time entry by hand (fallback for forgotten clock-ins).
+function MobileManualEntry({ employee, jobs, onClose, onSaved }) {
+  const [job, setJob] = useState("");
+  const [date, setDate] = useState(today());
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
+  const hrs = hoursBetween(start, end);
+  const save = () => {
+    db.create("timeentries", { employeeName: employee, jobName: job, entryDate: date, startTime: start, endTime: end, hoursWorked: hrs, workDescription: "", notes: "", equipmentUsed: "", mileageDriven: 0, source: "mobile-manual" });
+    notifyData();
+    onSaved();
+  };
+  return (
+    <MobileSheet title="Add time manually" onClose={onClose}>
+      <div style={{ padding: 16 }}>
+        <label style={mLbl}>Job</label>
+        <select value={job} onChange={e => setJob(e.target.value)} style={mInput}>
+          <option value="">No specific job</option>
+          {jobs.map(j => <option key={j._id} value={j.jobTitle}>{j.jobTitle}</option>)}
+        </select>
+        <label style={mLbl}>Date</label>
+        <input type="date" value={date} onChange={e => setDate(e.target.value)} style={mInput} />
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1 }}><label style={mLbl}>Start</label><input type="time" value={start} onChange={e => setStart(e.target.value)} style={mInput} /></div>
+          <div style={{ flex: 1 }}><label style={mLbl}>End</label><input type="time" value={end} onChange={e => setEnd(e.target.value)} style={mInput} /></div>
+        </div>
+        <div style={{ textAlign: "center", margin: "12px 0", fontWeight: 800, color: C.accent, fontSize: 18 }}>{hrs.toFixed(2)} h</div>
+        <button type="button" onClick={save} disabled={hrs <= 0} style={{ ...mBtn, background: hrs > 0 ? C.secondary : C.border, color: "#fff", opacity: hrs > 0 ? 1 : .7 }}>Save entry</button>
+      </div>
+    </MobileSheet>
+  );
+}
+
+// ⏱️ The centerpiece: one-tap clock in / out with a live timer and GPS stamp.
+function MobileTimeClock() {
+  const { user } = useAuth();
+  useDataVersion();
+  const employeeOptions = useEmployeeOptions();
+  const openJobs = getCol("jobs").filter(j => j.jobStatus !== "Completed");
+  const allJobs = getCol("jobs");
+
+  const [employee, setEmployee] = useState(user?.name || employeeOptions[0] || "Me");
+  const [active, setActive] = useState(() => { try { return JSON.parse(storage.get(ACTIVE_CLOCK_KEY) || "null"); } catch (e) { return null; } });
+  const [nowTs, setNowTs] = useState(Date.now());
+  const [picking, setPicking] = useState(false);
+  const [manual, setManual] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!active) return;
+    const id = setInterval(() => setNowTs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+
+  const persist = v => { setActive(v); if (v) storage.set(ACTIVE_CLOCK_KEY, JSON.stringify(v)); else storage.remove(ACTIVE_CLOCK_KEY); };
+
+  const clockIn = async jobName => {
+    setPicking(false);
+    const v = { employee, jobName, startISO: new Date().toISOString(), geoIn: null };
+    persist(v);
+    const geo = await getGeo();
+    if (geo) persist({ ...v, geoIn: geo });
+  };
+
+  const clockOut = async () => {
+    if (!active) return;
+    setBusy(true);
+    const start = new Date(active.startISO);
+    const end = new Date();
+    const geoOut = await getGeo();
+    db.create("timeentries", {
+      employeeName: active.employee, jobName: active.jobName, entryDate: dateStr(start),
+      startTime: timeHM(start), endTime: timeHM(end),
+      hoursWorked: Math.round((end - start) / 3600000 * 100) / 100,
+      workDescription: "", notes: "", equipmentUsed: "", mileageDriven: 0,
+      clockInAt: active.startISO, clockOutAt: end.toISOString(),
+      clockInLocation: active.geoIn || "", clockOutLocation: geoOut || "", source: "mobile-clock",
+    });
+    notifyData();
+    persist(null);
+    setBusy(false);
+  };
+
+  const myToday = getCol("timeentries").filter(e => e.entryDate === today() && e.employeeName === employee);
+  const todayHours = myToday.reduce((t, e) => t + num(e.hoursWorked), 0) + (active ? (nowTs - new Date(active.startISO)) / 3600000 : 0);
+
+  return (
+    <div>
+      {employeeOptions.length > 1 && !active && (
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: 12, color: C.textMuted, fontWeight: 600 }}>Logging time for</label>
+          <select value={employee} onChange={e => setEmployee(e.target.value)} style={{ ...mInput, marginTop: 4 }}>
+            {employeeOptions.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </div>
+      )}
+
+      <div style={{ ...mCard, textAlign: "center", padding: "26px 16px", background: active ? "#0F172A" : C.surface, color: active ? "#fff" : C.text, border: active ? "none" : mCard.border }}>
+        {active ? (
+          <>
+            <div style={{ fontSize: 11, letterSpacing: 1.5, textTransform: "uppercase", opacity: .55 }}>● Clocked in</div>
+            <div style={{ fontSize: 46, fontWeight: 900, fontVariantNumeric: "tabular-nums", margin: "6px 0 2px" }}>{fmtDur(nowTs - new Date(active.startISO))}</div>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>{active.jobName || "No specific job"}</div>
+            <div style={{ fontSize: 12, opacity: .55, marginTop: 3 }}>Since {timeHM(new Date(active.startISO))}{active.geoIn ? " · 📍 location saved" : ""}</div>
+            <button type="button" disabled={busy} onClick={clockOut} style={{ ...mBtn, background: "#DC2626", color: "#fff", marginTop: 20, opacity: busy ? .7 : 1 }}>{busy ? "Saving…" : "■  Clock Out"}</button>
+          </>
+        ) : (
+          <>
+            <div style={{ fontSize: 40, marginBottom: 4 }}>⏱️</div>
+            <div style={{ fontSize: 15, color: C.textMuted, marginBottom: 18 }}>You're not clocked in</div>
+            <button type="button" onClick={() => setPicking(true)} style={{ ...mBtn, background: C.secondary, color: "#fff" }}>▶  Clock In</button>
+            <button type="button" onClick={() => setManual(true)} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 14, marginTop: 12, cursor: "pointer", fontWeight: 600 }}>+ Add time manually</button>
+          </>
+        )}
+      </div>
+
+      <div style={{ ...mCard, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 600 }}>Today</div>
+          <div style={{ fontSize: 24, fontWeight: 900 }}>{todayHours.toFixed(2)} <span style={{ fontSize: 14, color: C.textMuted }}>h</span></div>
+        </div>
+        <div style={{ fontSize: 12, color: C.textMuted }}>{myToday.length} {myToday.length === 1 ? "entry" : "entries"}</div>
+      </div>
+
+      {myToday.length > 0 && (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 700, margin: "10px 2px 8px" }}>Today's entries</div>
+          {myToday.map(e => (
+            <div key={e._id} style={{ ...mCard, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, padding: 14 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 14, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.jobName || "No job"}</div>
+                <div style={{ fontSize: 12, color: C.textMuted }}>{e.startTime || "?"}–{e.endTime || "?"}{e.clockInLocation ? " · 📍" : ""}</div>
+              </div>
+              <div style={{ fontWeight: 800, color: C.accent, whiteSpace: "nowrap", marginLeft: 10 }}>{num(e.hoursWorked).toFixed(2)}h</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {picking && (
+        <MobileSheet title="What are you working on?" onClose={() => setPicking(false)}>
+          <button type="button" onClick={() => clockIn("")} style={{ ...sheetRow, fontWeight: 700 }}>▶ Start with no specific job</button>
+          {openJobs.length === 0 && <div style={{ padding: 16, color: C.textMuted, fontSize: 13 }}>No open jobs — you can still clock in with no job above.</div>}
+          {openJobs.map(j => (
+            <button key={j._id} type="button" onClick={() => clockIn(j.jobTitle)} style={sheetRow}>
+              <span style={{ fontWeight: 700 }}>{j.jobTitle}</span>
+              {j.clientName ? <span style={{ fontSize: 12, color: C.textMuted, display: "block", marginTop: 2 }}>{j.clientName}</span> : null}
+            </button>
+          ))}
+        </MobileSheet>
+      )}
+
+      {manual && <MobileManualEntry employee={employee} jobs={allJobs} onClose={() => setManual(false)} onSaved={() => setManual(false)} />}
+    </div>
+  );
+}
+
+// 📝 Quick daily log — one entry at a time, thumb-friendly.
+function MobileDailyLog() {
+  const { user } = useAuth();
+  useDataVersion();
+  const jobs = getCol("jobs");
+  const employee = user?.name || "Me";
+  const [job, setJob] = useState("");
+  const [work, setWork] = useState("");
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
+  const [notes, setNotes] = useState("");
+  const [msg, setMsg] = useState("");
+
+  const save = () => {
+    if (!job && !work.trim()) { setMsg("Pick a job or describe the work first."); return; }
+    db.create("timeentries", {
+      employeeName: employee, jobName: job, entryDate: today(),
+      startTime: start, endTime: end, hoursWorked: hoursBetween(start, end),
+      workDescription: work, notes, equipmentUsed: "", mileageDriven: 0, source: "mobile-log",
+    });
+    notifyData();
+    setJob(""); setWork(""); setStart(""); setEnd(""); setNotes(""); setMsg("Saved ✓");
+    setTimeout(() => setMsg(""), 2500);
+  };
+
+  const mine = getCol("timeentries").filter(e => e.entryDate === today() && e.employeeName === employee);
+
+  return (
+    <div>
+      <div style={mCard}>
+        <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 4 }}>Log today's work</div>
+        <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>{new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
+        <label style={mLbl}>Job</label>
+        <select value={job} onChange={e => setJob(e.target.value)} style={mInput}>
+          <option value="">No specific job</option>
+          {jobs.map(j => <option key={j._id} value={j.jobTitle}>{j.jobTitle}</option>)}
+        </select>
+        <label style={mLbl}>Work done</label>
+        <textarea value={work} onChange={e => setWork(e.target.value)} placeholder="Excavation, backfill, grading…" rows={3} style={{ ...mInput, resize: "vertical" }} />
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1 }}><label style={mLbl}>Start</label><input type="time" value={start} onChange={e => setStart(e.target.value)} style={mInput} /></div>
+          <div style={{ flex: 1 }}><label style={mLbl}>End</label><input type="time" value={end} onChange={e => setEnd(e.target.value)} style={mInput} /></div>
+        </div>
+        <label style={mLbl}>Notes</label>
+        <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Anything worth noting…" style={mInput} />
+        {msg && <div style={{ textAlign: "center", color: msg.includes("✓") ? C.green : "#DC2626", fontSize: 13, marginTop: 12, fontWeight: 600 }}>{msg}</div>}
+        <button type="button" onClick={save} style={{ ...mBtn, background: C.secondary, color: "#fff", marginTop: 14 }}>Save log</button>
+      </div>
+
+      {mine.length > 0 && (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 700, margin: "10px 2px 8px" }}>Logged today</div>
+          {mine.map(e => (
+            <div key={e._id} style={{ ...mCard, padding: 14, marginBottom: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{e.jobName || "No job"}</div>
+                {num(e.hoursWorked) > 0 && <div style={{ fontWeight: 800, color: C.accent }}>{num(e.hoursWorked).toFixed(2)}h</div>}
+              </div>
+              {e.workDescription && <div style={{ fontSize: 13, color: C.text, marginTop: 3 }}>{e.workDescription}</div>}
+              {e.notes && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>{e.notes}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 📅 Schedule — jobs grouped by when, as tappable cards with a map link.
+function MobileSchedule() {
+  const t = today();
+  const jobs = getCol("jobs").filter(j => j.startDate).slice().sort((a, b) => (a.startDate || "").localeCompare(b.startDate || ""));
+  const isToday = j => (j.startDate || "") <= t && (j.endDate || j.startDate || "") >= t;
+  const groups = [
+    { label: "Today", items: jobs.filter(isToday) },
+    { label: "Upcoming", items: jobs.filter(j => (j.startDate || "") > t) },
+    { label: "Earlier", items: jobs.filter(j => (j.endDate || j.startDate || "") < t).reverse() },
+  ].filter(g => g.items.length);
+
+  if (jobs.length === 0) return <div style={{ ...mCard, textAlign: "center", padding: "30px 18px", color: C.textMuted }}>No scheduled jobs yet. Jobs with a start date show up here.</div>;
+
+  return (
+    <div>
+      {groups.map(g => (
+        <div key={g.label} style={{ marginBottom: 6 }}>
+          <div style={{ fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, color: g.label === "Today" ? C.secondary : C.textMuted, margin: "6px 2px 8px" }}>{g.label}</div>
+          {g.items.map(j => (
+            <div key={j._id} style={{ ...mCard, padding: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                <div style={{ fontWeight: 800, fontSize: 15 }}>{j.jobTitle}</div>
+                <StatusBadge status={j.jobStatus} />
+              </div>
+              {j.clientName && <div style={{ fontSize: 13, color: C.textMuted, marginTop: 2 }}>{j.clientName}</div>}
+              <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>
+                {j.startDate}{j.endDate && j.endDate !== j.startDate ? " → " + j.endDate : ""}
+              </div>
+              {Array.isArray(j.assignedEmployees) && j.assignedEmployees.length > 0 && (
+                <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>👷 {j.assignedEmployees.join(", ")}</div>
+              )}
+              {j.jobAddress && <div style={{ marginTop: 8 }}><MapLink query={j.jobAddress} label="Directions" /></div>}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// 📷 Photos — pick a job, then view / capture photos (reuses the gallery).
+function MobilePhotos() {
+  useDataVersion();
+  const jobs = getCol("jobs");
+  const [jobId, setJobId] = useState(null);
+  const job = jobs.find(j => j._id === jobId);
+
+  if (job) {
+    return (
+      <div>
+        <button type="button" onClick={() => setJobId(null)} style={{ background: "none", border: "none", color: C.accent, fontWeight: 700, fontSize: 14, cursor: "pointer", marginBottom: 8, padding: 0 }}>‹ All jobs</button>
+        <div style={{ fontWeight: 800, fontSize: 17, marginBottom: 10 }}>{job.jobTitle}</div>
+        <div style={mCard}><JobMediaGallery job={job} /></div>
+      </div>
+    );
+  }
+
+  if (jobs.length === 0) return <div style={{ ...mCard, textAlign: "center", padding: "30px 18px", color: C.textMuted }}>No jobs yet — create one to add photos.</div>;
+
+  return (
+    <div>
+      <div style={{ fontSize: 13, color: C.textMuted, margin: "2px 2px 10px" }}>Pick a job to view or add photos & videos.</div>
+      {jobs.map(j => {
+        const count = getCol("job_media").filter(m => m.jobId === j._id).length;
+        return (
+          <button key={j._id} type="button" onClick={() => setJobId(j._id)} style={{ ...mCard, width: "100%", textAlign: "left", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 700, fontSize: 14, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{j.jobTitle}</div>
+              {j.clientName && <div style={{ fontSize: 12, color: C.textMuted }}>{j.clientName}</div>}
+            </div>
+            <div style={{ fontSize: 13, color: C.textMuted, whiteSpace: "nowrap" }}>{count ? "📷 " + count : "＋"}</div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function MobileMore() {
+  const { user, logout } = useAuth();
+  const { company } = useCompany();
+  const goDesktop = () => { storage.set(FORCE_DESKTOP_KEY, "1"); window.location.reload(); };
+  return (
+    <div>
+      <div style={{ ...mCard, textAlign: "center", padding: "22px 16px" }}>
+        <div style={{ width: 56, height: 56, borderRadius: 16, background: C.secondary, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 800, margin: "0 auto 10px" }}>{(user?.name || "?").slice(0, 1).toUpperCase()}</div>
+        <div style={{ fontWeight: 800, fontSize: 16 }}>{user?.name}</div>
+        <div style={{ fontSize: 13, color: C.textMuted }}>{user?.email}</div>
+        <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{company?.companyName} · {user?.role}</div>
+      </div>
+      <button type="button" onClick={goDesktop} style={{ ...mBtn, background: C.surface, color: C.text, border: "1px solid " + C.border, marginBottom: 12, fontSize: 15 }}>🖥️  Open full app (all features)</button>
+      <button type="button" onClick={logout} style={{ ...mBtn, background: "#FEF2F2", color: "#DC2626", fontSize: 15 }}>Sign out</button>
+      <p style={{ textAlign: "center", fontSize: 11, color: C.textMuted, marginTop: 18 }}>BuildMyBill — field app</p>
+    </div>
+  );
+}
+
+function MobileShell() {
+  const { user } = useAuth();
+  const { company } = useCompany();
+  const [tab, setTab] = useState("track");
+  const can = id => canAccess(id, user);
+  const TABS = [
+    { id: "track", label: "Track", icon: "⏱️", nav: "time-entry" },
+    { id: "log", label: "Daily Log", icon: "📝", nav: "daily-log" },
+    { id: "schedule", label: "Schedule", icon: "📅", nav: "schedule" },
+    { id: "photos", label: "Photos", icon: "📷", nav: "jobs" },
+    { id: "more", label: "More", icon: "⋯", nav: null },
+  ].filter(t => !t.nav || can(t.nav) || t.id === "more");
+  const title = { track: "Time Clock", log: "Daily Log", schedule: "Schedule", photos: "Job Photos", more: "More" }[tab];
+
+  return (
+    <div className="mshell">
+      <div className="mtopbar">
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 30, height: 30, borderRadius: 8, background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 15 }}>B</div>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 800, lineHeight: 1.1 }}>{title}</div>
+            <div style={{ fontSize: 11, opacity: .6 }}>{company?.companyName || "BuildMyBill"}</div>
+          </div>
+        </div>
+        <div style={{ fontSize: 12, opacity: .8, maxWidth: 120, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{user?.name}</div>
+      </div>
+      <div className="mmain">
+        {tab === "track" && (can("time-entry") ? <MobileTimeClock /> : <MobileLocked />)}
+        {tab === "log" && (can("daily-log") ? <MobileDailyLog /> : <MobileLocked />)}
+        {tab === "schedule" && (can("schedule") ? <MobileSchedule /> : <MobileLocked />)}
+        {tab === "photos" && (can("jobs") ? <MobilePhotos /> : <MobileLocked />)}
+        {tab === "more" && <MobileMore />}
+      </div>
+      <div className="mtabbar">
+        {TABS.map(t => (
+          <button key={t.id} type="button" className={"mtab" + (tab === t.id ? " active" : "")} onClick={() => setTab(t.id)}>
+            <span className="ico">{t.icon}</span>{t.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function AppShell() {
   const { page, navigate } = useRouter();
   const { user, isAuthenticated, pending, noAccess, ready, dataReady } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
   const dataVersion = useDataVersion();
+  const isMobile = useIsMobile();
 
   useEffect(() => { setMenuOpen(false); }, [page]);
 
@@ -3949,6 +4418,9 @@ function AppShell() {
   if (noAccess) return <NoAccessScreen />;
   if (pending) return <PendingScreen />;
   if (!dataReady) return <FullScreenLoader label="Loading your company data…" />;
+
+  // Phone-first field experience (unless the user chose the full desktop app).
+  if (isMobile) return <MobileShell />;
 
   const allowed = page === "pricing" ? true
     : page === "quote-editor" ? canAccess("quotes", user)
@@ -4018,6 +4490,15 @@ function App() {
 const boot = document.getElementById("boot");
 if (boot) boot.remove();
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+  <script>
+    // Register the service worker so the app is installable and loads offline.
+    // (Network-first inside the worker, so new deploys still show up.)
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", function () {
+        navigator.serviceWorker.register("sw.js").catch(function () {});
+      });
+    }
   </script>
 </body>
 </html>
