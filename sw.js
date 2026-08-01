@@ -2,7 +2,7 @@
    Network-first for same-origin GETs so new deploys always win; the cache is
    only a fallback when offline. Supabase (cross-origin) requests pass straight
    through and are never cached. */
-const CACHE = "bmb-v1";
+const CACHE = "bmb-v2";
 const SHELL = [
   "./", "./index.html", "./config.js", "./manifest.webmanifest",
   "./vendor/react.production.min.js", "./vendor/react-dom.production.min.js",

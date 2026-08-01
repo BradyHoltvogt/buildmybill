@@ -4527,6 +4527,7 @@ function AppShell() {
         </div>
         {/* key includes dataVersion so a rolled-back background write re-reads the store */}
         <main className="app-main" key={page + ":" + dataVersion}>
+          {isIOS() && !isStandalone() && <MobileInstallBanner />}
           {render
             ? render()
             : (
