@@ -1179,17 +1179,17 @@ function landToLatLng(p) {
     const lr = Math.floor((p.lsd - 1) / 4), li = (p.lsd - 1) % 4;
     const lcolE = lr % 2 === 0 ? li : 3 - li;
     const lcolW = 3 - lcolE;
-    xMi = (lcolW + 0.5) * 0.25 * 4 / 4; // 0..4 mi grid → but LSD spans whole section
-    xMi = lcolW * 0.25 + 0.125;
-    yMi = lr * 0.25 + 0.125;
-    // place within the section origin (section west/south edge)
-    xMi += colFromWest;
-    yMi += rowFromSouth;
+    // ¼-mile LSD cell centre, offset from the section's west/south edge.
+    xMi = colFromWest + lcolW * 0.25 + 0.125;
+    yMi = rowFromSouth + lr * 0.25 + 0.125;
   }
   const lat = 49 + (p.township - 1) * TWP_H + yMi * LAT_PER_MI;
   const lonPerMi = MILE / (111.32 * Math.cos(lat * Math.PI / 180));
-  // West edge of the range = meridian minus (range * 6) miles.
-  const westEdgeLon = MERIDIAN_LON[p.meridian] - (p.range * 6) * lonPerMi;
+  // Ranges are effectively a touch wider than 6 mi because of cumulative road
+  // allowances; 6.094 is calibrated against a surveyed SK quarter-section so the
+  // pin lands in the right spot (within a few hundred m in the tested area).
+  const RANGE_W = 6.094;
+  const westEdgeLon = MERIDIAN_LON[p.meridian] - (p.range * RANGE_W) * lonPerMi;
   const lng = westEdgeLon + xMi * lonPerMi;
   return { lat: +lat.toFixed(6), lng: +lng.toFixed(6) };
 }
