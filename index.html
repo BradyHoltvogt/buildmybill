@@ -4013,6 +4013,36 @@ const mLbl = { display: "block", fontSize: 12, fontWeight: 600, color: C.textMut
 const mInput = { width: "100%", padding: "12px", border: "1px solid " + C.border, borderRadius: 10, fontSize: 15, background: C.surface, color: C.text, WebkitAppearance: "none" };
 const sheetRow = { display: "block", width: "100%", textAlign: "left", background: "none", border: "none", borderBottom: "1px solid " + C.border, padding: "15px 16px", fontSize: 15, cursor: "pointer", color: C.text };
 
+// ── Install (Add to Home Screen) helpers ──
+function isStandalone() {
+  return window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+}
+function isIOS() {
+  return /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+// The captured beforeinstallprompt event (Android/Chrome), tracked reactively.
+function useInstallPrompt() {
+  const [evt, setEvt] = useState(() => window.__bmbInstall || null);
+  useEffect(() => {
+    const on = () => setEvt(window.__bmbInstall || null);
+    window.addEventListener("bmb-installready", on);
+    return () => window.removeEventListener("bmb-installready", on);
+  }, []);
+  return evt;
+}
+function installSteps() {
+  if (isIOS()) return [
+    "Tap the Share button at the bottom of Safari (a square with an up arrow).",
+    "Scroll down and tap “Add to Home Screen”.",
+    "Tap “Add” — BuildMyBill appears on your home screen.",
+  ];
+  return [
+    "Open your browser’s menu (⋮ or ⋯).",
+    "Tap “Add to Home Screen” or “Install app”.",
+    "Confirm to add it to your home screen.",
+  ];
+}
+
 // Bottom sheet used for job pickers and quick forms.
 function MobileSheet({ title, onClose, children }) {
   return (
@@ -4035,6 +4065,52 @@ function MobileLocked() {
       <div style={{ fontWeight: 700, marginBottom: 4 }}>No access to this section</div>
       <div style={{ fontSize: 13, color: C.textMuted }}>Your company owner controls what you can see. Ask them to enable it for you.</div>
     </div>
+  );
+}
+
+// Platform-appropriate "how to install" steps (used when there's no native prompt).
+function InstallHelpSheet({ onClose }) {
+  return (
+    <MobileSheet title="Add to Home Screen" onClose={onClose}>
+      <div style={{ padding: 16, fontSize: 14, lineHeight: 1.6 }}>
+        <ol style={{ margin: 0, paddingLeft: 22 }}>
+          {installSteps().map((s, i) => <li key={i} style={{ marginBottom: 10 }}>{s}</li>)}
+        </ol>
+        {isIOS() && <p style={{ marginTop: 12, color: C.textMuted, fontSize: 12 }}>On iPhone/iPad this only works in Safari — not Chrome.</p>}
+      </div>
+    </MobileSheet>
+  );
+}
+
+// Dismissible banner prompting install. Shows a one-tap Install on Android/Chrome,
+// or a "how to" sheet on iOS (which has no programmatic install).
+function MobileInstallBanner() {
+  const install = useInstallPrompt();
+  const [dismissed, setDismissed] = useState(() => storage.get("bmb_install_dismissed") === "1");
+  const [help, setHelp] = useState(false);
+  if (isStandalone() || dismissed) return null;
+  if (!install && !isIOS()) return null; // desktop browsers etc. — nothing to offer
+  const dismiss = () => { setDismissed(true); storage.set("bmb_install_dismissed", "1"); };
+  const go = async () => {
+    if (install) {
+      install.prompt();
+      try { await install.userChoice; } catch (e) {}
+      window.__bmbInstall = null; dismiss();
+    } else setHelp(true);
+  };
+  return (
+    <>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#0F172A", color: "#fff", borderRadius: 12, padding: "12px 12px 12px 14px", marginBottom: 14 }}>
+        <div style={{ fontSize: 22 }}>📲</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 800, fontSize: 14 }}>Install the app</div>
+          <div style={{ fontSize: 12, opacity: .65 }}>Add BuildMyBill to your home screen.</div>
+        </div>
+        <button type="button" onClick={go} style={{ background: C.secondary, color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Install</button>
+        <button type="button" onClick={dismiss} aria-label="Dismiss" style={{ background: "none", border: "none", color: "#fff", opacity: .5, fontSize: 20, cursor: "pointer", lineHeight: 1 }}>×</button>
+      </div>
+      {help && <InstallHelpSheet onClose={() => setHelp(false)} />}
+    </>
   );
 }
 
@@ -4344,7 +4420,13 @@ function MobilePhotos() {
 function MobileMore() {
   const { user, logout } = useAuth();
   const { company } = useCompany();
+  const install = useInstallPrompt();
+  const [help, setHelp] = useState(false);
   const goDesktop = () => { storage.set(FORCE_DESKTOP_KEY, "1"); window.location.reload(); };
+  const installApp = async () => {
+    if (install) { install.prompt(); try { await install.userChoice; } catch (e) {} window.__bmbInstall = null; }
+    else setHelp(true);
+  };
   return (
     <div>
       <div style={{ ...mCard, textAlign: "center", padding: "22px 16px" }}>
@@ -4353,9 +4435,13 @@ function MobileMore() {
         <div style={{ fontSize: 13, color: C.textMuted }}>{user?.email}</div>
         <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{company?.companyName} · {user?.role}</div>
       </div>
+      {isStandalone()
+        ? <div style={{ ...mCard, textAlign: "center", color: C.green, fontWeight: 700, fontSize: 14 }}>✓ Running as an installed app</div>
+        : <button type="button" onClick={installApp} style={{ ...mBtn, background: C.secondary, color: "#fff", marginBottom: 12, fontSize: 15 }}>📲  Install app on this device</button>}
       <button type="button" onClick={goDesktop} style={{ ...mBtn, background: C.surface, color: C.text, border: "1px solid " + C.border, marginBottom: 12, fontSize: 15 }}>🖥️  Open full app (all features)</button>
       <button type="button" onClick={logout} style={{ ...mBtn, background: "#FEF2F2", color: "#DC2626", fontSize: 15 }}>Sign out</button>
       <p style={{ textAlign: "center", fontSize: 11, color: C.textMuted, marginTop: 18 }}>BuildMyBill — field app</p>
+      {help && <InstallHelpSheet onClose={() => setHelp(false)} />}
     </div>
   );
 }
@@ -4387,6 +4473,7 @@ function MobileShell() {
         <div style={{ fontSize: 12, opacity: .8, maxWidth: 120, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{user?.name}</div>
       </div>
       <div className="mmain">
+        <MobileInstallBanner />
         {tab === "track" && (can("time-entry") ? <MobileTimeClock /> : <MobileLocked />)}
         {tab === "log" && (can("daily-log") ? <MobileDailyLog /> : <MobileLocked />)}
         {tab === "schedule" && (can("schedule") ? <MobileSchedule /> : <MobileLocked />)}
@@ -4435,6 +4522,8 @@ function AppShell() {
         <div className="topbar">
           <button type="button" onClick={() => setMenuOpen(o => !o)} aria-label="Menu" style={{ background: "rgba(255,255,255,0.12)", border: "none", color: "#fff", fontSize: 18, borderRadius: 8, width: 36, height: 36, cursor: "pointer" }}>☰</button>
           <span style={{ fontWeight: 700, fontSize: 15 }}>{label}</span>
+          <button type="button" onClick={() => { storage.remove(FORCE_DESKTOP_KEY); window.location.reload(); }}
+            style={{ marginLeft: "auto", background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>📱 Field view</button>
         </div>
         {/* key includes dataVersion so a rolled-back background write re-reads the store */}
         <main className="app-main" key={page + ":" + dataVersion}>
@@ -4499,6 +4588,18 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         navigator.serviceWorker.register("sw.js").catch(function () {});
       });
     }
+    // Capture the install prompt (Android/Chrome) so the app can offer a clear
+    // "Install" button instead of relying on the easy-to-miss browser prompt.
+    window.__bmbInstall = null;
+    window.addEventListener("beforeinstallprompt", function (e) {
+      e.preventDefault();
+      window.__bmbInstall = e;
+      window.dispatchEvent(new Event("bmb-installready"));
+    });
+    window.addEventListener("appinstalled", function () {
+      window.__bmbInstall = null;
+      window.dispatchEvent(new Event("bmb-installready"));
+    });
   </script>
 </body>
 </html>
