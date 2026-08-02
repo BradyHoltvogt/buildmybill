@@ -1426,6 +1426,10 @@ function ClientsPage() {
 function JobMediaGallery({ job }) {
   const { user } = useAuth();
   const ver = useDataVersion();
+  // Local refresh: re-render in place after upload/toggle/delete WITHOUT a global
+  // notifyData() (which remounts the page and would close the detail modal).
+  const [tick, setTick] = useState(0);
+  const bump = () => setTick(t => t + 1);
   const canAuthorize = user?.isOwner || user?.role === "Manager";
   const media = getCol("job_media").filter(m => m.jobId === job._id);
   const [urls, setUrls] = useState({});
@@ -1444,7 +1448,7 @@ function JobMediaGallery({ job }) {
       setUrls(u => { const n = { ...u }; entries.forEach(([p, url]) => { if (url) n[p] = url; }); return n; });
     })();
     return () => { alive = false; };
-  }, [pathsKey, ver]);
+  }, [pathsKey, ver, tick]);
 
   const onFiles = async (fileList) => {
     const files = Array.from(fileList || []);
@@ -1457,14 +1461,12 @@ function JobMediaGallery({ job }) {
     }
     setBusy(false);
     setNote(ok ? ok + " file" + (ok > 1 ? "s" : "") + " uploaded." : "");
-    notifyData();
+    bump();
     if (fileRef.current) fileRef.current.value = "";
   };
 
-  // db.update / db.remove mutate the store but only notify on rollback, so nudge
-  // a re-render here to reflect the toggle / removal immediately.
-  const toggleCustomer = (m) => { db.update("job_media", { ...m, customerVisible: !m.customerVisible }); notifyData(); };
-  const del = (m) => { if (window.confirm("Remove this " + m.type + "? This can't be undone.")) { bmbMedia.remove(m); notifyData(); } };
+  const toggleCustomer = (m) => { db.update("job_media", { ...m, customerVisible: !m.customerVisible }); bump(); };
+  const del = (m) => { if (window.confirm("Remove this " + m.type + "? This can't be undone.")) { bmbMedia.remove(m); bump(); } };
 
   const canDelete = (m) => canAuthorize || m.uploadedBy === user?.id;
   const shown = customerCount(media);
@@ -1544,6 +1546,8 @@ const prettySize = b => (b > 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.m
 function DocsList({ ownerId, collection = "job_docs", idField = "jobId", folder, emptyHint }) {
   const { user } = useAuth();
   useDataVersion();
+  const [tick, setTick] = useState(0);          // local re-render (keeps the modal open)
+  const bump = () => setTick(t => t + 1);
   const canDeleteAny = user?.isOwner || user?.role === "Manager";
   const docs = getCol(collection).filter(d => d[idField] === ownerId);
   const [busy, setBusy] = useState(false);
@@ -1556,12 +1560,12 @@ function DocsList({ ownerId, collection = "job_docs", idField = "jobId", folder,
     setBusy(true); setNote("");
     let ok = 0;
     for (const f of files) { try { await bmbDocs.upload(ownerId, f, user, { collection, idField, folder }); ok++; } catch (e) { window.alert("Couldn't upload " + f.name + ":\n" + (e.message || e)); } }
-    setBusy(false); notifyData();
+    setBusy(false); bump();
     setNote(ok ? ok + " document" + (ok > 1 ? "s" : "") + " added." : "");
     if (fileRef.current) fileRef.current.value = "";
   };
   const open = async (d) => { const url = await bmbDocs.signedUrl(d.path); if (url) window.open(url, "_blank", "noopener"); else window.alert("Couldn't open that file."); };
-  const del = (d) => { if (window.confirm("Remove “" + (d.name || "this file") + "”?")) { bmbDocs.remove(d, collection); notifyData(); } };
+  const del = (d) => { if (window.confirm("Remove “" + (d.name || "this file") + "”?")) { bmbDocs.remove(d, collection); bump(); } };
 
   return (
     <div style={{ marginTop: 4 }}>
