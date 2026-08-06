@@ -129,6 +129,7 @@
   }
   #boot .msg { font-size: 13px; opacity: .6; }
 </style>
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
 </head>
 <body>
   <div id="boot">
@@ -140,6 +141,7 @@
   <script src="vendor/react.production.min.js"></script>
   <script src="vendor/react-dom.production.min.js"></script>
   <script src="vendor/supabase.js"></script>
+  <script src="vendor/leaflet/leaflet.js"></script>
   <script src="config.js"></script>
   <script src="vendor/babel.min.js"></script>
   <script type="text/babel" data-presets="react">
@@ -182,6 +184,16 @@ const supa = window.supabase.createClient(CFG.url, CFG.anonKey, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storage: authStorage },
 });
 
+// Leaflet's default marker icons are served relative to the page, not to
+// leaflet.css — point them at our vendored copies explicitly.
+if (window.L) {
+  L.Icon.Default.mergeOptions({
+    iconUrl: "vendor/leaflet/images/marker-icon.png",
+    iconRetinaUrl: "vendor/leaflet/images/marker-icon-2x.png",
+    shadowUrl: "vendor/leaflet/images/marker-shadow.png",
+  });
+}
+
 // Transient client-only ids (React keys, line items) — never hit the DB.
 const genId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 // Real UUID for DB rows, generated client-side so optimistic updates keep a stable id.
@@ -204,6 +216,7 @@ const COLLECTIONS = [
   "quotes", "clients", "jobs", "employees", "subcontractors", "equipment",
   "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
   "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs", "quote_docs",
+  "sites", "loads", "activeclocks", "locationpings",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -321,6 +334,16 @@ const db = {
     const { error } = await supa.from("records").delete().eq("company_id", CURRENT_COMPANY_ID);
     if (error) throw error;
     clearStore();
+  },
+
+  // Re-fetches just one collection from the server and replaces the local mirror.
+  // Used for polling data other devices are writing (e.g. crew locations) that
+  // wouldn't otherwise show up until a full reload.
+  async refreshCollection(col) {
+    const { data, error } = await supa.from("records").select("id,collection,data,created_at,updated_at").eq("collection", col).order("created_at", { ascending: false });
+    if (error) { console.error("Refresh failed:", error); return; }
+    store[col] = (data || []).map(rowToRecord);
+    notifyData();
   },
 };
 
@@ -550,7 +573,7 @@ const useCompany = () => useContext(CompanyCtx);
 
 const DEFAULT_PRIMARY = "#111827";
 const DEFAULT_SECONDARY = "#16A34A";
-const BRANDING_KEYS = ["primaryColor", "secondaryColor", "logoUrl", "address", "phone", "email", "website"];
+const BRANDING_KEYS = ["primaryColor", "secondaryColor", "logoUrl", "address", "phone", "email", "website", "shopAddress", "shopLat", "shopLng", "geofenceRadiusM"];
 
 function applyBranding(company) {
   const root = document.documentElement;
@@ -1076,18 +1099,20 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
   );
 }
 
-function CRUDPage({ title, singular, subtitle, collection, columns, formFields, emptyIcon, defaultValues = {}, detail }) {
-  const [items, setItems] = useState(() => db.getAll(collection).items);
+function CRUDPage({ title, singular, subtitle, collection, columns, formFields, emptyIcon, defaultValues = {}, detail, sort, beforeSave }) {
+  const applySort = arr => (sort ? arr.slice().sort(sort) : arr);
+  const [items, setItems] = useState(() => applySort(db.getAll(collection).items));
   const [modal, setModal] = useState(null);
   const [viewing, setViewing] = useState(null);
   const [query, setQuery] = useState("");
   const noun = singular || title.replace(/ies$/, "y").replace(/s$/, "");
 
-  const reload = () => setItems(db.getAll(collection).items);
+  const reload = () => setItems(applySort(db.getAll(collection).items));
 
-  const save = (data) => {
-    if (modal.mode === "edit") db.update(collection, data);
-    else db.create(collection, data);
+  const save = async (data) => {
+    const toSave = beforeSave ? await beforeSave(data) : data;
+    if (modal.mode === "edit") db.update(collection, toSave);
+    else db.create(collection, toSave);
     setModal(null);
     reload();
   };
@@ -1242,6 +1267,58 @@ async function geocodeAddress(query) {
 
 // A lat/long string ready for the address field / maps link.
 const latLngStr = (lat, lng) => (+lat).toFixed(6) + ", " + (+lng).toFixed(6);
+
+// Parse a "lat, lng" string (as produced by latLngStr) back into numbers, or null.
+function parseLatLngStr(s) {
+  const m = String(s || "").match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+  return m ? { lat: +m[1], lng: +m[2] } : null;
+}
+
+// Current position as { lat, lng } numbers, or null. Never blocks the caller for long.
+function getGeoCoords(timeout = 10000) {
+  return new Promise(resolve => {
+    if (!navigator.geolocation) return resolve(null);
+    navigator.geolocation.getCurrentPosition(
+      p => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
+      () => resolve(null),
+      { enableHighAccuracy: true, timeout, maximumAge: 30000 }
+    );
+  });
+}
+
+// "3 min ago" / "just now" — for a live-location "last seen" readout.
+function timeAgo(iso) {
+  if (!iso) return "";
+  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 45) return "just now";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  return Math.round(s / 3600) + " hr ago";
+}
+
+// Great-circle distance in meters between two lat/lng points (haversine).
+function distanceMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Resolve any location field's value (a saved "lat, lng" pin, or free-text address)
+// to coordinates — geocoding it if it isn't already a pin. Used wherever a saved
+// location needs to be measured against, e.g. proximity matching.
+async function resolveLatLng(value) {
+  const parsed = parseLatLngStr(value);
+  if (parsed) return parsed;
+  if (!String(value || "").trim()) return null;
+  const results = await geocodeAddress(value);
+  return results && results[0] ? { lat: results[0].lat, lng: results[0].lng } : null;
+}
+
+// Jobs listed customer-first, so field crews have a reliable spelling reference
+// for daily logs and scale tickets.
+const jobLabel = j => (j && j.clientName ? j.clientName + " — " + (j.jobTitle || "Job") : (j ? (j.jobTitle || "Job") : ""));
+const jobsByClient = jobs => jobs.slice().sort((a, b) =>
+  (a.clientName || "").localeCompare(b.clientName || "") || (a.jobTitle || "").localeCompare(b.jobTitle || ""));
 
 // Modal to find a location by address/town search, legal land description, or GPS.
 function LocationPicker({ onPick, onClose }) {
@@ -1626,10 +1703,10 @@ function JobsPage() {
   ];
 
   const columns = [
+    { key: "clientName", label: "Client" },
     { key: "jobTitle", label: "Job Title", render: (v, row) => (
       <span>{v} {row.visibility === "private" && <Badge color="#FEF2F2" textColor="#DC2626">Private</Badge>}</span>
     ) },
-    { key: "clientName", label: "Client" },
     { key: "jobAddress", label: "Location", render: v => <MapLink query={v} label="Map" /> },
     { key: "assignedEmployees", label: "Crew", render: crew },
     { key: "_media", label: "Media", render: (_v, row) => {
@@ -1683,6 +1760,59 @@ function JobsPage() {
     columns={columns}
     formFields={formFields}
     detail={detail}
+    sort={(a, b) => (a.clientName || "").localeCompare(b.clientName || "") || (a.jobTitle || "").localeCompare(b.jobTitle || "")}
+  />;
+}
+
+function SitesPage() {
+  const clientNames = useMemo(() => db.getAll("clients").items.map(c => c.clientName).filter(Boolean), []);
+  const beforeSave = async data => {
+    const ll = await resolveLatLng(data.siteAddress);
+    return { ...data, siteLat: ll ? ll.lat : null, siteLng: ll ? ll.lng : null };
+  };
+  return <CRUDPage
+    title="Local Sites" singular="Local Site" subtitle="Billable locations you visit repeatedly — snow removal, mowing, recurring service calls — matched automatically by GPS on the daily log" collection="sites" emptyIcon="🧭"
+    columns={[
+      { key: "clientName", label: "Client" },
+      { key: "siteName", label: "Site" },
+      { key: "siteAddress", label: "Location", render: v => <MapLink query={v} label="Map" /> },
+      { key: "billingNotes", label: "Billing Notes" },
+    ]}
+    formFields={[
+      { key: "siteName", label: "Site Name", required: true, placeholder: "North Lot" },
+      { key: "clientName", label: "Client", type: "datalist", options: clientNames, placeholder: "Type or pick a registered client" },
+      { key: "siteAddress", label: "Site Location", type: "maps", placeholder: "Site address or pin (lat, lng)" },
+      { key: "billingNotes", label: "Billing Notes", type: "textarea", placeholder: "Rate, contract terms…" },
+    ]}
+    sort={(a, b) => (a.clientName || "").localeCompare(b.clientName || "") || (a.siteName || "").localeCompare(b.siteName || "")}
+    beforeSave={beforeSave}
+  />;
+}
+
+function HaulLoadsPage() {
+  const jobNames = useMemo(() => jobsByClient(db.getAll("jobs").items).map(j => j.jobTitle).filter(Boolean), []);
+  const truckNames = useMemo(() => db.getAll("equipment").items.filter(e => e.equipmentType === "Truck" || e.equipmentType === "Semi").map(e => e.equipmentName).filter(Boolean), []);
+  const employeeNames = useMemo(() => db.getAll("employees").items.filter(e => e.isActive !== false).map(e => e.fullName).filter(Boolean), []);
+  return <CRUDPage
+    title="Haul Loads" singular="Load" subtitle="Loads hauled per truck — yards and scale ticket numbers, for billing" collection="loads" emptyIcon="⚖️"
+    defaultValues={{ entryDate: today() }}
+    columns={[
+      { key: "entryDate", label: "Date" },
+      { key: "employeeName", label: "Employee" },
+      { key: "truck", label: "Truck" },
+      { key: "jobName", label: "Job" },
+      { key: "yards", label: "Yards", render: v => (num(v) ? num(v) : "—") },
+      { key: "ticketNumber", label: "Ticket #" },
+    ]}
+    formFields={[
+      { key: "entryDate", label: "Date", type: "date", required: true },
+      { key: "employeeName", label: "Employee", type: "datalist", options: employeeNames },
+      { key: "truck", label: "Truck", type: "datalist", options: truckNames, required: true },
+      { key: "jobName", label: "Job", type: "datalist", options: jobNames },
+      { key: "yards", label: "Yards", type: "number", placeholder: "0" },
+      { key: "ticketNumber", label: "Ticket #", placeholder: "Scale ticket #" },
+    ]}
+    sort={(a, b) => (b.entryDate || "").localeCompare(a.entryDate || "")}
   />;
 }
 
@@ -2426,7 +2556,7 @@ function QuoteEditor({ docId, onClose }) {
               ? (
                 <select value={doc.jobReference} onChange={e => update({ jobReference: e.target.value })} style={inputCls}>
                   <option value="">No job selected</option>
-                  {jobs.map(j => <option key={j._id} value={j.jobTitle}>{j.jobTitle}</option>)}
+                  {jobsByClient(jobs).map(j => <option key={j._id} value={j.jobTitle}>{jobLabel(j)}</option>)}
                 </select>
               )
               : <TextInput value={doc.jobReference} onChange={v => update({ jobReference: v })} placeholder="Job name, number, or ID" />}
@@ -2678,7 +2808,7 @@ function TimeEntryPage() {
                       ? (
                         <select value={r.jobLocation} onChange={e => updRow(r.id, "jobLocation", e.target.value)} style={{ ...inputCls, minWidth: 140 }}>
                           <option value="">Select job…</option>
-                          {jobs.map(j => <option key={j._id} value={j.jobTitle}>{j.jobTitle}</option>)}
+                          {jobsByClient(jobs).map(j => <option key={j._id} value={j.jobTitle}>{jobLabel(j)}</option>)}
                         </select>
                       )
                       : <input value={r.jobLocation} onChange={e => updRow(r.id, "jobLocation", e.target.value)} placeholder="Site A" style={{ ...inputCls, minWidth: 130 }} />}
@@ -2809,7 +2939,7 @@ function DailyLogPage() {
               <Field label="Job Location">
                 <select value={r.jobLocation} onChange={e => updRow(r.id, "jobLocation", e.target.value)} style={inputCls}>
                   <option value="">Select job…</option>
-                  {jobs.map(j => <option key={j._id} value={j.jobAddress || j.jobTitle}>{j.jobAddress || j.jobTitle}</option>)}
+                  {jobsByClient(jobs).map(j => <option key={j._id} value={j.jobAddress || j.jobTitle}>{jobLabel(j)}</option>)}
                 </select>
               </Field>
               <Field label="Contract">
@@ -3024,6 +3154,90 @@ function EmployeeLogsPage() {
           emptyMessage="No time entries yet."
         />
       </div>
+    </div>
+  );
+}
+
+/* ─── Crew locations (Owner/Manager only) ────────────────────────────────────
+   Live location for whoever is currently clocked in, plus a breadcrumb trail
+   for their current shift. Backed by the "activeclocks" / "locationpings"
+   collections, which are written on clock-in/out and cleared on clock-out —
+   so this only ever shows someone while they're on the clock, and the trail
+   disappears the moment they clock out. Since other devices' writes aren't
+   pushed to us in real time, this page polls the server directly. */
+function useCrewLocationsPolling(pollMs = 20000) {
+  useDataVersion();
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => { if (!cancelled) { db.refreshCollection("activeclocks"); db.refreshCollection("locationpings"); } };
+    refresh();
+    const id = setInterval(refresh, pollMs);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [pollMs]);
+}
+
+function CrewMapModal({ session, pings, onClose }) {
+  const containerRef = useRef(null);
+  useEffect(() => {
+    if (!containerRef.current || !window.L || pings.length === 0) return;
+    const latlngs = pings.map(p => [p.lat, p.lng]);
+    const map = L.map(containerRef.current).setView(latlngs[latlngs.length - 1], 15);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19, attribution: "&copy; OpenStreetMap contributors",
+    }).addTo(map);
+    if (latlngs.length > 1) {
+      const trail = L.polyline(latlngs, { color: C.secondary, weight: 4 }).addTo(map);
+      L.circleMarker(latlngs[0], { radius: 6, color: "#6B7280", fillColor: "#6B7280", fillOpacity: 1 }).addTo(map).bindPopup("Clocked in here");
+      map.fitBounds(trail.getBounds(), { padding: [30, 30] });
+    }
+    L.marker(latlngs[latlngs.length - 1]).addTo(map).bindPopup("Current location").openPopup();
+    return () => map.remove();
+  }, [session._id, pings.length]);
+
+  return (
+    <Modal title={session.employeeName + " — live location"} width={720} onClose={onClose}>
+      {pings.length === 0
+        ? <p style={{ color: C.textMuted, fontSize: 13 }}>No location yet — the app will drop a pin shortly after they clock in.</p>
+        : (
+          <>
+            <div ref={containerRef} style={{ height: 420, borderRadius: 10, overflow: "hidden" }} />
+            <div style={{ fontSize: 12, color: C.textMuted, marginTop: 10 }}>
+              {pings.length} location ping{pings.length === 1 ? "" : "s"} since clock-in · updates automatically while they're on the clock
+            </div>
+          </>
+        )}
+    </Modal>
+  );
+}
+
+function CrewLocationsPage() {
+  useCrewLocationsPolling();
+  const [selected, setSelected] = useState(null);
+  const active = getCol("activeclocks").slice().sort((a, b) => (a.employeeName || "").localeCompare(b.employeeName || ""));
+  const pingsFor = id => getCol("locationpings").filter(p => p.clockRecordId === id).sort((a, b) => (a.at || "").localeCompare(b.at || ""));
+
+  return (
+    <div>
+      <PageHeader title="Crew Locations" subtitle="Live location for anyone currently clocked in — visible to owners and managers only" />
+      {active.length === 0
+        ? <EmptyState icon="🛰️" title="No one's clocked in" subtitle="Live locations show up here the moment someone clocks in on the field app, and disappear when they clock out." />
+        : (
+          <div className="grid-auto">
+            {active.map(a => {
+              const pings = pingsFor(a._id);
+              const last = pings[pings.length - 1];
+              return (
+                <div key={a._id} style={card}>
+                  <div style={{ fontSize: 15, fontWeight: 700 }}>{a.employeeName}</div>
+                  <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>Clocked in since {a.startISO ? new Date(a.startISO).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}</div>
+                  <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>{last ? "Last seen " + timeAgo(last.at) : "Waiting for a location…"}</div>
+                  <button type="button" onClick={() => setSelected(a)} disabled={!last} style={{ ...btnOutline, marginTop: 12, width: "100%", opacity: last ? 1 : .5 }}>📍 View live location</button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      {selected && <CrewMapModal session={selected} pings={pingsFor(selected._id)} onClose={() => setSelected(null)} />}
     </div>
   );
 }
@@ -3616,13 +3830,20 @@ function SettingsPage() {
     logoUrl: company?.logoUrl || "",
     primaryColor: company?.primaryColor || DEFAULT_PRIMARY,
     secondaryColor: company?.secondaryColor || DEFAULT_SECONDARY,
+    shopAddress: company?.shopAddress || "",
+    geofenceRadiusM: company?.geofenceRadiusM || 300,
   });
   const [message, setMessage] = useState("");
+  const [lookupShop, setLookupShop] = useState(false);
+  const [saving, setSaving] = useState(false);
 
-  const save = () => {
-    updateCompany(form);
-    setMessage("Settings saved.");
-    setTimeout(() => setMessage(""), 2500);
+  const save = async () => {
+    setSaving(true);
+    const ll = form.shopAddress ? await resolveLatLng(form.shopAddress) : null;
+    await updateCompany({ ...form, shopLat: ll ? ll.lat : null, shopLng: ll ? ll.lng : null });
+    setSaving(false);
+    setMessage(form.shopAddress && !ll ? "Settings saved — couldn't pin the shop address, so the clock-in alert won't trigger." : "Settings saved.");
+    setTimeout(() => setMessage(""), form.shopAddress && !ll ? 5000 : 2500);
   };
 
   const exportAll = () => {
@@ -3715,8 +3936,26 @@ function SettingsPage() {
         </div>
       </div>
 
+      <div style={{ ...card }}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Shop location &amp; clock-in alert</h3>
+        <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 16, lineHeight: 1.6 }}>
+          Pin your shop's location and the field app will prompt crew to clock in when they open it near the shop.
+          This only works while the app is open on their phone — phones don't allow location tracking while a web app is closed or the screen is locked.
+        </p>
+        <Field label="Shop Location">
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <input value={form.shopAddress} onChange={e => setForm(f => ({ ...f, shopAddress: e.target.value }))} placeholder="Shop address, or look it up →" style={{ ...inputCls, flex: "1 1 180px" }} />
+            <button type="button" onClick={() => setLookupShop(true)} style={{ ...btnSecondary, whiteSpace: "nowrap" }}>🔍 Look up</button>
+          </div>
+        </Field>
+        <Field label="Alert radius (meters)">
+          <input type="number" min="50" value={form.geofenceRadiusM} onChange={e => setForm(f => ({ ...f, geofenceRadiusM: e.target.value }))} style={{ ...inputCls, width: 120 }} />
+        </Field>
+        {lookupShop && <LocationPicker onClose={() => setLookupShop(false)} onPick={v => { setForm(f => ({ ...f, shopAddress: v })); setLookupShop(false); }} />}
+      </div>
+
       <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 20 }}>
-        <button type="button" onClick={save} style={btnSecondary}>Save Settings</button>
+        <button type="button" onClick={save} disabled={saving} style={btnSecondary}>{saving ? "Saving…" : "Save Settings"}</button>
       </div>
 
       <div className="grid-2">
@@ -4153,8 +4392,11 @@ const NAV = [
   { id: "daily-log", label: "Daily Log", icon: "📝" },
   { id: "employee-logs", label: "Work Logs", icon: "📊" },
   { id: "manager-logs", label: "Manager Logs", icon: "📖" },
+  { id: "crew-locations", label: "Crew Locations", icon: "🛰️" },
   { id: "equipment", label: "Equipment", icon: "🚛" },
   { id: "truck-logs", label: "Vehicle Logs", icon: "🚚" },
+  { id: "haul-loads", label: "Haul Loads", icon: "⚖️" },
+  { id: "local-sites", label: "Local Sites", icon: "🧭" },
   { id: "safety", label: "Safety Checks", icon: "🦺" },
   { id: "inventory", label: "Inventory", icon: "📦" },
   { id: "warehouses", label: "Warehouses", icon: "🏭" },
@@ -4169,14 +4411,18 @@ const NAV = [
 // Every signed-in member sees these; owner-only areas are admin.
 const ALWAYS_VISIBLE = ["dashboard", "profile"];
 const OWNER_ONLY = ["team", "settings", "subscriptions"];
+// Live employee location — not owner-employee-grantable like other sections;
+// only owners and managers ever see it, full stop.
+const MANAGER_PLUS_ONLY = ["crew-locations"];
 // Nav items an owner can grant to employees (everything not always/owner-only).
-const GRANTABLE = NAV.map(n => n.id).filter(id => !ALWAYS_VISIBLE.includes(id) && !OWNER_ONLY.includes(id));
+const GRANTABLE = NAV.map(n => n.id).filter(id => !ALWAYS_VISIBLE.includes(id) && !OWNER_ONLY.includes(id) && !MANAGER_PLUS_ONLY.includes(id));
 
 function canAccess(navId, user) {
   if (!user) return false;
   if (user.isOwner) return true;                    // owner sees everything
   if (ALWAYS_VISIBLE.includes(navId)) return true;
   if (OWNER_ONLY.includes(navId)) return false;
+  if (MANAGER_PLUS_ONLY.includes(navId)) return user.role === "Manager";
   return !!(user.permissions && user.permissions[navId]);
 }
 
@@ -4249,8 +4495,11 @@ const PAGES = {
   "daily-log": () => <DailyLogPage />,
   "employee-logs": () => <EmployeeLogsPage />,
   "manager-logs": () => <ManagerLogsPage />,
+  "crew-locations": () => <CrewLocationsPage />,
   equipment: () => <EquipmentPage />,
   "truck-logs": () => <TruckLogBooksPage />,
+  "haul-loads": () => <HaulLoadsPage />,
+  "local-sites": () => <SitesPage />,
   safety: () => <SafetyPage />,
   inventory: () => <InventoryPage />,
   warehouses: () => <WarehousesPage />,
@@ -4489,7 +4738,7 @@ function MobileWorkLogSheet({ employee, jobs, onClose, onSaved, jobsOnly }) {
         <label style={mLbl}>Job</label>
         <select value={job} onChange={e => setJob(e.target.value)} style={mInput}>
           <option value="">No specific job</option>
-          {pickable.map(j => <option key={j._id} value={j.jobTitle}>{j.jobTitle}</option>)}
+          {jobsByClient(pickable).map(j => <option key={j._id} value={j.jobTitle}>{jobLabel(j)}</option>)}
         </select>
         <div style={{ display: "flex", gap: 10 }}>
           <div style={{ flex: 1 }}><label style={mLbl}>Start</label><input type="time" value={start} onChange={e => setStart(e.target.value)} style={mInput} /></div>
@@ -4559,8 +4808,26 @@ function MobileTeamEfficiency() {
   );
 }
 
+// Watches GPS while mounted (i.e. while the Track tab is open) and reports
+// whether the phone is currently within range of the shop. Foreground-only —
+// stops the moment the tab is switched away from (component unmount).
+function useNearShop(company, enabled) {
+  const [near, setNear] = useState(false);
+  useEffect(() => {
+    if (!enabled || company?.shopLat == null || company?.shopLng == null || !navigator.geolocation) { setNear(false); return; }
+    const id = navigator.geolocation.watchPosition(
+      pos => setNear(distanceMeters(pos.coords.latitude, pos.coords.longitude, company.shopLat, company.shopLng) <= (num(company.geofenceRadiusM) || 300)),
+      () => {},
+      { enableHighAccuracy: true, maximumAge: 15000, timeout: 20000 }
+    );
+    return () => navigator.geolocation.clearWatch(id);
+  }, [enabled, company?.shopLat, company?.shopLng, company?.geofenceRadiusM]);
+  return near;
+}
+
 function MobileTimeClock() {
   const { user } = useAuth();
+  const { company } = useCompany();
   useDataVersion();
   const employeeOptions = useEmployeeOptions();
   const allJobs = getCol("jobs");
@@ -4571,6 +4838,9 @@ function MobileTimeClock() {
   const [nowTs, setNowTs] = useState(Date.now());
   const [logging, setLogging] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [alertDismissed, setAlertDismissed] = useState(false);
+  const nearShop = useNearShop(company, !active);
+  useEffect(() => { if (!nearShop) setAlertDismissed(false); }, [nearShop]);
 
   useEffect(() => {
     if (!active) return;
@@ -4578,13 +4848,33 @@ function MobileTimeClock() {
     return () => clearInterval(id);
   }, [active]);
 
+  // While clocked in, drop a location ping every so often so owners/managers can
+  // see a live trail. Stops the instant the tab closes or they clock out — never
+  // runs in the background (see useNearShop above for why: phones don't allow it).
+  useEffect(() => {
+    if (!active || !active.clockRecordId) return;
+    const ping = async () => {
+      const coords = await getGeoCoords();
+      if (coords) db.create("locationpings", { employeeName: active.employee, clockRecordId: active.clockRecordId, lat: coords.lat, lng: coords.lng, at: new Date().toISOString() });
+    };
+    const id = setInterval(ping, 90000);
+    return () => clearInterval(id);
+  }, [active?.clockRecordId]);
+
   const persist = v => { setActive(v); if (v) storage.set(ACTIVE_CLOCK_KEY, JSON.stringify(v)); else storage.remove(ACTIVE_CLOCK_KEY); };
 
   const clockIn = async () => {
-    const v = { employee, startISO: new Date().toISOString(), geoIn: null };
+    // A server-visible "I'm on the clock" record, so owners/managers can see who's
+    // active from any device — separate from the shift record, which is only
+    // written on clock-out.
+    const rec = db.create("activeclocks", { employeeName: employee, startISO: new Date().toISOString() });
+    const v = { employee, startISO: rec.startISO, geoIn: null, clockRecordId: rec._id };
     persist(v);
-    const geo = await getGeo();
-    if (geo) persist({ ...v, geoIn: geo });
+    const coords = await getGeoCoords();
+    if (coords) {
+      persist({ ...v, geoIn: latLngStr(coords.lat, coords.lng) });
+      db.create("locationpings", { employeeName: employee, clockRecordId: rec._id, lat: coords.lat, lng: coords.lng, at: new Date().toISOString() });
+    }
   };
 
   const clockOut = async () => {
@@ -4600,6 +4890,12 @@ function MobileTimeClock() {
       hours: Math.round((end - start) / 3600000 * 100) / 100,
       clockInLocation: active.geoIn || "", clockOutLocation: geoOut || "",
     });
+    // Live location only exists while clocked in — clear the trail along with
+    // the active-clock record now that the shift's over.
+    if (active.clockRecordId) {
+      getCol("locationpings").filter(p => p.clockRecordId === active.clockRecordId).forEach(p => db.remove("locationpings", p._id));
+      db.remove("activeclocks", active.clockRecordId);
+    }
     notifyData();
     persist(null);
     setBusy(false);
@@ -4621,6 +4917,18 @@ function MobileTimeClock() {
           <select value={employee} onChange={e => setEmployee(e.target.value)} style={{ ...mInput, marginTop: 4 }}>
             {employeeOptions.map(n => <option key={n} value={n}>{n}</option>)}
           </select>
+        </div>
+      )}
+
+      {!active && nearShop && !alertDismissed && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#0F172A", color: "#fff", borderRadius: 12, padding: "12px 12px 12px 14px", marginBottom: 14 }}>
+          <div style={{ fontSize: 22 }}>📍</div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 800, fontSize: 14 }}>You're near the shop</div>
+            <div style={{ fontSize: 12, opacity: .65 }}>Clock in now?</div>
+          </div>
+          <button type="button" onClick={clockIn} style={{ background: C.secondary, color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Clock In</button>
+          <button type="button" onClick={() => setAlertDismissed(true)} aria-label="Dismiss" style={{ background: "none", border: "none", color: "#fff", opacity: .5, fontSize: 20, cursor: "pointer", lineHeight: 1 }}>×</button>
         </div>
       )}
 
@@ -4688,7 +4996,13 @@ function MobileTimeClock() {
 // The in-progress entry is saved to a draft (so switching tabs never loses it),
 // and photos/videos can be attached straight to the picked job.
 const DL_DRAFT_KEY = "bmb_dl_draft";
-const emptyDraft = { job: "", jobId: "", work: "", start: "", end: "", notes: "", maintenance: false, maintUnit: "", maintMileage: "", maintHours: "" };
+const emptyDraft = {
+  job: "", jobId: "", work: "", start: "", end: "", notes: "", maintenance: false, maintUnit: "", maintMileage: "", maintHours: "",
+  hauling: false, loads: [], siteId: "", siteName: "", siteClient: "",
+};
+const emptyLoadRow = () => ({ id: genId(), truck: "", yards: "", ticketNumber: "" });
+// How far (m) a dropped pin can be from a saved local site and still count as a match.
+const SITE_RADIUS_M = 800;
 function MobileDailyLog() {
   const { user } = useAuth();
   useDataVersion();
@@ -4701,26 +5015,52 @@ function MobileDailyLog() {
   });
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const [siteSearching, setSiteSearching] = useState(false);
+  const [siteResults, setSiteResults] = useState(null);
   const fileRef = useRef(null);
   // Persist the draft on every change so a tab switch (or reload) keeps it.
   useEffect(() => { storage.set(DL_DRAFT_KEY, JSON.stringify(draft)); }, [draft]);
   const set = (k, v) => setDraft(d => ({ ...d, [k]: v }));
   const pickJob = title => {
     const j = jobs.find(x => x.jobTitle === title);
-    setDraft(d => ({ ...d, job: title, jobId: j ? j._id : "" }));
+    setDraft(d => ({ ...d, job: title, jobId: j ? j._id : "", siteId: "", siteName: "", siteClient: "" }));
   };
 
   const hrs = hoursBetween(draft.start, draft.end);
 
+  const setLoadRow = (id, k, v) => setDraft(d => ({ ...d, loads: d.loads.map(r => (r.id === id ? { ...r, [k]: v } : r)) }));
+  const addLoadRow = () => setDraft(d => ({ ...d, loads: [...d.loads, emptyLoadRow()] }));
+  const removeLoadRow = id => setDraft(d => ({ ...d, loads: d.loads.filter(r => r.id !== id) }));
+
+  const findNearbySites = async () => {
+    setSiteSearching(true);
+    const geo = await getGeo();
+    setSiteSearching(false);
+    if (!geo) { setMsg("Couldn't get your location — allow location access and try again."); return; }
+    const [lat, lng] = geo.split(",").map(s => +s.trim());
+    const nearby = getCol("sites")
+      .filter(s => s.siteLat != null && s.siteLng != null)
+      .map(s => ({ ...s, dist: distanceMeters(lat, lng, s.siteLat, s.siteLng) }))
+      .filter(s => s.dist <= SITE_RADIUS_M)
+      .sort((a, b) => a.dist - b.dist);
+    setSiteResults(nearby);
+  };
+  const pickSite = s => {
+    setDraft(d => ({ ...d, job: s.siteName, jobId: "", siteId: s._id, siteName: s.siteName, siteClient: s.clientName || "" }));
+    setSiteResults(null);
+  };
+
   const save = () => {
     if (draft.maintenance && !draft.maintUnit.trim()) { setMsg("Pick or enter the equipment unit for the maintenance."); return; }
-    if (!draft.job && !draft.work.trim() && !draft.maintenance) { setMsg("Pick a job or describe the work first."); return; }
+    const validLoads = draft.hauling ? draft.loads.filter(r => r.truck && (r.yards || r.ticketNumber)) : [];
+    if (!draft.job && !draft.work.trim() && !draft.maintenance && validLoads.length === 0) { setMsg("Pick a job or describe the work first."); return; }
     db.create("timeentries", {
       employeeName: employee, jobName: draft.job, entryDate: today(),
       startTime: draft.start, endTime: draft.end, hoursWorked: hrs,
       workDescription: draft.work, notes: draft.notes,
       equipmentUsed: draft.maintenance ? draft.maintUnit : "", mileageDriven: draft.maintenance ? num(draft.maintMileage) : 0,
       isMaintenance: !!draft.maintenance, maintUnit: draft.maintUnit, maintMileage: draft.maintMileage, maintHours: draft.maintHours,
+      siteId: draft.siteId, siteName: draft.siteName, siteClient: draft.siteClient,
       source: "mobile-log",
     });
     // Push the latest mileage/hours reading onto the matching equipment record,
@@ -4734,12 +5074,21 @@ function MobileDailyLog() {
         db.update("equipment", patch);
       }
     }
+    // One record per load — keeps yards/ticket numbers billable and exportable individually.
+    validLoads.forEach(r => {
+      db.create("loads", {
+        employeeName: employee, entryDate: today(), jobId: draft.jobId, jobName: draft.job,
+        truck: r.truck, yards: num(r.yards), ticketNumber: r.ticketNumber,
+        source: "mobile-log",
+      });
+    });
     notifyData();
     setDraft({ ...emptyDraft }); storage.remove(DL_DRAFT_KEY);
+    setSiteResults(null);
     setMsg("Saved ✓");
     setTimeout(() => setMsg(""), 2500);
   };
-  const clearDraft = () => { setDraft({ ...emptyDraft }); storage.remove(DL_DRAFT_KEY); setMsg(""); };
+  const clearDraft = () => { setDraft({ ...emptyDraft }); storage.remove(DL_DRAFT_KEY); setMsg(""); setSiteResults(null); };
 
   const onFiles = async (fileList) => {
     const files = Array.from(fileList || []);
@@ -4755,6 +5104,7 @@ function MobileDailyLog() {
   };
 
   const mine = getCol("timeentries").filter(e => e.entryDate === today() && e.employeeName === employee && e.source !== "mobile-clock");
+  const myLoads = getCol("loads").filter(l => l.entryDate === today() && l.employeeName === employee);
   const jobMediaCount = draft.jobId ? getCol("job_media").filter(m => m.jobId === draft.jobId).length : 0;
 
   return (
@@ -4762,14 +5112,31 @@ function MobileDailyLog() {
       <div style={mCard}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
           <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 4 }}>Log today's work</div>
-          {(draft.job || draft.work || draft.start || draft.notes || draft.maintenance) && <button type="button" onClick={clearDraft} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12, cursor: "pointer" }}>Clear</button>}
+          {(draft.job || draft.work || draft.start || draft.notes || draft.maintenance || draft.hauling) && <button type="button" onClick={clearDraft} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12, cursor: "pointer" }}>Clear</button>}
         </div>
         <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>{new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
         <label style={mLbl}>Job</label>
         <select value={draft.job} onChange={e => pickJob(e.target.value)} style={mInput}>
           <option value="">No specific job</option>
-          {jobs.map(j => <option key={j._id} value={j.jobTitle}>{j.jobTitle}</option>)}
+          {jobsByClient(jobs).map(j => <option key={j._id} value={j.jobTitle}>{jobLabel(j)}</option>)}
         </select>
+        {draft.siteId && <div style={{ fontSize: 12, color: C.secondary, fontWeight: 700, marginTop: 4 }}>🧭 Site: {draft.siteName}{draft.siteClient ? " — " + draft.siteClient : ""}</div>}
+        <button type="button" onClick={findNearbySites} disabled={siteSearching} style={{ ...mBtn, background: C.surfaceAlt, color: C.text, border: "1px solid " + C.border, marginTop: 8, padding: "10px", fontSize: 13 }}>
+          {siteSearching ? "Finding nearby sites…" : "🧭 Find nearby site"}
+        </button>
+        {siteResults && (
+          <div style={{ background: C.surfaceAlt, borderRadius: 10, padding: 10, marginTop: 8 }}>
+            {siteResults.length === 0
+              ? <div style={{ fontSize: 12, color: C.textMuted, textAlign: "center", padding: "6px 0" }}>No billable sites nearby.</div>
+              : siteResults.map(s => (
+                <button key={s._id} type="button" onClick={() => pickSite(s)} style={{ display: "block", width: "100%", textAlign: "left", background: C.surface, border: "1px solid " + C.border, borderRadius: 8, padding: "9px 12px", marginBottom: 6, cursor: "pointer" }}>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{s.siteName}{s.clientName ? " — " + s.clientName : ""}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted }}>{Math.round(s.dist)} m away</div>
+                </button>
+              ))}
+            <button type="button" onClick={() => setSiteResults(null)} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12, cursor: "pointer", padding: 0 }}>Close</button>
+          </div>
+        )}
         <label style={mLbl}>Work done</label>
         <textarea value={draft.work} onChange={e => set("work", e.target.value)} placeholder="Excavation, backfill, grading…" rows={3} style={{ ...mInput, resize: "vertical" }} />
         <div style={{ display: "flex", gap: 10 }}>
@@ -4798,6 +5165,33 @@ function MobileDailyLog() {
           </div>
         )}
 
+        {/* Hauling loads — one row per load, each with its own truck, so the
+            correct truck/yards/ticket combo shows up on the billing export. */}
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+          <input type="checkbox" checked={draft.hauling} onChange={e => { set("hauling", e.target.checked); if (e.target.checked && draft.loads.length === 0) set("loads", [emptyLoadRow()]); }} style={{ accentColor: C.secondary, width: 18, height: 18 }} />
+          🚛 I hauled loads today
+        </label>
+        {draft.hauling && (
+          <div style={{ background: C.surfaceAlt, borderRadius: 10, padding: 12, marginTop: 8 }}>
+            {draft.loads.map((r, i) => (
+              <div key={r.id} style={{ background: C.surface, border: "1px solid " + C.border, borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase" }}>Load {i + 1}</span>
+                  {draft.loads.length > 1 && <button type="button" onClick={() => removeLoadRow(r.id)} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 16, cursor: "pointer", lineHeight: 1 }}>×</button>}
+                </div>
+                <label style={{ ...mLbl, marginTop: 4 }}>Truck</label>
+                <input list="dl-trucks" value={r.truck} onChange={e => setLoadRow(r.id, "truck", e.target.value)} placeholder="Pick or type a truck" style={mInput} />
+                <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
+                  <div style={{ flex: 1 }}><label style={mLbl}>Yards</label><input type="number" inputMode="decimal" value={r.yards} onChange={e => setLoadRow(r.id, "yards", e.target.value)} placeholder="0" style={mInput} /></div>
+                  <div style={{ flex: 1 }}><label style={mLbl}>Ticket #</label><input value={r.ticketNumber} onChange={e => setLoadRow(r.id, "ticketNumber", e.target.value)} placeholder="Scale ticket #" style={mInput} /></div>
+                </div>
+              </div>
+            ))}
+            <datalist id="dl-trucks">{equipment.filter(eq => eq.equipmentType === "Truck" || eq.equipmentType === "Semi").map(eq => <option key={eq._id} value={eq.equipmentName} />)}</datalist>
+            <button type="button" onClick={addLoadRow} style={{ ...btnOutline, width: "100%" }}>+ Add another load</button>
+          </div>
+        )}
+
         {/* Photos & videos attach to the picked job. */}
         <button type="button" onClick={() => fileRef.current && fileRef.current.click()} disabled={busy}
           style={{ ...mBtn, background: C.surfaceAlt, color: C.text, border: "1px solid " + C.border, marginTop: 12, fontSize: 14, opacity: busy ? .6 : 1 }}>
@@ -4822,7 +5216,23 @@ function MobileDailyLog() {
               {(e.startTime || e.endTime) && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>{e.startTime || "?"}–{e.endTime || "?"}{num(e.hoursWorked) > 0 ? " · " + num(e.hoursWorked).toFixed(2) + " h" : ""}</div>}
               {e.workDescription && <div style={{ fontSize: 13, color: C.text, marginTop: 3 }}>{e.workDescription}</div>}
               {e.isMaintenance && <div style={{ fontSize: 12, color: "#D97706", marginTop: 3, fontWeight: 600 }}>🔧 {e.maintUnit}{e.maintMileage ? " · " + e.maintMileage + " km" : ""}{e.maintHours ? " · " + e.maintHours + " hrs" : ""}</div>}
+              {e.siteId && <div style={{ fontSize: 12, color: C.secondary, marginTop: 3, fontWeight: 600 }}>🧭 {e.siteName}{e.siteClient ? " — " + e.siteClient : ""}</div>}
               {e.notes && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>{e.notes}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {myLoads.length > 0 && (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 700, margin: "10px 2px 8px" }}>Loads hauled today</div>
+          {myLoads.map(l => (
+            <div key={l._id} style={{ ...mCard, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, padding: 14 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>🚛 {l.truck}{l.jobName ? " — " + l.jobName : ""}</div>
+                {l.ticketNumber && <div style={{ fontSize: 12, color: C.textMuted }}>Ticket #{l.ticketNumber}</div>}
+              </div>
+              {num(l.yards) > 0 && <div style={{ fontWeight: 800, color: C.accent, whiteSpace: "nowrap", marginLeft: 10 }}>{num(l.yards)} yd</div>}
             </div>
           ))}
         </div>
@@ -4834,7 +5244,7 @@ function MobileDailyLog() {
 // 📅 Schedule — jobs grouped by when, as tappable cards with a map link.
 function MobileSchedule() {
   const t = today();
-  const jobs = getCol("jobs").filter(j => j.startDate).slice().sort((a, b) => (a.startDate || "").localeCompare(b.startDate || ""));
+  const jobs = jobsByClient(getCol("jobs").filter(j => j.startDate)).sort((a, b) => (a.startDate || "").localeCompare(b.startDate || ""));
   const isToday = j => (j.startDate || "") <= t && (j.endDate || j.startDate || "") >= t;
   const groups = [
     { label: "Today", items: jobs.filter(isToday) },
@@ -4874,7 +5284,7 @@ function MobileSchedule() {
 // 📷 Photos — pick a job, then view / capture photos (reuses the gallery).
 function MobilePhotos() {
   useDataVersion();
-  const jobs = getCol("jobs");
+  const jobs = jobsByClient(getCol("jobs"));
   // Persist the open job: if iOS reloads the app while the camera is open
   // (memory pressure on big landscape shots), we return to the same job.
   const [jobId, setJobIdState] = useState(() => storage.get("bmb_photos_job") || null);
