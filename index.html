@@ -216,7 +216,7 @@ const COLLECTIONS = [
   "quotes", "clients", "jobs", "employees", "subcontractors", "equipment",
   "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
   "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs", "quote_docs",
-  "sites", "loads", "activeclocks", "locationpings",
+  "sites", "loads", "activeclocks", "locationpings", "equipmentlogs",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -346,6 +346,25 @@ const db = {
     notifyData();
   },
 };
+
+// Records a chunk of billable equipment usage (from any daily log / time entry
+// form) and rolls the hours onto the equipment's running total — the one place
+// "what equipment, how long" turns into both a billing record and an updated
+// odometer/engine-hour total, so Equipment, Billing, and the daily logs all
+// agree with each other.
+function logEquipmentUsage({ equipmentName, hours, employeeName, entryDate, jobId, jobName, source }) {
+  const name = String(equipmentName || "").trim();
+  const h = num(hours);
+  if (!name || h <= 0) return;
+  const eq = getCol("equipment").find(e => (e.equipmentName || "").trim() === name);
+  const rate = eq ? num(eq.billingRatePerHour) : 0;
+  db.create("equipmentlogs", {
+    employeeName: employeeName || "", entryDate: entryDate || today(), jobId: jobId || "", jobName: jobName || "",
+    equipmentId: eq ? eq._id : "", equipmentName: name, hoursUsed: h, billingRatePerHour: rate, cost: h * rate,
+    source: source || "",
+  });
+  if (eq) db.update("equipment", { ...eq, totalHours: num(eq.totalHours) + h });
+}
 
 /* ─── Job media (photos & videos) ────────────────────────────────────────────
    Files live in a PRIVATE Supabase Storage bucket, foldered by company then job:
@@ -1866,6 +1885,59 @@ function SubcontractorsPage() {
 }
 
 function EquipmentPage() {
+  const detail = eq => {
+    const field = (label, value) => (value || value === 0) ? (
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</div>
+        <div style={{ fontSize: 14 }}>{value}</div>
+      </div>
+    ) : null;
+    // Every equipment-usage row logged anywhere (mobile daily log, desktop time
+    // tracking / daily log) lands here — this is the single running record of
+    // what this machine has billed and how many hours it's accumulated.
+    const logs = getCol("equipmentlogs")
+      .filter(l => (eq._id && l.equipmentId === eq._id) || (!l.equipmentId && l.equipmentName === eq.equipmentName))
+      .sort((a, b) => (b.entryDate || "").localeCompare(a.entryDate || ""));
+    const totalBilled = logs.reduce((s, l) => s + num(l.cost), 0);
+    const totalHoursLogged = logs.reduce((s, l) => s + num(l.hoursUsed), 0);
+    return (
+      <div>
+        <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 4 }}>{eq.equipmentName}</div>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 14 }}>{eq.equipmentType || "Equipment"}{eq.manufacturer ? " · " + eq.manufacturer : ""}</div>
+        <div className="grid-2" style={{ gap: 8 }}>
+          {field("Billing Rate", eq.billingRatePerHour ? "$" + num(eq.billingRatePerHour).toFixed(2) + "/hr" : null)}
+          {field("Total Engine Hours", eq.totalHours !== undefined && eq.totalHours !== "" ? num(eq.totalHours).toLocaleString() : null)}
+          {field("Current Mileage", eq.currentMileage !== undefined && eq.currentMileage !== "" ? num(eq.currentMileage).toLocaleString() + " km" : null)}
+          {field("Last Service", eq.lastServiceDate)}
+        </div>
+        <div style={{ marginTop: 12, paddingTop: 16, borderTop: "1px solid " + C.border }}>
+          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Equipment Log</h3>
+          {logs.length === 0
+            ? <p style={{ color: C.textMuted, fontSize: 13 }}>No logged usage yet — equipment picked on the daily log or time tracking shows up here, billed at this item's rate.</p>
+            : (
+              <>
+                <div className="grid-2" style={{ gap: 8, marginBottom: 14 }}>
+                  <StatCard label="Hours logged" value={totalHoursLogged.toFixed(1)} />
+                  <StatCard label="Billed" value={fmt(totalBilled)} />
+                </div>
+                <DataTable
+                  columns={[
+                    { key: "entryDate", label: "Date" },
+                    { key: "employeeName", label: "Employee" },
+                    { key: "jobName", label: "Job" },
+                    { key: "hoursUsed", label: "Hours", render: v => num(v).toFixed(2) },
+                    { key: "cost", label: "Billed", render: v => fmt(num(v)) },
+                  ]}
+                  rows={logs}
+                  emptyMessage="No usage logged yet."
+                />
+              </>
+            )}
+        </div>
+      </div>
+    );
+  };
+
   return <CRUDPage
     title="Equipment" singular="Equipment Item" subtitle="Track your fleet and machinery" collection="equipment" emptyIcon="🚛"
     columns={[
@@ -1891,6 +1963,7 @@ function EquipmentPage() {
       { key: "description", label: "Description", type: "textarea", placeholder: "Equipment notes…" },
       { key: "maintenanceNotes", label: "Maintenance Notes", type: "textarea", placeholder: "Recent maintenance…" },
     ]}
+    detail={detail}
   />;
 }
 
@@ -2753,11 +2826,12 @@ function TimeEntryPage() {
     const valid = rows.filter(r => r.jobLocation || r.workDone);
     if (valid.length === 0) { window.alert("Add a job or a description of the work before submitting."); return; }
     valid.forEach(r => {
+      const hrs = hoursBetween(r.startTime, r.endTime);
       db.create("timeentries", {
         employeeName,
         jobName: r.jobLocation,
         entryDate: date,
-        hoursWorked: hoursBetween(r.startTime, r.endTime),
+        hoursWorked: hrs,
         startTime: r.startTime,
         endTime: r.endTime,
         workDescription: r.workDone,
@@ -2765,6 +2839,9 @@ function TimeEntryPage() {
         equipmentUsed: r.equipment,
         mileageDriven: num(r.mileage),
       });
+      // The equipment picked for a row is assumed to have run for that row's
+      // hours — bills it and rolls the hours onto the equipment's total.
+      if (r.equipment) logEquipmentUsage({ equipmentName: r.equipment, hours: hrs, employeeName, entryDate: date, jobName: r.jobLocation, source: "desktop-time-entry" });
     });
     setRows([newTimeRow()]);
     refresh();
@@ -2882,12 +2959,13 @@ function DailyLogPage() {
     const valid = rows.filter(r => r.jobLocation || r.workDone);
     if (valid.length === 0) { window.alert("Fill in at least one row before submitting."); return; }
     valid.forEach(r => {
+      const hrs = hoursBetween(r.startTime, r.endTime);
       db.create("timeentries", {
         employeeName,
         jobName: r.jobLocation,
         contract: r.contract,
         entryDate,
-        hoursWorked: hoursBetween(r.startTime, r.endTime),
+        hoursWorked: hrs,
         startTime: r.startTime,
         endTime: r.endTime,
         workDescription: r.workDone,
@@ -2895,6 +2973,9 @@ function DailyLogPage() {
         equipmentUsed: r.equipment,
         mileageDriven: num(r.mileage),
       });
+      // The equipment picked for a row is assumed to have run for that row's
+      // hours — bills it and rolls the hours onto the equipment's total.
+      if (r.equipment) logEquipmentUsage({ equipmentName: r.equipment, hours: hrs, employeeName, entryDate, jobName: r.jobLocation, source: "desktop-daily-log" });
     });
     setRows([newTimeRow()]);
     setMessage("Daily log submitted — " + valid.length + " entries saved.");
@@ -3339,6 +3420,7 @@ function Dashboard() {
 /* ─── Billing & reports ──────────────────────────────────────────────────── */
 function BillingPage() {
   const entries = useMemo(() => db.getAll("timeentries", {}, { limit: 1000 }).items, []);
+  const equipmentLogs = useMemo(() => db.getAll("equipmentlogs", {}, { limit: 1000 }).items, []);
   const employees = useMemo(() => db.getAll("employees").items, []);
   const [filters, setFilters] = useState({ startDate: "", endDate: "", employee: "", job: "" });
 
@@ -3355,9 +3437,22 @@ function BillingPage() {
     return true;
   });
 
+  // Equipment hours billed alongside labour — logged from the daily log / time
+  // tracking whenever equipment is picked, and rolled onto the equipment's
+  // running total (see logEquipmentUsage).
+  const filteredEquipment = equipmentLogs.filter(l => {
+    if (filters.startDate && (l.entryDate || "") < filters.startDate) return false;
+    if (filters.endDate && (l.entryDate || "") > filters.endDate) return false;
+    if (filters.employee && l.employeeName !== filters.employee) return false;
+    if (filters.job && !String(l.jobName || "").toLowerCase().includes(filters.job.toLowerCase())) return false;
+    return true;
+  });
+
   const totalHours = filtered.reduce((s, e) => s + num(e.hoursWorked), 0);
-  const totalCost = filtered.reduce((s, e) => s + num(e.hoursWorked) * rateFor(e.employeeName), 0);
+  const totalLabourCost = filtered.reduce((s, e) => s + num(e.hoursWorked) * rateFor(e.employeeName), 0);
   const totalMiles = filtered.reduce((s, e) => s + num(e.mileageDriven), 0);
+  const totalEquipmentHours = filteredEquipment.reduce((s, l) => s + num(l.hoursUsed), 0);
+  const totalEquipmentCost = filteredEquipment.reduce((s, l) => s + num(l.cost), 0);
 
   const exportCSV = () => {
     const rows = [
@@ -3368,7 +3463,15 @@ function BillingPage() {
         num(e.mileageDriven), e.equipmentUsed, e.workDescription,
       ]),
       [],
-      ["", "", "TOTAL", totalHours.toFixed(2), "", totalCost.toFixed(2), totalMiles],
+      ["", "", "TOTAL", totalHours.toFixed(2), "", totalLabourCost.toFixed(2), totalMiles],
+      [],
+      ["EQUIPMENT USAGE"],
+      ["Date", "Equipment", "Employee", "Job", "Hours", "Rate", "Billed"],
+      ...filteredEquipment.map(l => [l.entryDate, l.equipmentName, l.employeeName, l.jobName, num(l.hoursUsed).toFixed(2), num(l.billingRatePerHour).toFixed(2), num(l.cost).toFixed(2)]),
+      [],
+      ["", "", "", "TOTAL", totalEquipmentHours.toFixed(2), "", totalEquipmentCost.toFixed(2)],
+      [],
+      ["", "", "", "", "", "GRAND TOTAL", (totalLabourCost + totalEquipmentCost).toFixed(2)],
     ];
     downloadFile("billing_report_" + today() + ".csv", toCSV(rows), "text/csv;charset=utf-8");
   };
@@ -3377,7 +3480,7 @@ function BillingPage() {
     <div>
       <PageHeader
         title="Billing & Reports"
-        subtitle="Generate billing reports from logged time"
+        subtitle="Generate billing reports from logged time and equipment usage"
         action={<button type="button" onClick={exportCSV} style={btnSecondary}>📊 Export CSV</button>}
       />
 
@@ -3400,11 +3503,17 @@ function BillingPage() {
 
       <div className="grid-3" style={{ marginBottom: 20 }}>
         <StatCard label="Total Hours" value={totalHours.toFixed(2)} />
-        <StatCard label="Labour Cost" value={fmt(totalCost)} />
+        <StatCard label="Labour Cost" value={fmt(totalLabourCost)} />
         <StatCard label="Entries" value={filtered.length} />
       </div>
 
-      <div style={card}>
+      <div className="grid-3" style={{ marginBottom: 20 }}>
+        <StatCard label="Equipment Hours" value={totalEquipmentHours.toFixed(2)} />
+        <StatCard label="Equipment Cost" value={fmt(totalEquipmentCost)} />
+        <StatCard label="Total Billed" value={fmt(totalLabourCost + totalEquipmentCost)} />
+      </div>
+
+      <div style={{ ...card, marginBottom: 20 }}>
         <DataTable
           columns={[
             { key: "entryDate", label: "Date" },
@@ -3417,6 +3526,22 @@ function BillingPage() {
           ]}
           rows={filtered}
           emptyMessage="No entries match your filters."
+        />
+      </div>
+
+      <div style={card}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>Equipment Usage</h3>
+        <DataTable
+          columns={[
+            { key: "entryDate", label: "Date" },
+            { key: "equipmentName", label: "Equipment" },
+            { key: "employeeName", label: "Employee" },
+            { key: "jobName", label: "Job" },
+            { key: "hoursUsed", label: "Hours", render: v => num(v).toFixed(2) + "h" },
+            { key: "cost", label: "Billed", render: v => fmt(num(v)) },
+          ]}
+          rows={filteredEquipment}
+          emptyMessage="No equipment usage in range — pick equipment on the daily log or time tracking to bill it here."
         />
       </div>
     </div>
@@ -4717,42 +4842,6 @@ function MobileInstallBanner() {
   );
 }
 
-// Log work done on a job — a chunk of time that fits INSIDE the day's clocked
-// shift. This is the work that counts toward efficiency.
-function MobileWorkLogSheet({ employee, jobs, onClose, onSaved, jobsOnly }) {
-  const [job, setJob] = useState("");
-  const [start, setStart] = useState("");
-  const [end, setEnd] = useState("");
-  const [work, setWork] = useState("");
-  const hrs = hoursBetween(start, end);
-  const pickable = jobsOnly ? jobs.filter(j => j.jobStatus !== "Completed") : jobs;
-  const save = () => {
-    if (!job && !work.trim()) return;
-    db.create("timeentries", { employeeName: employee, jobName: job, entryDate: today(), startTime: start, endTime: end, hoursWorked: hrs, workDescription: work, notes: "", equipmentUsed: "", mileageDriven: 0, source: "mobile-worklog" });
-    notifyData();
-    onSaved();
-  };
-  return (
-    <MobileSheet title="Log work on a job" onClose={onClose}>
-      <div style={{ padding: 16 }}>
-        <label style={mLbl}>Job</label>
-        <select value={job} onChange={e => setJob(e.target.value)} style={mInput}>
-          <option value="">No specific job</option>
-          {jobsByClient(pickable).map(j => <option key={j._id} value={j.jobTitle}>{jobLabel(j)}</option>)}
-        </select>
-        <div style={{ display: "flex", gap: 10 }}>
-          <div style={{ flex: 1 }}><label style={mLbl}>Start</label><input type="time" value={start} onChange={e => setStart(e.target.value)} style={mInput} /></div>
-          <div style={{ flex: 1 }}><label style={mLbl}>End</label><input type="time" value={end} onChange={e => setEnd(e.target.value)} style={mInput} /></div>
-        </div>
-        <label style={mLbl}>Work done (optional)</label>
-        <input value={work} onChange={e => setWork(e.target.value)} placeholder="Excavation, hauling…" style={mInput} />
-        <div style={{ textAlign: "center", margin: "12px 0", fontWeight: 800, color: C.accent, fontSize: 18 }}>{hrs > 0 ? hmm(hrs) + " (" + hrs.toFixed(2) + " h)" : "—"}</div>
-        <button type="button" onClick={save} disabled={hrs <= 0 || (!job && !work.trim())} style={{ ...mBtn, background: hrs > 0 ? C.secondary : C.border, color: "#fff", opacity: hrs > 0 ? 1 : .7 }}>Save work</button>
-      </div>
-    </MobileSheet>
-  );
-}
-
 // ⏱️ The centerpiece: one-tap clock in / out with a live timer and GPS stamp.
 // Small circular efficiency badge. Over 100% is flagged blue ("verify" — more
 // job time was logged than clocked, e.g. a forgotten clock-in).
@@ -4825,18 +4914,17 @@ function useNearShop(company, enabled) {
   return near;
 }
 
-function MobileTimeClock() {
+function MobileTimeClock({ onLogWork }) {
   const { user } = useAuth();
   const { company } = useCompany();
   useDataVersion();
   const employeeOptions = useEmployeeOptions();
-  const allJobs = getCol("jobs");
   const canManage = user?.isOwner || user?.role === "Manager";
+  const canLogWork = canAccess("daily-log", user);
 
   const [employee, setEmployee] = useState(user?.name || employeeOptions[0] || "Me");
   const [active, setActive] = useState(() => { try { return JSON.parse(storage.get(ACTIVE_CLOCK_KEY) || "null"); } catch (e) { return null; } });
   const [nowTs, setNowTs] = useState(Date.now());
-  const [logging, setLogging] = useState(false);
   const [busy, setBusy] = useState(false);
   const [alertDismissed, setAlertDismissed] = useState(false);
   const nearShop = useNearShop(company, !active);
@@ -4961,7 +5049,7 @@ function MobileTimeClock() {
             </div>
           </div>
         </div>
-        <button type="button" onClick={() => setLogging(true)} style={{ ...mBtn, background: C.surfaceAlt, color: C.text, marginTop: 14, fontSize: 15, border: "1px solid " + C.border }}>＋ Log work on a job</button>
+        {canLogWork && <button type="button" onClick={onLogWork} style={{ ...mBtn, background: C.surfaceAlt, color: C.text, marginTop: 14, fontSize: 15, border: "1px solid " + C.border }}>＋ Log work on a job</button>}
       </div>
 
       {myWork.length > 0 && (
@@ -4986,8 +5074,6 @@ function MobileTimeClock() {
       )}
 
       {canManage && <MobileTeamEfficiency />}
-
-      {logging && <MobileWorkLogSheet employee={employee} jobs={allJobs} jobsOnly onClose={() => setLogging(false)} onSaved={() => setLogging(false)} />}
     </div>
   );
 }
@@ -4999,8 +5085,10 @@ const DL_DRAFT_KEY = "bmb_dl_draft";
 const emptyDraft = {
   job: "", jobId: "", work: "", start: "", end: "", notes: "", maintenance: false, maintUnit: "", maintMileage: "", maintHours: "",
   hauling: false, loads: [], siteId: "", siteName: "", siteClient: "",
+  equipmentUse: false, equipRows: [],
 };
 const emptyLoadRow = () => ({ id: genId(), truck: "", yards: "", ticketNumber: "" });
+const emptyEquipRow = () => ({ id: genId(), equipment: "", hours: "" });
 // How far (m) a dropped pin can be from a saved local site and still count as a match.
 const SITE_RADIUS_M = 800;
 function MobileDailyLog() {
@@ -5032,6 +5120,10 @@ function MobileDailyLog() {
   const addLoadRow = () => setDraft(d => ({ ...d, loads: [...d.loads, emptyLoadRow()] }));
   const removeLoadRow = id => setDraft(d => ({ ...d, loads: d.loads.filter(r => r.id !== id) }));
 
+  const setEquipRow = (id, k, v) => setDraft(d => ({ ...d, equipRows: d.equipRows.map(r => (r.id === id ? { ...r, [k]: v } : r)) }));
+  const addEquipRow = () => setDraft(d => ({ ...d, equipRows: [...d.equipRows, emptyEquipRow()] }));
+  const removeEquipRow = id => setDraft(d => ({ ...d, equipRows: d.equipRows.filter(r => r.id !== id) }));
+
   const findNearbySites = async () => {
     setSiteSearching(true);
     const geo = await getGeo();
@@ -5053,7 +5145,8 @@ function MobileDailyLog() {
   const save = () => {
     if (draft.maintenance && !draft.maintUnit.trim()) { setMsg("Pick or enter the equipment unit for the maintenance."); return; }
     const validLoads = draft.hauling ? draft.loads.filter(r => r.truck && (r.yards || r.ticketNumber)) : [];
-    if (!draft.job && !draft.work.trim() && !draft.maintenance && validLoads.length === 0) { setMsg("Pick a job or describe the work first."); return; }
+    const validEquip = draft.equipmentUse ? draft.equipRows.filter(r => r.equipment && num(r.hours) > 0) : [];
+    if (!draft.job && !draft.work.trim() && !draft.maintenance && validLoads.length === 0 && validEquip.length === 0) { setMsg("Pick a job or describe the work first."); return; }
     db.create("timeentries", {
       employeeName: employee, jobName: draft.job, entryDate: today(),
       startTime: draft.start, endTime: draft.end, hoursWorked: hrs,
@@ -5082,6 +5175,10 @@ function MobileDailyLog() {
         source: "mobile-log",
       });
     });
+    // Bills each piece of equipment at its rate and rolls the hours onto its total.
+    validEquip.forEach(r => {
+      logEquipmentUsage({ equipmentName: r.equipment, hours: r.hours, employeeName: employee, entryDate: today(), jobId: draft.jobId, jobName: draft.job, source: "mobile-log" });
+    });
     notifyData();
     setDraft({ ...emptyDraft }); storage.remove(DL_DRAFT_KEY);
     setSiteResults(null);
@@ -5105,6 +5202,7 @@ function MobileDailyLog() {
 
   const mine = getCol("timeentries").filter(e => e.entryDate === today() && e.employeeName === employee && e.source !== "mobile-clock");
   const myLoads = getCol("loads").filter(l => l.entryDate === today() && l.employeeName === employee);
+  const myEquipment = getCol("equipmentlogs").filter(l => l.entryDate === today() && l.employeeName === employee);
   const jobMediaCount = draft.jobId ? getCol("job_media").filter(m => m.jobId === draft.jobId).length : 0;
 
   return (
@@ -5112,7 +5210,7 @@ function MobileDailyLog() {
       <div style={mCard}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
           <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 4 }}>Log today's work</div>
-          {(draft.job || draft.work || draft.start || draft.notes || draft.maintenance || draft.hauling) && <button type="button" onClick={clearDraft} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12, cursor: "pointer" }}>Clear</button>}
+          {(draft.job || draft.work || draft.start || draft.notes || draft.maintenance || draft.hauling || draft.equipmentUse) && <button type="button" onClick={clearDraft} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12, cursor: "pointer" }}>Clear</button>}
         </div>
         <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>{new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
         <label style={mLbl}>Job</label>
@@ -5146,6 +5244,33 @@ function MobileDailyLog() {
         {hrs > 0 && <div style={{ textAlign: "center", marginTop: 8, fontSize: 13, color: C.textMuted }}>{draft.start}–{draft.end} · <strong style={{ color: C.accent }}>{hmm(hrs)}</strong> ({hrs.toFixed(2)} h)</div>}
         <label style={mLbl}>Notes</label>
         <input value={draft.notes} onChange={e => set("notes", e.target.value)} placeholder="Anything worth noting…" style={mInput} />
+
+        {/* Equipment used on this job — bills each item at its rate and rolls
+            the hours onto its running total (separate from a maintenance
+            reading below, which is an odometer/engine-hour snapshot). */}
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+          <input type="checkbox" checked={draft.equipmentUse} onChange={e => { set("equipmentUse", e.target.checked); if (e.target.checked && draft.equipRows.length === 0) set("equipRows", [emptyEquipRow()]); }} style={{ accentColor: C.secondary, width: 18, height: 18 }} />
+          🚜 Equipment used on this job
+        </label>
+        {draft.equipmentUse && (
+          <div style={{ background: C.surfaceAlt, borderRadius: 10, padding: 12, marginTop: 8 }}>
+            {draft.equipRows.map((r, i) => (
+              <div key={r.id} style={{ background: C.surface, border: "1px solid " + C.border, borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase" }}>Equipment {i + 1}</span>
+                  {draft.equipRows.length > 1 && <button type="button" onClick={() => removeEquipRow(r.id)} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 16, cursor: "pointer", lineHeight: 1 }}>×</button>}
+                </div>
+                <label style={{ ...mLbl, marginTop: 4 }}>Equipment</label>
+                <input list="dl-equipment-use" value={r.equipment} onChange={e => setEquipRow(r.id, "equipment", e.target.value)} placeholder="Pick or type equipment" style={mInput} />
+                <label style={mLbl}>Hours used</label>
+                <input type="number" inputMode="decimal" value={r.hours} onChange={e => setEquipRow(r.id, "hours", e.target.value)} placeholder="0" style={mInput} />
+              </div>
+            ))}
+            <datalist id="dl-equipment-use">{equipment.map(eq => <option key={eq._id} value={eq.equipmentName} />)}</datalist>
+            <button type="button" onClick={addEquipRow} style={{ ...btnOutline, width: "100%" }}>+ Add another</button>
+            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>Billed at each item's rate and added to its total hours on the Equipment page.</div>
+          </div>
+        )}
 
         {/* Equipment maintenance — prompts for unit, mileage & hours. */}
         <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
@@ -5233,6 +5358,21 @@ function MobileDailyLog() {
                 {l.ticketNumber && <div style={{ fontSize: 12, color: C.textMuted }}>Ticket #{l.ticketNumber}</div>}
               </div>
               {num(l.yards) > 0 && <div style={{ fontWeight: 800, color: C.accent, whiteSpace: "nowrap", marginLeft: 10 }}>{num(l.yards)} yd</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {myEquipment.length > 0 && (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 700, margin: "10px 2px 8px" }}>Equipment used today</div>
+          {myEquipment.map(l => (
+            <div key={l._id} style={{ ...mCard, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, padding: 14 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>🚜 {l.equipmentName}{l.jobName ? " — " + l.jobName : ""}</div>
+                {num(l.cost) > 0 && <div style={{ fontSize: 12, color: C.textMuted }}>{fmt(num(l.cost))} billed</div>}
+              </div>
+              <div style={{ fontWeight: 800, color: C.accent, whiteSpace: "nowrap", marginLeft: 10 }}>{num(l.hoursUsed).toFixed(2)} h</div>
             </div>
           ))}
         </div>
@@ -5382,7 +5522,7 @@ function MobileShell() {
       </div>
       <div className="mmain">
         <MobileInstallBanner />
-        {tab === "track" && (can("time-entry") ? <MobileTimeClock /> : <MobileLocked />)}
+        {tab === "track" && (can("time-entry") ? <MobileTimeClock onLogWork={() => setTab("log")} /> : <MobileLocked />)}
         {tab === "log" && (can("daily-log") ? <MobileDailyLog /> : <MobileLocked />)}
         {tab === "schedule" && (can("schedule") ? <MobileSchedule /> : <MobileLocked />)}
         {tab === "photos" && (can("jobs") ? <MobilePhotos /> : <MobileLocked />)}
