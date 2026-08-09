@@ -21,9 +21,15 @@ Features built: quotes & invoices (line items, tax, PDF print), client CRM, jobs
 (photos/videos, documents, map locations, crew, private/assigned visibility,
 mobilization cost), team management (company join-code + owner approval + granular
 per-section permissions), **time tracking with clocked-vs-logged efficiency**, daily
-logs, work/manager logs, equipment (with maintenance readings), vehicle logs, safety
+logs, work/manager logs, equipment (maintenance readings + general billable equipment
+usage, rolled into Billing & Reports + a per-item usage log), vehicle logs, safety
 checks, inventory, warehouses, scheduling, subcontractors, contracts, billing/reports,
-a market-priced subscriptions page, and an **installable phone-first field app (PWA)**.
+a market-priced subscriptions page, and an **installable phone-first field app (PWA)**
+with clock-in/out geofence alerts (real phone notifications, foreground-only), live
+crew location + trail for owners/managers while clocked in, hauling-load tracking,
+"Local Sites" GPS-matched recurring billable locations, and employee self-serve
+**shift-edit requests** (My Hours → request a correction → owner/manager email +
+approval, since employees can't edit a clocked shift directly).
 
 ---
 
@@ -117,6 +123,10 @@ live project** unless noted:
 6. `migration_job_docs.sql` — `job-docs` bucket + policies; extends the records SELECT
    policy to hide private-job documents.
 7. `migration_private_jobs.sql` — earlier/superseded private-jobs policy (kept for history).
+8. `migration_shift_requests.sql` — emails the owner + managers (via `private.send_email`
+   from `emails.sql`, which must be run first) when an employee submits a shift-edit
+   request from My Hours. Trigger lives on `public.records`, filtered to
+   `collection = 'shiftrequests'` inside the function body (not the trigger clause).
 
 **RLS lesson (once caused an outage):** a policy on `public.records` must NOT run a
 subquery against `public.records` — Postgres throws `42P17 infinite recursion`, which
@@ -143,7 +153,16 @@ subquery against `public.records` — Postgres throws `42P17 infinite recursion`
   `geocodeAddress()`. **Job detail modal** re-renders locally (a `bump()` tick) on
   media/doc changes so it doesn't remount and close.
 - **Equipment maintenance** in the daily log pushes the latest mileage/engine-hours
-  onto the matching `equipment` record (running totals).
+  onto the matching `equipment` record (running totals) — separate from general
+  **equipment usage** (also loggable from the daily log), which bills hours at the
+  equipment's rate and *adds* to its running total instead of overwriting it.
+- **Shifts have no direct edit UI.** Employees can't edit a clocked `shifts` record —
+  they request a correction (My Hours → Request a correction), which lands in
+  `shiftrequests` (`status: Pending/Approved/Rejected`) and emails the owner/managers.
+  Approving on the Shift Requests page patches the `shifts` record directly; the
+  `employees` collection is purely informational and NOT linked to login accounts —
+  matching to "whose shift is this" is done by plain-text name (`employeeName ===
+  user.name`), same as everywhere else time gets attributed to a person.
 
 ---
 

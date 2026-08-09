@@ -216,7 +216,7 @@ const COLLECTIONS = [
   "quotes", "clients", "jobs", "employees", "subcontractors", "equipment",
   "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
   "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs", "quote_docs",
-  "sites", "loads", "activeclocks", "locationpings", "equipmentlogs",
+  "sites", "loads", "activeclocks", "locationpings", "equipmentlogs", "shiftrequests",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -529,6 +529,13 @@ function hoursBetween(start, end) {
   const [eh, em] = end.split(":").map(Number);
   if (![sh, sm, eh, em].every(Number.isFinite)) return 0;
   return Math.max(0, (eh * 60 + em - sh * 60 - sm) / 60);
+}
+
+// The job work someone logged on a given day — shown alongside a shift-edit
+// request as corroborating evidence ("you logged work on X until 5:47pm") so
+// both the employee and the approver have something more concrete than memory.
+function dayWorkContext(employeeName, entryDate) {
+  return getCol("timeentries").filter(e => e.employeeName === employeeName && e.entryDate === entryDate && e.source !== "mobile-clock");
 }
 
 // Decimal hours → "h.mm" clock-style string, where the part after the dot is
@@ -864,6 +871,7 @@ const STATUS_COLORS = {
   "On Hold": ["#FEFCE8", "#CA8A04"],
   Pending: ["#FEFCE8", "#CA8A04"],
   Accepted: ["#F0FDF4", "#16A34A"],
+  Approved: ["#F0FDF4", "#16A34A"],
   Rejected: ["#FEF2F2", "#DC2626"],
   Sent: ["#EFF6FF", "#2563EB"],
 };
@@ -3323,6 +3331,99 @@ function CrewLocationsPage() {
   );
 }
 
+/* ─── Shift requests (Owner/Manager only) ─────────────────────────────────────
+   Employees can't edit a clocked shift directly — they request a correction
+   from "My Hours" on the field app (e.g. forgot to clock out, ended up with a
+   23-hour shift). This is where owners/managers review it: approving patches
+   the underlying `shifts` record directly; rejecting just closes the request.
+   An email goes out to the owner + managers on submission (see
+   supabase/migration_shift_requests.sql). */
+function ShiftRequestsPage() {
+  useDataVersion();
+  const { user } = useAuth();
+  const requests = getCol("shiftrequests");
+  const pending = requests.filter(r => r.status === "Pending");
+  const resolved = requests.filter(r => r.status !== "Pending");
+
+  const approve = req => {
+    const shift = getCol("shifts").find(s => s._id === req.shiftId);
+    if (shift) {
+      db.update("shifts", {
+        ...shift, startTime: req.requestedStartTime, endTime: req.requestedEndTime,
+        hours: hoursBetween(req.requestedStartTime, req.requestedEndTime),
+      });
+    }
+    db.update("shiftrequests", { ...req, status: "Approved", reviewedBy: user?.name || "", reviewedAt: new Date().toISOString() });
+    notifyData();
+  };
+  const reject = req => {
+    db.update("shiftrequests", { ...req, status: "Rejected", reviewedBy: user?.name || "", reviewedAt: new Date().toISOString() });
+    notifyData();
+  };
+
+  const requestCard = (req, editable) => {
+    const context = dayWorkContext(req.employeeName, req.entryDate);
+    return (
+      <div key={req._id} style={{ ...card, marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 10 }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>{req.employeeName}</div>
+            <div style={{ fontSize: 12, color: C.textMuted }}>{req.entryDate}</div>
+          </div>
+          <StatusBadge status={req.status} />
+        </div>
+        <div className="grid-2" style={{ gap: 8, marginBottom: 10 }}>
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>Logged</div>
+            <div style={{ fontSize: 14 }}>{req.originalStartTime || "?"}–{req.originalEndTime || "?"} ({num(req.originalHours).toFixed(2)}h)</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>Requested</div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.accent }}>{req.requestedStartTime || "?"}–{req.requestedEndTime || "?"} ({hoursBetween(req.requestedStartTime, req.requestedEndTime).toFixed(2)}h)</div>
+          </div>
+        </div>
+        {req.reason && <div style={{ fontSize: 13, marginBottom: 10 }}><strong>Reason:</strong> {req.reason}</div>}
+        {context.length > 0 && (
+          <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: 10, marginBottom: 10 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 6 }}>Logged that day</div>
+            {context.map(e => (
+              <div key={e._id} style={{ fontSize: 12, marginBottom: 3 }}>
+                {e.jobName || "Work"} · {e.startTime || "?"}–{e.endTime || "?"}{num(e.hoursWorked) ? " (" + num(e.hoursWorked).toFixed(2) + "h)" : ""}
+              </div>
+            ))}
+          </div>
+        )}
+        {editable
+          ? (
+            <div style={{ display: "flex", gap: 10 }}>
+              <button type="button" onClick={() => approve(req)} style={{ ...btnSecondary, flex: 1 }}>Approve</button>
+              <button type="button" onClick={() => reject(req)} style={{ ...btnDanger, flex: 1 }}>Reject</button>
+            </div>
+          )
+          : req.reviewedBy && (
+            <div style={{ fontSize: 12, color: C.textMuted }}>Reviewed by {req.reviewedBy}{req.reviewedAt ? " · " + new Date(req.reviewedAt).toLocaleDateString() : ""}</div>
+          )}
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <PageHeader title="Shift Requests" subtitle="Employee-requested corrections to clocked shifts — approving here updates the shift" />
+      <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Pending ({pending.length})</h3>
+      {pending.length === 0
+        ? <EmptyState icon="🕘" title="No pending requests" subtitle="When an employee requests a shift correction from “My Hours” on the field app, it shows up here." />
+        : pending.map(r => requestCard(r, true))}
+      {resolved.length > 0 && (
+        <>
+          <h3 style={{ fontSize: 15, fontWeight: 700, margin: "24px 0 12px" }}>History</h3>
+          {resolved.map(r => requestCard(r, false))}
+        </>
+      )}
+    </div>
+  );
+}
+
 /* ─── Dashboard ──────────────────────────────────────────────────────────── */
 function Dashboard() {
   const { navigate } = useRouter();
@@ -3345,14 +3446,16 @@ function Dashboard() {
   const hoursThisMonth = db.getAll("timeentries", {}, { limit: 1000 }).items
     .filter(e => (e.entryDate || "").slice(0, 7) === today().slice(0, 7))
     .reduce((s, e) => s + num(e.hoursWorked), 0);
+  const pendingShiftRequests = (user?.isOwner || user?.role === "Manager") ? db.getAll("shiftrequests", { status: "Pending" }).total : 0;
 
   return (
     <div>
       <PageHeader title={"Welcome back, " + (user?.name || "there") + " 👋"} subtitle={company?.companyName} />
 
-      <div className="grid-2" style={{ marginBottom: 20 }}>
+      <div className={pendingShiftRequests > 0 ? "grid-3" : "grid-2"} style={{ marginBottom: 20 }}>
         <StatCard label="Outstanding (quotes + invoices)" value={fmt(outstanding)} icon="💰" onClick={() => navigate("quotes")} />
         <StatCard label="Hours logged this month" value={hoursThisMonth.toFixed(1) + "h"} icon="⏱️" onClick={() => navigate("employee-logs")} />
+        {pendingShiftRequests > 0 && <StatCard label="Pending shift requests" value={pendingShiftRequests} icon="🕘" onClick={() => navigate("shift-requests")} />}
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 16, marginBottom: 28 }}>
@@ -4518,6 +4621,7 @@ const NAV = [
   { id: "employee-logs", label: "Work Logs", icon: "📊" },
   { id: "manager-logs", label: "Manager Logs", icon: "📖" },
   { id: "crew-locations", label: "Crew Locations", icon: "🛰️" },
+  { id: "shift-requests", label: "Shift Requests", icon: "🕘" },
   { id: "equipment", label: "Equipment", icon: "🚛" },
   { id: "truck-logs", label: "Vehicle Logs", icon: "🚚" },
   { id: "haul-loads", label: "Haul Loads", icon: "⚖️" },
@@ -4538,7 +4642,7 @@ const ALWAYS_VISIBLE = ["dashboard", "profile"];
 const OWNER_ONLY = ["team", "settings", "subscriptions"];
 // Live employee location — not owner-employee-grantable like other sections;
 // only owners and managers ever see it, full stop.
-const MANAGER_PLUS_ONLY = ["crew-locations"];
+const MANAGER_PLUS_ONLY = ["crew-locations", "shift-requests"];
 // Nav items an owner can grant to employees (everything not always/owner-only).
 const GRANTABLE = NAV.map(n => n.id).filter(id => !ALWAYS_VISIBLE.includes(id) && !OWNER_ONLY.includes(id) && !MANAGER_PLUS_ONLY.includes(id));
 
@@ -4621,6 +4725,7 @@ const PAGES = {
   "employee-logs": () => <EmployeeLogsPage />,
   "manager-logs": () => <ManagerLogsPage />,
   "crew-locations": () => <CrewLocationsPage />,
+  "shift-requests": () => <ShiftRequestsPage />,
   equipment: () => <EquipmentPage />,
   "truck-logs": () => <TruckLogBooksPage />,
   "haul-loads": () => <HaulLoadsPage />,
@@ -4805,6 +4910,111 @@ function InstallHelpSheet({ onClose }) {
           {installSteps().map((s, i) => <li key={i} style={{ marginBottom: 10 }}>{s}</li>)}
         </ol>
         {isIOS() && <p style={{ marginTop: 12, color: C.textMuted, fontSize: 12 }}>On iPhone/iPad this only works in Safari — not Chrome.</p>}
+      </div>
+    </MobileSheet>
+  );
+}
+
+// 📊 My Hours — an employee's own clocked-shift history, grouped by month, with
+// a way to request a correction on a shift instead of editing it directly
+// (e.g. forgot to clock out and ended up with a 23-hour shift). Requests go to
+// the owner/managers for approval — see ShiftRequestsPage and
+// supabase/migration_shift_requests.sql for the email side.
+function MyHoursSheet({ employee, onClose }) {
+  useDataVersion();
+  const shifts = getCol("shifts").filter(s => s.employeeName === employee).sort((a, b) => (b.entryDate || "").localeCompare(a.entryDate || ""));
+  const requests = getCol("shiftrequests").filter(r => r.employeeName === employee);
+
+  const oneYearAgo = dateStr(new Date(Date.now() - 366 * 86400000));
+  const recent = shifts.filter(s => (s.entryDate || "") >= oneYearAgo);
+  const totalHours = recent.reduce((s, x) => s + num(x.hours), 0);
+
+  const months = {};
+  recent.forEach(s => { const k = (s.entryDate || "").slice(0, 7); if (!months[k]) months[k] = []; months[k].push(s); });
+  const monthKeys = Object.keys(months).sort((a, b) => b.localeCompare(a));
+  const monthLabel = k => { const [y, m] = k.split("-").map(Number); return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" }); };
+
+  const [expanded, setExpanded] = useState(() => today().slice(0, 7));
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState({ start: "", end: "", reason: "" });
+  const [msg, setMsg] = useState("");
+
+  const openEdit = s => { setEditingId(s._id); setForm({ start: s.startTime || "", end: s.endTime || "", reason: "" }); setMsg(""); };
+  const submitRequest = s => {
+    if (!form.start || !form.end || !form.reason.trim()) { setMsg("Fill in the corrected times and a reason."); return; }
+    db.create("shiftrequests", {
+      employeeName: employee, shiftId: s._id, entryDate: s.entryDate,
+      originalStartTime: s.startTime, originalEndTime: s.endTime, originalHours: s.hours,
+      requestedStartTime: form.start, requestedEndTime: form.end, reason: form.reason.trim(),
+      status: "Pending",
+    });
+    notifyData();
+    setEditingId(null);
+    setMsg("Request sent — your owner/manager will get an email.");
+    setTimeout(() => setMsg(""), 4000);
+  };
+
+  return (
+    <MobileSheet title="My Hours" onClose={onClose}>
+      <div style={{ padding: 16 }}>
+        <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 16 }}>{totalHours.toFixed(1)} hours clocked over the last 12 months</div>
+
+        {monthKeys.length === 0 && <div style={{ textAlign: "center", color: C.textMuted, padding: "20px 0" }}>No clocked shifts yet.</div>}
+
+        {monthKeys.map(k => {
+          const rows = months[k];
+          const monthTotal = rows.reduce((s, x) => s + num(x.hours), 0);
+          const isOpen = expanded === k;
+          return (
+            <div key={k} style={{ marginBottom: 10 }}>
+              <button type="button" onClick={() => setExpanded(isOpen ? null : k)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", background: C.surfaceAlt, border: "none", borderRadius: 10, padding: "12px 14px", cursor: "pointer", textAlign: "left" }}>
+                <span style={{ fontWeight: 700, fontSize: 14 }}>{isOpen ? "▾" : "▸"} {monthLabel(k)}</span>
+                <span style={{ fontSize: 13, color: C.textMuted }}>{monthTotal.toFixed(1)} h · {rows.length} shift{rows.length === 1 ? "" : "s"}</span>
+              </button>
+              {isOpen && rows.map(s => {
+                const req = requests.find(r => r.shiftId === s._id && r.status !== "Rejected");
+                return (
+                  <div key={s._id} style={{ ...mCard, marginTop: 8, padding: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                      <div>
+                        <div style={{ fontWeight: 700, fontSize: 14 }}>{s.entryDate}</div>
+                        <div style={{ fontSize: 12, color: C.textMuted }}>{s.startTime || "?"}–{s.endTime || "?"}</div>
+                      </div>
+                      <div style={{ fontWeight: 800, color: C.accent }}>{hmm(num(s.hours))}</div>
+                    </div>
+                    {req
+                      ? <div style={{ marginTop: 8 }}><StatusBadge status={req.status} /></div>
+                      : editingId === s._id
+                        ? (
+                          <div style={{ marginTop: 10, borderTop: "1px solid " + C.border, paddingTop: 10 }}>
+                            {dayWorkContext(employee, s.entryDate).length > 0 && (
+                              <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: 10, marginBottom: 10, fontSize: 12 }}>
+                                <div style={{ fontWeight: 700, marginBottom: 4 }}>You logged that day:</div>
+                                {dayWorkContext(employee, s.entryDate).map(e => (
+                                  <div key={e._id}>{e.jobName || "Work"} · {e.startTime || "?"}–{e.endTime || "?"}</div>
+                                ))}
+                              </div>
+                            )}
+                            <div style={{ display: "flex", gap: 10 }}>
+                              <div style={{ flex: 1 }}><label style={mLbl}>Actually started</label><input type="time" value={form.start} onChange={e => setForm(f => ({ ...f, start: e.target.value }))} style={mInput} /></div>
+                              <div style={{ flex: 1 }}><label style={mLbl}>Actually ended</label><input type="time" value={form.end} onChange={e => setForm(f => ({ ...f, end: e.target.value }))} style={mInput} /></div>
+                            </div>
+                            <label style={mLbl}>Reason</label>
+                            <input value={form.reason} onChange={e => setForm(f => ({ ...f, reason: e.target.value }))} placeholder="Forgot to clock out, left around 5pm…" style={mInput} />
+                            {msg && <div style={{ fontSize: 12, color: msg.includes("sent") ? C.green : "#DC2626", marginTop: 8 }}>{msg}</div>}
+                            <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+                              <button type="button" onClick={() => setEditingId(null)} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+                              <button type="button" onClick={() => submitRequest(s)} style={{ ...btnSecondary, flex: 1 }}>Send request</button>
+                            </div>
+                          </div>
+                        )
+                        : <button type="button" onClick={() => openEdit(s)} style={{ background: "none", border: "none", color: C.accent, fontSize: 12, fontWeight: 700, cursor: "pointer", padding: 0, marginTop: 8 }}>Request a correction</button>}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
       </div>
     </MobileSheet>
   );
@@ -5537,6 +5747,7 @@ function MobileMore() {
   const { company } = useCompany();
   const install = useInstallPrompt();
   const [help, setHelp] = useState(false);
+  const [myHours, setMyHours] = useState(false);
   const goDesktop = () => { storage.remove(FORCE_MOBILE_KEY); storage.set(FORCE_DESKTOP_KEY, "1"); window.location.reload(); };
   const installApp = async () => {
     if (install) { install.prompt(); try { await install.userChoice; } catch (e) {} window.__bmbInstall = null; }
@@ -5550,6 +5761,7 @@ function MobileMore() {
         <div style={{ fontSize: 13, color: C.textMuted }}>{user?.email}</div>
         <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{company?.companyName} · {user?.role}</div>
       </div>
+      <button type="button" onClick={() => setMyHours(true)} style={{ ...mBtn, background: C.surface, color: C.text, border: "1px solid " + C.border, marginBottom: 12, fontSize: 15 }}>📊  My Hours</button>
       {isStandalone()
         ? <div style={{ ...mCard, textAlign: "center", color: C.green, fontWeight: 700, fontSize: 14 }}>✓ Running as an installed app</div>
         : <button type="button" onClick={installApp} style={{ ...mBtn, background: C.secondary, color: "#fff", marginBottom: 12, fontSize: 15 }}>📲  Install app on this device</button>}
@@ -5557,6 +5769,7 @@ function MobileMore() {
       <button type="button" onClick={logout} style={{ ...mBtn, background: "#FEF2F2", color: "#DC2626", fontSize: 15 }}>Sign out</button>
       <p style={{ textAlign: "center", fontSize: 11, color: C.textMuted, marginTop: 18 }}>BuildMyBill — field app</p>
       {help && <InstallHelpSheet onClose={() => setHelp(false)} />}
+      {myHours && <MyHoursSheet employee={user?.name} onClose={() => setMyHours(false)} />}
     </div>
   );
 }
