@@ -4898,8 +4898,11 @@ function MobileTeamEfficiency() {
 }
 
 // Watches GPS while mounted (i.e. while the Track tab is open) and reports
-// whether the phone is currently within range of the shop. Foreground-only —
-// stops the moment the tab is switched away from (component unmount).
+// whether the phone is currently within range of the shop. Watches whether
+// clocked in or not — arrival matters when off the clock (prompt to check in),
+// departure matters when on the clock (prompt to check out). Foreground-only —
+// stops the moment the tab is switched away from (component unmount); phones
+// don't let a web app watch location in the background.
 function useNearShop(company, enabled) {
   const [near, setNear] = useState(false);
   useEffect(() => {
@@ -4912,6 +4915,30 @@ function useNearShop(company, enabled) {
     return () => navigator.geolocation.clearWatch(id);
   }, [enabled, company?.shopLat, company?.shopLng, company?.geofenceRadiusM]);
   return near;
+}
+
+// A real phone notification (via the service worker, which mobile browsers
+// require) rather than just an in-app banner — best-effort only: it can only
+// fire while this tab/app is actually open, since phones don't allow a web
+// app to run or be woken up in the background.
+async function showLocalNotification(title, body, tag) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    const reg = navigator.serviceWorker && await navigator.serviceWorker.getRegistration();
+    if (reg) { reg.showNotification(title, { body, tag, renotify: true, icon: "icon-192.png", badge: "icon-192.png" }); return; }
+    new Notification(title, { body, tag });
+  } catch (e) { /* some mobile browsers restrict the Notification constructor without a SW — best effort */ }
+}
+
+// Reactive wrapper around the browser's notification permission, since
+// Notification.permission itself isn't observable.
+function useNotifyPermission() {
+  const [perm, setPerm] = useState(() => ("Notification" in window ? Notification.permission : "unsupported"));
+  const request = async () => {
+    if (!("Notification" in window)) return;
+    setPerm(await Notification.requestPermission());
+  };
+  return [perm, request];
 }
 
 function MobileTimeClock({ onLogWork }) {
@@ -4927,8 +4954,30 @@ function MobileTimeClock({ onLogWork }) {
   const [nowTs, setNowTs] = useState(Date.now());
   const [busy, setBusy] = useState(false);
   const [alertDismissed, setAlertDismissed] = useState(false);
-  const nearShop = useNearShop(company, !active);
+  const [checkOutDismissed, setCheckOutDismissed] = useState(false);
+  const [notifyPerm, requestNotify] = useNotifyPermission();
+  const nearShop = useNearShop(company, true);
   useEffect(() => { if (!nearShop) setAlertDismissed(false); }, [nearShop]);
+
+  // Remembers "were they near the shop at some point while clocked in" so a
+  // later departure can be recognized as *leaving the shop*, not just "not
+  // currently at the shop" (which would be true nearly all day, every day).
+  const [wasNearShop, setWasNearShop] = useState(false);
+  useEffect(() => {
+    if (active && nearShop) setWasNearShop(true);
+    if (!active) setWasNearShop(false);
+  }, [active, nearShop]);
+  const leavingShop = active && wasNearShop && !nearShop;
+  useEffect(() => { if (!leavingShop) setCheckOutDismissed(false); }, [leavingShop]);
+
+  // Real phone notifications alongside the in-app banners below — best effort,
+  // only fires while the app is actually open (see useNearShop).
+  useEffect(() => {
+    if (!active && nearShop && !alertDismissed) showLocalNotification("BuildMyBill", "You're near the shop — want to clock in?", "bmb-clock-in");
+  }, [nearShop]);
+  useEffect(() => {
+    if (leavingShop && !checkOutDismissed) showLocalNotification("BuildMyBill", "Leaving the shop — want to clock out?", "bmb-clock-out");
+  }, [leavingShop]);
 
   useEffect(() => {
     if (!active) return;
@@ -5008,6 +5057,14 @@ function MobileTimeClock({ onLogWork }) {
         </div>
       )}
 
+      {notifyPerm === "default" && company?.shopLat != null && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, background: C.surfaceAlt, border: "1px solid " + C.border, borderRadius: 12, padding: "12px 12px 12px 14px", marginBottom: 14 }}>
+          <div style={{ fontSize: 20 }}>🔔</div>
+          <div style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600 }}>Get a phone alert to check in/out near the shop</div>
+          <button type="button" onClick={requestNotify} style={{ ...btnOutline, whiteSpace: "nowrap", padding: "8px 12px", fontSize: 12 }}>Enable</button>
+        </div>
+      )}
+
       {!active && nearShop && !alertDismissed && (
         <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#0F172A", color: "#fff", borderRadius: 12, padding: "12px 12px 12px 14px", marginBottom: 14 }}>
           <div style={{ fontSize: 22 }}>📍</div>
@@ -5017,6 +5074,18 @@ function MobileTimeClock({ onLogWork }) {
           </div>
           <button type="button" onClick={clockIn} style={{ background: C.secondary, color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Clock In</button>
           <button type="button" onClick={() => setAlertDismissed(true)} aria-label="Dismiss" style={{ background: "none", border: "none", color: "#fff", opacity: .5, fontSize: 20, cursor: "pointer", lineHeight: 1 }}>×</button>
+        </div>
+      )}
+
+      {leavingShop && !checkOutDismissed && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#0F172A", color: "#fff", borderRadius: 12, padding: "12px 12px 12px 14px", marginBottom: 14 }}>
+          <div style={{ fontSize: 22 }}>📍</div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 800, fontSize: 14 }}>Leaving the shop</div>
+            <div style={{ fontSize: 12, opacity: .65 }}>Clock out now?</div>
+          </div>
+          <button type="button" disabled={busy} onClick={clockOut} style={{ background: "#DC2626", color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", fontWeight: 700, fontSize: 13, cursor: "pointer", opacity: busy ? .7 : 1 }}>Clock Out</button>
+          <button type="button" onClick={() => setCheckOutDismissed(true)} aria-label="Dismiss" style={{ background: "none", border: "none", color: "#fff", opacity: .5, fontSize: 20, cursor: "pointer", lineHeight: 1 }}>×</button>
         </div>
       )}
 

@@ -2,11 +2,12 @@
    Network-first for same-origin GETs so new deploys always win; the cache is
    only a fallback when offline. Supabase (cross-origin) requests pass straight
    through and are never cached. */
-const CACHE = "bmb-v3";
+const CACHE = "bmb-v4";
 const SHELL = [
   "./", "./index.html", "./config.js", "./manifest.webmanifest",
   "./vendor/react.production.min.js", "./vendor/react-dom.production.min.js",
   "./vendor/supabase.js", "./vendor/babel.min.js",
+  "./vendor/leaflet/leaflet.js", "./vendor/leaflet/leaflet.css",
   "./icon-192.png", "./icon-512.png"
 ];
 
@@ -39,5 +40,17 @@ self.addEventListener("fetch", e => {
         return res;
       })
       .catch(() => caches.match(req).then(r => r || caches.match("./index.html")))
+  );
+});
+
+// Tapping a check-in/out notification focuses the app if it's already open,
+// or opens it fresh otherwise.
+self.addEventListener("notificationclick", e => {
+  e.notification.close();
+  e.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(list => {
+      for (const c of list) { if ("focus" in c) return c.focus(); }
+      if (self.clients.openWindow) return self.clients.openWindow("./");
+    })
   );
 });
