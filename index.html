@@ -1893,6 +1893,7 @@ function SubcontractorsPage() {
 }
 
 function EquipmentPage() {
+  const warehouseNames = useMemo(() => db.getAll("warehouses").items.map(w => w.warehouseName).filter(Boolean), []);
   const detail = eq => {
     const field = (label, value) => (value || value === 0) ? (
       <div style={{ marginBottom: 12 }}>
@@ -1917,6 +1918,7 @@ function EquipmentPage() {
           {field("Total Engine Hours", eq.totalHours !== undefined && eq.totalHours !== "" ? num(eq.totalHours).toLocaleString() : null)}
           {field("Current Mileage", eq.currentMileage !== undefined && eq.currentMileage !== "" ? num(eq.currentMileage).toLocaleString() + " km" : null)}
           {field("Last Service", eq.lastServiceDate)}
+          {field("Warehouse", eq.warehouse)}
         </div>
         <div style={{ marginTop: 12, paddingTop: 16, borderTop: "1px solid " + C.border }}>
           <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Equipment Log</h3>
@@ -1956,6 +1958,7 @@ function EquipmentPage() {
       { key: "billingRatePerHour", label: "$/hr", render: money },
       { key: "totalHours", label: "Engine Hrs" },
       { key: "currentMileage", label: "Mileage (km)", render: v => (v === "" || v === undefined || v === null ? "—" : num(v).toLocaleString()) },
+      { key: "warehouse", label: "Warehouse", render: v => v || "—" },
       { key: "lastServiceDate", label: "Last Service", render: v => v || "—" },
     ]}
     formFields={[
@@ -1966,6 +1969,7 @@ function EquipmentPage() {
       { key: "billingRatePerHour", label: "Billing Rate ($/hr)", type: "number", placeholder: "150.00" },
       { key: "totalHours", label: "Engine Hours", type: "number", placeholder: "0" },
       { key: "currentMileage", label: "Current Mileage (km)", type: "number", placeholder: "0" },
+      { key: "warehouse", label: "Warehouse", type: "datalist", options: warehouseNames, placeholder: "Where's it stored?" },
       { key: "lastServiceDate", label: "Last Service Date", type: "date" },
       { key: "vinNumber", label: "VIN Number", placeholder: "1HGBH41JXMN109186" },
       { key: "description", label: "Description", type: "textarea", placeholder: "Equipment notes…" },
@@ -1976,6 +1980,7 @@ function EquipmentPage() {
 }
 
 function InventoryPage() {
+  const warehouseNames = useMemo(() => db.getAll("warehouses").items.map(w => w.warehouseName).filter(Boolean), []);
   return <CRUDPage
     title="Inventory" singular="Material" subtitle="Track stock levels and materials" collection="inventory" emptyIcon="📦"
     columns={[
@@ -1991,7 +1996,7 @@ function InventoryPage() {
       { key: "currentStock", label: "Current Stock", type: "number", placeholder: "100" },
       { key: "unitOfMeasure", label: "Unit of Measure", placeholder: "tons, yards, units…" },
       { key: "unitPrice", label: "Unit Price ($)", type: "number", placeholder: "25.00" },
-      { key: "warehouse", label: "Warehouse", placeholder: "Main Warehouse" },
+      { key: "warehouse", label: "Warehouse", type: "datalist", options: warehouseNames, placeholder: "Which warehouse?" },
       { key: "supplier", label: "Supplier", placeholder: "Supplier name" },
       { key: "description", label: "Description", type: "textarea", placeholder: "Material details…" },
     ]}
@@ -2045,25 +2050,107 @@ function SafetyPage() {
 }
 
 function WarehousesPage() {
+  const detail = wh => {
+    const field = (label, node) => node ? (
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</div>
+        <div style={{ fontSize: 14 }}>{node}</div>
+      </div>
+    ) : null;
+    // What's here, pulled live from Equipment/Inventory — both link back by
+    // warehouse name (same plain-text matching convention used everywhere else
+    // in the app, e.g. jobs/employees), not a foreign key.
+    const equipmentHere = getCol("equipment").filter(e => (e.warehouse || "") === wh.warehouseName);
+    const stockHere = getCol("inventory").filter(i => (i.warehouse || "") === wh.warehouseName);
+    const stockValue = stockHere.reduce((s, i) => s + num(i.currentStock) * num(i.unitPrice), 0);
+    return (
+      <div>
+        <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 4 }}>{wh.warehouseName}</div>
+        <div style={{ marginBottom: 14 }}>
+          {wh.isActive !== false ? <Badge color="#F0FDF4" textColor="#16A34A">Active</Badge> : <Badge color="#FEF2F2" textColor="#DC2626">Inactive</Badge>}
+        </div>
+        <div className="grid-2" style={{ gap: 8 }}>
+          {field("Contact", wh.contactPerson)}
+          {field("Phone", wh.phoneNumber)}
+          {field("Capacity", wh.capacity ? num(wh.capacity).toLocaleString() + " sq ft" : null)}
+        </div>
+        {wh.address && field("Location", (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <span>{wh.address}</span>
+            <a href={mapsUrl(wh.address)} target="_blank" rel="noopener noreferrer" style={{ ...btnOutline, textDecoration: "none", padding: "6px 12px" }}>🗺️ Open in Maps</a>
+          </div>
+        ))}
+        {field("What's stored here", wh.description)}
+
+        <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
+          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Equipment Here ({equipmentHere.length})</h3>
+          {equipmentHere.length === 0
+            ? <p style={{ color: C.textMuted, fontSize: 13 }}>No equipment assigned to this warehouse yet — set it on the Equipment page.</p>
+            : (
+              <DataTable
+                columns={[
+                  { key: "equipmentName", label: "Name" },
+                  { key: "equipmentType", label: "Type" },
+                  { key: "totalHours", label: "Engine Hrs", render: v => (v || v === 0) ? num(v).toLocaleString() : "—" },
+                ]}
+                rows={equipmentHere}
+                emptyMessage="No equipment."
+              />
+            )}
+        </div>
+
+        <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
+          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Stock Here ({stockHere.length})</h3>
+          {stockHere.length === 0
+            ? <p style={{ color: C.textMuted, fontSize: 13 }}>No inventory assigned to this warehouse yet — set it on the Inventory page.</p>
+            : (
+              <>
+                <StatCard label="Total Stock Value" value={fmt(stockValue)} />
+                <div style={{ marginTop: 10 }}>
+                  <DataTable
+                    columns={[
+                      { key: "materialName", label: "Material" },
+                      { key: "currentStock", label: "Quantity", render: (v, row) => num(v) + " " + (row.unitOfMeasure || "units") },
+                      { key: "unitPrice", label: "Unit Price", render: money },
+                    ]}
+                    rows={stockHere}
+                    emptyMessage="No stock."
+                  />
+                </div>
+              </>
+            )}
+        </div>
+      </div>
+    );
+  };
+
+  const beforeSave = async data => {
+    const ll = await resolveLatLng(data.address);
+    return { ...data, addressLat: ll ? ll.lat : null, addressLng: ll ? ll.lng : null };
+  };
+
   return <CRUDPage
-    title="Warehouses" singular="Warehouse" subtitle="Manage storage locations and facilities" collection="warehouses" emptyIcon="🏭"
+    title="Warehouses" singular="Warehouse" subtitle="Storage locations — what's stored there, equipment on site, and stock on hand" collection="warehouses" emptyIcon="🏭"
     defaultValues={{ isActive: true }}
     columns={[
       { key: "warehouseName", label: "Warehouse Name" },
-      { key: "address", label: "Address" },
-      { key: "contactPerson", label: "Contact" },
-      { key: "phoneNumber", label: "Phone" },
+      { key: "address", label: "Location", render: v => <MapLink query={v} label="Map" /> },
+      { key: "_equipment", label: "Equipment", render: (_v, row) => getCol("equipment").filter(e => (e.warehouse || "") === row.warehouseName).length || "—" },
+      { key: "_stock", label: "Stock Items", render: (_v, row) => getCol("inventory").filter(i => (i.warehouse || "") === row.warehouseName).length || "—" },
       { key: "capacity", label: "Capacity", render: v => (v ? num(v).toLocaleString() + " sq ft" : "—") },
       { key: "isActive", label: "Active", render: v => (v !== false ? "✅" : "❌") },
     ]}
     formFields={[
       { key: "warehouseName", label: "Warehouse Name", required: true, placeholder: "Main Warehouse" },
-      { key: "address", label: "Address", required: true, placeholder: "123 Industrial Blvd, City" },
+      { key: "address", label: "Location", type: "maps", required: true, placeholder: "Address or pin (lat, lng)" },
       { key: "contactPerson", label: "Contact Person", placeholder: "John Doe" },
       { key: "phoneNumber", label: "Phone Number", placeholder: "+1 555 000 0000" },
       { key: "capacity", label: "Capacity (sq ft)", type: "number", placeholder: "10000" },
+      { key: "description", label: "What's stored here", type: "textarea", placeholder: "General notes — staging area, spare parts bin, bulk materials not tracked as line-item stock…" },
       { key: "isActive", label: "Currently active", type: "boolean" },
     ]}
+    detail={detail}
+    beforeSave={beforeSave}
   />;
 }
 
@@ -3248,12 +3335,13 @@ function EmployeeLogsPage() {
 }
 
 /* ─── Crew locations (Owner/Manager only) ────────────────────────────────────
-   Live location for whoever is currently clocked in, plus a breadcrumb trail
-   for their current shift. Backed by the "activeclocks" / "locationpings"
-   collections, which are written on clock-in/out and cleared on clock-out —
-   so this only ever shows someone while they're on the clock, and the trail
-   disappears the moment they clock out. Since other devices' writes aren't
-   pushed to us in real time, this page polls the server directly. */
+   Live location + trail for whoever is currently clocked in (backed by
+   "activeclocks", which only exists while someone's on the clock), plus a
+   "Recent Shifts" history where past shifts' routes can still be viewed —
+   each shift keeps the `clockRecordId` linking it to its "locationpings", so
+   the trail survives clock-out even though the "currently active" marker
+   doesn't. Since other devices' writes aren't pushed to us in real time, this
+   page polls the server directly. */
 function useCrewLocationsPolling(pollMs = 20000) {
   useDataVersion();
   useEffect(() => {
@@ -3265,7 +3353,7 @@ function useCrewLocationsPolling(pollMs = 20000) {
   }, [pollMs]);
 }
 
-function CrewMapModal({ session, pings, onClose }) {
+function CrewMapModal({ session, pings, onClose, live }) {
   const containerRef = useRef(null);
   useEffect(() => {
     if (!containerRef.current || !window.L || pings.length === 0) return;
@@ -3279,19 +3367,19 @@ function CrewMapModal({ session, pings, onClose }) {
       L.circleMarker(latlngs[0], { radius: 6, color: "#6B7280", fillColor: "#6B7280", fillOpacity: 1 }).addTo(map).bindPopup("Clocked in here");
       map.fitBounds(trail.getBounds(), { padding: [30, 30] });
     }
-    L.marker(latlngs[latlngs.length - 1]).addTo(map).bindPopup("Current location").openPopup();
+    L.marker(latlngs[latlngs.length - 1]).addTo(map).bindPopup(live ? "Current location" : "Clocked out here").openPopup();
     return () => map.remove();
   }, [session._id, pings.length]);
 
   return (
-    <Modal title={session.employeeName + " — live location"} width={720} onClose={onClose}>
+    <Modal title={session.employeeName + (live ? " — live location" : " — route")} width={720} onClose={onClose}>
       {pings.length === 0
-        ? <p style={{ color: C.textMuted, fontSize: 13 }}>No location yet — the app will drop a pin shortly after they clock in.</p>
+        ? <p style={{ color: C.textMuted, fontSize: 13 }}>No location recorded for this shift.</p>
         : (
           <>
             <div ref={containerRef} style={{ height: 420, borderRadius: 10, overflow: "hidden" }} />
             <div style={{ fontSize: 12, color: C.textMuted, marginTop: 10 }}>
-              {pings.length} location ping{pings.length === 1 ? "" : "s"} since clock-in · updates automatically while they're on the clock
+              {pings.length} location ping{pings.length === 1 ? "" : "s"}{live ? " since clock-in · updates automatically while they're on the clock" : " over this shift"}
             </div>
           </>
         )}
@@ -3302,16 +3390,21 @@ function CrewMapModal({ session, pings, onClose }) {
 function CrewLocationsPage() {
   useCrewLocationsPolling();
   const [selected, setSelected] = useState(null);
+  const [historySelected, setHistorySelected] = useState(null);
   const active = getCol("activeclocks").slice().sort((a, b) => (a.employeeName || "").localeCompare(b.employeeName || ""));
   const pingsFor = id => getCol("locationpings").filter(p => p.clockRecordId === id).sort((a, b) => (a.at || "").localeCompare(b.at || ""));
+  const recentShifts = getCol("shifts")
+    .filter(s => s.clockRecordId)
+    .sort((a, b) => (b.clockOutAt || "").localeCompare(a.clockOutAt || ""))
+    .slice(0, 30);
 
   return (
     <div>
-      <PageHeader title="Crew Locations" subtitle="Live location for anyone currently clocked in — visible to owners and managers only" />
+      <PageHeader title="Crew Locations" subtitle="Live location while clocked in, plus routes from recent finished shifts — visible to owners and managers only" />
       {active.length === 0
-        ? <EmptyState icon="🛰️" title="No one's clocked in" subtitle="Live locations show up here the moment someone clocks in on the field app, and disappear when they clock out." />
+        ? <EmptyState icon="🛰️" title="No one's clocked in" subtitle="Live locations show up here the moment someone clocks in on the field app." />
         : (
-          <div className="grid-auto">
+          <div className="grid-auto" style={{ marginBottom: 24 }}>
             {active.map(a => {
               const pings = pingsFor(a._id);
               const last = pings[pings.length - 1];
@@ -3326,7 +3419,29 @@ function CrewLocationsPage() {
             })}
           </div>
         )}
-      {selected && <CrewMapModal session={selected} pings={pingsFor(selected._id)} onClose={() => setSelected(null)} />}
+
+      <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Recent Shifts</h3>
+      {recentShifts.length === 0
+        ? <p style={{ color: C.textMuted, fontSize: 13 }}>No finished shifts with a recorded route yet.</p>
+        : (
+          <div style={card}>
+            <DataTable
+              columns={[
+                { key: "employeeName", label: "Employee" },
+                { key: "entryDate", label: "Date" },
+                { key: "startTime", label: "Start" },
+                { key: "endTime", label: "End" },
+                { key: "hours", label: "Hours", render: v => num(v).toFixed(2) + "h" },
+              ]}
+              rows={recentShifts}
+              onView={s => setHistorySelected(s)}
+              emptyMessage="No finished shifts yet."
+            />
+          </div>
+        )}
+
+      {selected && <CrewMapModal session={selected} pings={pingsFor(selected._id)} onClose={() => setSelected(null)} live />}
+      {historySelected && <CrewMapModal session={historySelected} pings={pingsFor(historySelected.clockRecordId)} onClose={() => setHistorySelected(null)} />}
     </div>
   );
 }
@@ -5236,13 +5351,12 @@ function MobileTimeClock({ onLogWork }) {
       startTime: timeHM(start), endTime: timeHM(end),
       hours: Math.round((end - start) / 3600000 * 100) / 100,
       clockInLocation: active.geoIn || "", clockOutLocation: geoOut || "",
+      // Keeps the link to this shift's location pings so the route can still be
+      // viewed on Crew Locations after clock-out (only the "currently active"
+      // marker goes away — the trail itself is kept).
+      clockRecordId: active.clockRecordId || "",
     });
-    // Live location only exists while clocked in — clear the trail along with
-    // the active-clock record now that the shift's over.
-    if (active.clockRecordId) {
-      getCol("locationpings").filter(p => p.clockRecordId === active.clockRecordId).forEach(p => db.remove("locationpings", p._id));
-      db.remove("activeclocks", active.clockRecordId);
-    }
+    if (active.clockRecordId) db.remove("activeclocks", active.clockRecordId);
     notifyData();
     persist(null);
     setBusy(false);
