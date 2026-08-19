@@ -1150,6 +1150,26 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
             </Field>
           );
         }
+        if (f.type === "customFields") {
+          const rows = Array.isArray(form[f.key]) ? form[f.key] : [];
+          const setRows = next => set(f.key, next);
+          const updateRow = (i, patch) => setRows(rows.map((r, ri) => (ri === i ? { ...r, ...patch } : r)));
+          const removeRow = i => setRows(rows.filter((_, ri) => ri !== i));
+          const addRow = () => setRows([...rows, { label: "", value: "" }]);
+          return (
+            <Field key={f.key} label={f.label}>
+              {rows.map((r, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
+                  <input value={r.label} onChange={e => updateRow(i, { label: e.target.value })} placeholder="Label…" style={{ ...inputCls, flex: "0 1 160px" }} />
+                  <input value={r.value} onChange={e => updateRow(i, { value: e.target.value })} placeholder="Value…" style={{ ...inputCls, flex: 1 }} />
+                  <button type="button" onClick={() => removeRow(i)} aria-label="Remove" style={{ ...btnOutline, padding: "8px 10px" }}>×</button>
+                </div>
+              ))}
+              <button type="button" onClick={addRow} style={btnOutline}>+ Add detail</button>
+              <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>{f.hint || "Add whatever's actually useful — condition, source, purchase date, a quirk worth remembering. No fixed list."}</div>
+            </Field>
+          );
+        }
         if (f.type === "maps") {
           return <MapsField key={f.key} field={f} value={form[f.key]} onChange={v => set(f.key, v)} onLookup={() => setLookupKey(f.key)} />;
         }
@@ -2073,6 +2093,14 @@ function InventoryDetailView({ item }) {
         {field("Reorder Point", live.reorderPoint !== undefined && live.reorderPoint !== "" ? num(live.reorderPoint) + " " + (live.unitOfMeasure || "units") : null)}
       </div>
 
+      {Array.isArray(live.customFields) && live.customFields.some(r => r.label || r.value) && (
+        <div style={{ marginTop: 4 }}>
+          <div className="grid-2" style={{ gap: 8 }}>
+            {live.customFields.filter(r => r.label || r.value).map((r, i) => <React.Fragment key={i}>{field(r.label || "Detail", r.value)}</React.Fragment>)}
+          </div>
+        </div>
+      )}
+
       <div style={{ marginTop: 12, paddingTop: 16, borderTop: "1px solid " + C.border }}>
         <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Log a Movement</h3>
         <div className="grid-2" style={{ gap: 12 }}>
@@ -2149,6 +2177,7 @@ function InventoryPage() {
       { key: "binLocation", label: "Bin / Shelf Location (optional)", placeholder: "Bay 3, Shelf B…" },
       { key: "supplier", label: "Supplier", placeholder: "Supplier name" },
       { key: "description", label: "Description", type: "textarea", placeholder: "Material details…" },
+      { key: "customFields", label: "Additional Details", type: "customFields", hint: "Condition, purchase date, source, a quirk worth remembering… whatever's useful, no fixed list." },
     ]}
     detail={item => <InventoryDetailView item={item} />}
   />;
@@ -2233,6 +2262,12 @@ function WarehousesPage() {
         ))}
         {field("What's stored here", wh.description)}
 
+        {Array.isArray(wh.customFields) && wh.customFields.some(r => r.label || r.value) && (
+          <div className="grid-2" style={{ gap: 8 }}>
+            {wh.customFields.filter(r => r.label || r.value).map((r, i) => <React.Fragment key={i}>{field(r.label || "Detail", r.value)}</React.Fragment>)}
+          </div>
+        )}
+
         <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
           <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Equipment Here ({equipmentHere.length})</h3>
           {equipmentHere.length === 0
@@ -2304,11 +2339,12 @@ function WarehousesPage() {
     ]}
     formFields={[
       { key: "warehouseName", label: "Warehouse Name", required: true, placeholder: "Main Warehouse" },
-      { key: "address", label: "Location", type: "maps", required: true, placeholder: "Address or pin (lat, lng)" },
+      { key: "address", label: "Location (optional)", type: "maps", placeholder: "Address or pin (lat, lng) — fill in later if you don't know it yet" },
       { key: "contactPerson", label: "Contact Person", placeholder: "John Doe" },
       { key: "phoneNumber", label: "Phone Number", placeholder: "+1 555 000 0000" },
       { key: "capacity", label: "Capacity (sq ft)", type: "number", placeholder: "10000" },
       { key: "description", label: "What's stored here", type: "textarea", placeholder: "General notes — staging area, spare parts bin, bulk materials not tracked as line-item stock…" },
+      { key: "customFields", label: "Additional Details", type: "customFields", hint: "Gate code, landlord, hours, a quirk worth remembering… whatever's useful, no fixed list." },
       { key: "isActive", label: "Currently active", type: "boolean" },
     ]}
     detail={detail}
