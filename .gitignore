@@ -7,3 +7,6 @@ Desktop.ini
 # Local screenshots / scratch
 screenshots/
 *.tmp
+
+# Per-machine Claude Code permission state (not shared config)
+.claude/settings.local.json

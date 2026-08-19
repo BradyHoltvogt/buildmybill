@@ -217,6 +217,7 @@ const COLLECTIONS = [
   "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
   "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs", "quote_docs",
   "sites", "loads", "activeclocks", "locationpings", "equipmentlogs", "shiftrequests",
+  "inventorylogs",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -365,6 +366,30 @@ function logEquipmentUsage({ equipmentName, hours, employeeName, entryDate, jobI
   });
   if (eq) db.update("equipment", { ...eq, totalHours: num(eq.totalHours) + h });
 }
+
+// Records a stock movement (received or used) against an inventory item and
+// keeps its running currentStock in sync — the one place "what happened to
+// this material" turns into both an audit trail and an updated stock count,
+// instead of currentStock being a number someone just overwrites by hand.
+function logInventoryMovement({ inventoryId, materialName, type, quantity, note, entryDate, loggedBy }) {
+  const item = inventoryId
+    ? db.getById("inventory", inventoryId)
+    : getCol("inventory").find(i => (i.materialName || "").trim() === String(materialName || "").trim());
+  const q = num(quantity);
+  if (!item || !(q > 0)) return null;
+  const kind = type === "Used" ? "Used" : "Received";
+  const delta = kind === "Used" ? -q : q;
+  db.create("inventorylogs", {
+    inventoryId: item._id, materialName: item.materialName, type: kind, quantity: q,
+    note: note || "", entryDate: entryDate || today(), loggedBy: loggedBy || "",
+  });
+  db.update("inventory", { ...item, currentStock: Math.max(0, num(item.currentStock) + delta) });
+  return kind;
+}
+
+// A material is flagged low the moment its stock reaches (or drops under) the
+// reorder point someone set for it — no reorder point means no alert.
+const isLowStock = i => i && i.reorderPoint !== undefined && i.reorderPoint !== "" && num(i.currentStock) <= num(i.reorderPoint);
 
 /* ─── Job media (photos & videos) ────────────────────────────────────────────
    Files live in a PRIVATE Supabase Storage bucket, foldered by company then job:
@@ -1126,7 +1151,7 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
   );
 }
 
-function CRUDPage({ title, singular, subtitle, collection, columns, formFields, emptyIcon, defaultValues = {}, detail, sort, beforeSave }) {
+function CRUDPage({ title, singular, subtitle, collection, columns, formFields, emptyIcon, defaultValues = {}, detail, sort, beforeSave, extra }) {
   const applySort = arr => (sort ? arr.slice().sort(sort) : arr);
   const [items, setItems] = useState(() => applySort(db.getAll(collection).items));
   const [modal, setModal] = useState(null);
@@ -1165,6 +1190,7 @@ function CRUDPage({ title, singular, subtitle, collection, columns, formFields, 
         subtitle={subtitle}
         action={<button type="button" onClick={openCreate} style={btnSecondary}>+ New {noun}</button>}
       />
+      {extra}
       {items.length === 0
         ? <EmptyState
             icon={emptyIcon || "📂"}
@@ -1189,11 +1215,15 @@ function CRUDPage({ title, singular, subtitle, collection, columns, formFields, 
       )}
 
       {viewing && detail && (
-        <Modal title={noun + " Details"} width={640} onClose={() => setViewing(null)}>
+        // A detail view can write to this collection on its own (e.g. Inventory's
+        // movement log) without going through save()/reload() above, so closing
+        // the modal always reloads the table from the live store — otherwise the
+        // list behind it can show stale numbers until some other action refreshes it.
+        <Modal title={noun + " Details"} width={640} onClose={() => { setViewing(null); reload(); }}>
           {detail(viewing)}
           <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
-            <button type="button" onClick={() => { setViewing(null); openEdit(viewing); }} style={{ ...btnOutline, flex: 1 }}>Edit</button>
-            <button type="button" onClick={() => setViewing(null)} style={{ ...btnSecondary, flex: 1 }}>Close</button>
+            <button type="button" onClick={() => { const fresh = db.getById(collection, viewing._id) || viewing; setViewing(null); reload(); openEdit(fresh); }} style={{ ...btnOutline, flex: 1 }}>Edit</button>
+            <button type="button" onClick={() => { setViewing(null); reload(); }} style={{ ...btnSecondary, flex: 1 }}>Close</button>
           </div>
         </Modal>
       )}
@@ -1979,13 +2009,110 @@ function EquipmentPage() {
   />;
 }
 
+// Inventory detail: what's on hand, where it sits, and the full receive/use
+// history behind that number — plus a quick way to log the next movement
+// without opening Edit and hand-typing a new total.
+function InventoryDetailView({ item }) {
+  const [tick, setTick] = useState(0);
+  const live = db.getById("inventory", item._id) || item;
+  const logs = getCol("inventorylogs")
+    .filter(l => (live._id && l.inventoryId === live._id) || (!l.inventoryId && l.materialName === live.materialName))
+    .sort((a, b) => (b.entryDate || "").localeCompare(a.entryDate || "") || (b._createdDate || "").localeCompare(a._createdDate || ""));
+  const low = isLowStock(live);
+
+  const [moveType, setMoveType] = useState("Received");
+  const [moveQty, setMoveQty] = useState("");
+  const [moveNote, setMoveNote] = useState("");
+  const logMove = () => {
+    if (!(num(moveQty) > 0)) return;
+    logInventoryMovement({ inventoryId: live._id, materialName: live.materialName, type: moveType, quantity: moveQty, note: moveNote });
+    setMoveQty(""); setMoveNote(""); setTick(t => t + 1);
+  };
+
+  const field = (label, value) => (value || value === 0) ? (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</div>
+      <div style={{ fontSize: 14 }}>{value}</div>
+    </div>
+  ) : null;
+
+  return (
+    <div>
+      <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 4 }}>{live.materialName}</div>
+      <div style={{ marginBottom: 14, display: "flex", gap: 8, alignItems: "center" }}>
+        <span style={{ fontSize: 14 }}>{num(live.currentStock)} {live.unitOfMeasure || "units"} on hand</span>
+        {low && <Badge color="#FEF2F2" textColor="#DC2626">Low stock — reorder point {num(live.reorderPoint)}</Badge>}
+      </div>
+      <div className="grid-2" style={{ gap: 8 }}>
+        {field("Unit Price", live.unitPrice ? money(live.unitPrice) : null)}
+        {field("Stock Value", fmt(num(live.currentStock) * num(live.unitPrice)))}
+        {field("Warehouse", live.warehouse)}
+        {field("Bin / Shelf Location", live.binLocation)}
+        {field("Supplier", live.supplier)}
+        {field("Reorder Point", live.reorderPoint !== undefined && live.reorderPoint !== "" ? num(live.reorderPoint) + " " + (live.unitOfMeasure || "units") : null)}
+      </div>
+
+      <div style={{ marginTop: 12, paddingTop: 16, borderTop: "1px solid " + C.border }}>
+        <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Log a Movement</h3>
+        <div className="grid-2" style={{ gap: 12 }}>
+          <Field label="Type"><Select value={moveType} onChange={setMoveType} options={["Received", "Used"]} /></Field>
+          <Field label="Quantity"><TextInput type="number" value={moveQty} onChange={setMoveQty} placeholder="0" /></Field>
+        </div>
+        <Field label="Note (optional)"><TextInput value={moveNote} onChange={setMoveNote} placeholder="PO #, job, reason…" /></Field>
+        <button type="button" onClick={logMove} disabled={!(num(moveQty) > 0)} style={{ ...btnSecondary, opacity: num(moveQty) > 0 ? 1 : 0.5 }}>
+          Log {moveType}
+        </button>
+      </div>
+
+      <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
+        <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Movement History ({logs.length})</h3>
+        {logs.length === 0
+          ? <p style={{ color: C.textMuted, fontSize: 13 }}>No movements logged yet — receiving and usage will show up here once logged.</p>
+          : (
+            <DataTable
+              columns={[
+                { key: "entryDate", label: "Date" },
+                { key: "type", label: "Type", render: v => <Badge color={v === "Used" ? "#FFF7ED" : "#F0FDF4"} textColor={v === "Used" ? "#EA580C" : "#16A34A"}>{v}</Badge> },
+                { key: "quantity", label: "Qty", render: v => num(v).toLocaleString() },
+                { key: "note", label: "Note", render: v => v || "—" },
+              ]}
+              rows={logs}
+              emptyMessage="No movements."
+            />
+          )}
+      </div>
+    </div>
+  );
+}
+
 function InventoryPage() {
   const warehouseNames = useMemo(() => db.getAll("warehouses").items.map(w => w.warehouseName).filter(Boolean), []);
+  const allItems = getCol("inventory");
+  const lowStockItems = allItems.filter(isLowStock);
+  const totalValue = allItems.reduce((s, i) => s + num(i.currentStock) * num(i.unitPrice), 0);
+
+  const extra = (
+    <div className="grid-3" style={{ marginBottom: 20 }}>
+      <StatCard label="Materials Tracked" value={allItems.length} />
+      <StatCard label="Low Stock" value={lowStockItems.length} />
+      <StatCard label="Total Stock Value" value={fmt(totalValue)} />
+    </div>
+  );
+
   return <CRUDPage
-    title="Inventory" singular="Material" subtitle="Track stock levels and materials" collection="inventory" emptyIcon="📦"
+    title="Inventory" singular="Material" subtitle="Track stock levels, locations, and movements" collection="inventory" emptyIcon="📦"
+    extra={extra}
     columns={[
       { key: "materialName", label: "Material" },
-      { key: "currentStock", label: "Stock", render: (v, row) => num(v) + " " + (row.unitOfMeasure || "units") },
+      {
+        key: "currentStock", label: "Stock", render: (v, row) => (
+          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            {num(v).toLocaleString() + " " + (row.unitOfMeasure || "units")}
+            {isLowStock(row) && <Badge color="#FEF2F2" textColor="#DC2626">Low</Badge>}
+          </span>
+        )
+      },
+      { key: "binLocation", label: "Location", render: v => v || "—" },
       { key: "unitPrice", label: "Unit Price", render: money },
       { key: "currentStock2", label: "Stock Value", render: (_v, row) => fmt(num(row.currentStock) * num(row.unitPrice)) },
       { key: "warehouse", label: "Warehouse" },
@@ -1995,11 +2122,14 @@ function InventoryPage() {
       { key: "materialName", label: "Material Name", required: true, placeholder: "Gravel, Sand, Lumber…" },
       { key: "currentStock", label: "Current Stock", type: "number", placeholder: "100" },
       { key: "unitOfMeasure", label: "Unit of Measure", placeholder: "tons, yards, units…" },
+      { key: "reorderPoint", label: "Reorder Point (optional)", type: "number", placeholder: "Flag as low stock at or below this" },
       { key: "unitPrice", label: "Unit Price ($)", type: "number", placeholder: "25.00" },
       { key: "warehouse", label: "Warehouse", type: "datalist", options: warehouseNames, placeholder: "Which warehouse?" },
+      { key: "binLocation", label: "Bin / Shelf Location (optional)", placeholder: "Bay 3, Shelf B…" },
       { key: "supplier", label: "Supplier", placeholder: "Supplier name" },
       { key: "description", label: "Description", type: "textarea", placeholder: "Material details…" },
     ]}
+    detail={item => <InventoryDetailView item={item} />}
   />;
 }
 
@@ -2105,12 +2235,23 @@ function WarehousesPage() {
             ? <p style={{ color: C.textMuted, fontSize: 13 }}>No inventory assigned to this warehouse yet — set it on the Inventory page.</p>
             : (
               <>
-                <StatCard label="Total Stock Value" value={fmt(stockValue)} />
+                <div className="grid-2" style={{ gap: 8 }}>
+                  <StatCard label="Total Stock Value" value={fmt(stockValue)} />
+                  <StatCard label="Low Stock Items" value={stockHere.filter(isLowStock).length} />
+                </div>
                 <div style={{ marginTop: 10 }}>
                   <DataTable
                     columns={[
                       { key: "materialName", label: "Material" },
-                      { key: "currentStock", label: "Quantity", render: (v, row) => num(v) + " " + (row.unitOfMeasure || "units") },
+                      {
+                        key: "currentStock", label: "Quantity", render: (v, row) => (
+                          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            {num(v).toLocaleString() + " " + (row.unitOfMeasure || "units")}
+                            {isLowStock(row) && <Badge color="#FEF2F2" textColor="#DC2626">Low</Badge>}
+                          </span>
+                        )
+                      },
+                      { key: "binLocation", label: "Location", render: v => v || "—" },
                       { key: "unitPrice", label: "Unit Price", render: money },
                     ]}
                     rows={stockHere}
@@ -2892,6 +3033,62 @@ const newTimeRow = () => ({
   startTime: "08:00", endTime: "17:00", equipment: "", notes: "", mileage: "",
 });
 
+// Edit an existing "timeentries" record — used from both the Time Tracking
+// page's Recent Entries table and the Work Logs (EmployeeLogsPage) all-entries
+// table. Recomputes hoursWorked from start/end on save, same as entry creation.
+function TimeEntryEditForm({ entry, employeeOptions, onSave, onCancel }) {
+  const [form, setForm] = useState({ ...entry });
+  const jobs = useMemo(() => db.getAll("jobs").items, []);
+  const equipment = useMemo(() => db.getAll("equipment").items, []);
+  const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
+  const hrs = hoursBetween(form.startTime, form.endTime);
+
+  const submit = () => onSave({ ...form, hoursWorked: hrs });
+
+  return (
+    <div>
+      <div className="row-wrap" style={{ gap: 12 }}>
+        <Field label="Employee"><Select value={form.employeeName} onChange={v => set("employeeName", v)} options={employeeOptions} style={{ width: 200 }} /></Field>
+        <Field label="Date"><input type="date" value={form.entryDate || ""} onChange={e => set("entryDate", e.target.value)} style={inputCls} /></Field>
+      </div>
+      <Field label="Job / Location">
+        {jobs.length > 0
+          ? (
+            <select value={form.jobName || ""} onChange={e => set("jobName", e.target.value)} style={inputCls}>
+              <option value="">No specific job</option>
+              {jobsByClient(jobs).map(j => <option key={j._id} value={j.jobTitle}>{jobLabel(j)}</option>)}
+            </select>
+          )
+          : <TextInput value={form.jobName} onChange={v => set("jobName", v)} placeholder="Site A" />}
+      </Field>
+      <Field label="Work Done"><TextInput value={form.workDescription} onChange={v => set("workDescription", v)} placeholder="Excavation…" rows={2} /></Field>
+      <div className="row-wrap" style={{ gap: 12 }}>
+        <Field label="Start Time"><input type="time" value={form.startTime || ""} onChange={e => set("startTime", e.target.value)} style={{ ...inputCls, width: 130 }} /></Field>
+        <Field label="End Time"><input type="time" value={form.endTime || ""} onChange={e => set("endTime", e.target.value)} style={{ ...inputCls, width: 130 }} /></Field>
+        <Field label="Hours"><div style={{ ...inputCls, width: 90, textAlign: "center", fontWeight: 700, color: C.accent }}>{hrs.toFixed(1)}h</div></Field>
+      </div>
+      <div className="row-wrap" style={{ gap: 12 }}>
+        <Field label="Equipment" style={{ flex: 1 }}>
+          {equipment.length > 0
+            ? (
+              <select value={form.equipmentUsed || ""} onChange={e => set("equipmentUsed", e.target.value)} style={inputCls}>
+                <option value="">None</option>
+                {equipment.map(eq => <option key={eq._id} value={eq.equipmentName}>{eq.equipmentName}</option>)}
+              </select>
+            )
+            : <TextInput value={form.equipmentUsed} onChange={v => set("equipmentUsed", v)} placeholder="None" />}
+        </Field>
+        <Field label="Miles Driven"><input type="number" min="0" value={form.mileageDriven || ""} onChange={e => set("mileageDriven", e.target.value)} placeholder="0" style={{ ...inputCls, width: 110 }} /></Field>
+      </div>
+      <Field label="Notes"><TextInput value={form.notes} onChange={v => set("notes", v)} placeholder="Additional notes…" rows={2} /></Field>
+      <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
+        <button type="button" onClick={onCancel} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+        <button type="button" onClick={submit} style={{ ...btnSecondary, flex: 1 }}>Save</button>
+      </div>
+    </div>
+  );
+}
+
 function useEmployeeOptions() {
   const { user } = useAuth();
   const employees = useMemo(() => db.getAll("employees").items, []);
@@ -2910,12 +3107,14 @@ function TimeEntryPage() {
   const [entries, setEntries] = useState(() => db.getAll("timeentries", {}, { limit: 20 }).items);
   const jobs = useMemo(() => db.getAll("jobs").items, []);
   const equipment = useMemo(() => db.getAll("equipment").items, []);
+  const [editing, setEditing] = useState(null);
 
   const updRow = (id, k, v) => setRows(r => r.map(x => (x.id === id ? { ...x, [k]: v } : x)));
   const delRow = id => setRows(r => r.filter(x => x.id !== id));
   const totalHours = rows.reduce((t, r) => t + hoursBetween(r.startTime, r.endTime), 0);
 
   const refresh = () => setEntries(db.getAll("timeentries", {}, { limit: 20 }).items);
+  const saveEdit = record => { db.update("timeentries", record); setEditing(null); refresh(); };
 
   const submit = () => {
     const valid = rows.filter(r => r.jobLocation || r.workDone);
@@ -3029,9 +3228,16 @@ function TimeEntryPage() {
           ]}
           rows={entries}
           emptyMessage="No entries yet."
+          onEdit={e => setEditing({ ...e })}
           onDelete={e => { if (window.confirm("Delete this entry?")) { db.remove("timeentries", e._id); refresh(); } }}
         />
       </div>
+
+      {editing && (
+        <Modal title="Edit Time Entry" onClose={() => setEditing(null)}>
+          <TimeEntryEditForm entry={editing} employeeOptions={employeeOptions} onSave={saveEdit} onCancel={() => setEditing(null)} />
+        </Modal>
+      )}
     </div>
   );
 }
@@ -3264,9 +3470,14 @@ function TruckLogBooksPage() {
 }
 
 function EmployeeLogsPage() {
-  const [entries] = useState(() => db.getAll("timeentries", {}, { limit: 1000 }).items);
+  const employeeOptions = useEmployeeOptions();
+  const [entries, setEntries] = useState(() => db.getAll("timeentries", {}, { limit: 1000 }).items);
   const employees = useMemo(() => db.getAll("employees").items, []);
   const [selected, setSelected] = useState("");
+  const [editing, setEditing] = useState(null);
+
+  const refresh = () => setEntries(db.getAll("timeentries", {}, { limit: 1000 }).items);
+  const saveEdit = record => { db.update("timeentries", record); setEditing(null); refresh(); };
 
   const filtered = entries.filter(e => !selected || e.employeeName === selected);
   const rateFor = name => {
@@ -3328,8 +3539,15 @@ function EmployeeLogsPage() {
           ]}
           rows={filtered}
           emptyMessage="No time entries yet."
+          onEdit={e => setEditing({ ...e })}
         />
       </div>
+
+      {editing && (
+        <Modal title="Edit Time Entry" onClose={() => setEditing(null)}>
+          <TimeEntryEditForm entry={editing} employeeOptions={employeeOptions} onSave={saveEdit} onCancel={() => setEditing(null)} />
+        </Modal>
+      )}
     </div>
   );
 }
@@ -4148,8 +4366,8 @@ async function seedDemoData(company) {
       { equipmentName: "Kenworth T880", equipmentType: "Truck", manufacturer: "Kenworth", yearOfManufacture: "2019", billingRatePerHour: "120", totalHours: "88400" },
     ],
     inventory: [
-      { materialName: "3/4\" Crushed Gravel", currentStock: "480", unitOfMeasure: "tons", unitPrice: "22.50", supplier: "Humboldt Aggregates", warehouse: "Main Yard" },
-      { materialName: "Rebar #4", currentStock: "1200", unitOfMeasure: "lengths", unitPrice: "8.75", supplier: "SteelCo", warehouse: "Main Yard" },
+      { materialName: "3/4\" Crushed Gravel", currentStock: "480", unitOfMeasure: "tons", unitPrice: "22.50", supplier: "Humboldt Aggregates", warehouse: "Main Yard", binLocation: "Yard Pile 2", reorderPoint: "100" },
+      { materialName: "Rebar #4", currentStock: "45", unitOfMeasure: "lengths", unitPrice: "8.75", supplier: "SteelCo", warehouse: "Main Yard", binLocation: "Bay 3, Rack B", reorderPoint: "50" },
     ],
     timeentries: [
       { employeeName: "Cole Bennett", jobName: "Highway 5 Culvert Replacement", entryDate: today(), hoursWorked: 8.5, startTime: "07:00", endTime: "15:30", workDescription: "Culvert excavation and backfill", equipmentUsed: "CAT 320 Excavator", mileageDriven: 42 },
@@ -5484,6 +5702,42 @@ const emptyLoadRow = () => ({ id: genId(), truck: "", yards: "", ticketNumber: "
 const emptyEquipRow = () => ({ id: genId(), equipment: "", hours: "" });
 // How far (m) a dropped pin can be from a saved local site and still count as a match.
 const SITE_RADIUS_M = 800;
+// Edit (or delete) an already-logged "timeentries" record from the "Logged
+// today" list — mirrors TimeEntryEditForm's fields but as a mobile sheet.
+// Fields not shown here (maintUnit, siteId, source, etc.) are preserved
+// since `form` starts as a full copy of the entry.
+function MobileEditLogSheet({ entry, jobs, onSave, onDelete, onClose }) {
+  const [form, setForm] = useState({ ...entry });
+  const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
+  const hrs = hoursBetween(form.startTime, form.endTime);
+  const save = () => onSave({ ...form, hoursWorked: hrs });
+  return (
+    <MobileSheet title="Edit Entry" onClose={onClose}>
+      <div style={{ padding: 16 }}>
+        <label style={mLbl}>Job</label>
+        <select value={form.jobName || ""} onChange={e => set("jobName", e.target.value)} style={mInput}>
+          <option value="">No specific job</option>
+          {jobsByClient(jobs).map(j => <option key={j._id} value={j.jobTitle}>{jobLabel(j)}</option>)}
+        </select>
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1 }}><label style={mLbl}>Start</label><input type="time" value={form.startTime || ""} onChange={e => set("startTime", e.target.value)} style={mInput} /></div>
+          <div style={{ flex: 1 }}><label style={mLbl}>End</label><input type="time" value={form.endTime || ""} onChange={e => set("endTime", e.target.value)} style={mInput} /></div>
+        </div>
+        <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{hrs.toFixed(2)} h</div>
+        <label style={mLbl}>Work Done</label>
+        <input value={form.workDescription || ""} onChange={e => set("workDescription", e.target.value)} placeholder="Excavation…" style={mInput} />
+        <label style={mLbl}>Notes</label>
+        <input value={form.notes || ""} onChange={e => set("notes", e.target.value)} placeholder="Additional notes…" style={mInput} />
+        <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+          <button type="button" onClick={onClose} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+          <button type="button" onClick={save} style={{ ...mBtn, flex: 1, background: C.secondary, color: "#fff", padding: "12px" }}>Save</button>
+        </div>
+        <button type="button" onClick={() => onDelete(form)} style={{ ...btnDanger, width: "100%", marginTop: 10, padding: "10px" }}>Delete entry</button>
+      </div>
+    </MobileSheet>
+  );
+}
+
 function MobileDailyLog() {
   const { user } = useAuth();
   useDataVersion();
@@ -5498,6 +5752,7 @@ function MobileDailyLog() {
   const [busy, setBusy] = useState(false);
   const [siteSearching, setSiteSearching] = useState(false);
   const [siteResults, setSiteResults] = useState(null);
+  const [editingEntry, setEditingEntry] = useState(null);
   const fileRef = useRef(null);
   // Persist the draft on every change so a tab switch (or reload) keeps it.
   useEffect(() => { storage.set(DL_DRAFT_KEY, JSON.stringify(draft)); }, [draft]);
@@ -5579,6 +5834,12 @@ function MobileDailyLog() {
     setTimeout(() => setMsg(""), 2500);
   };
   const clearDraft = () => { setDraft({ ...emptyDraft }); storage.remove(DL_DRAFT_KEY); setMsg(""); setSiteResults(null); };
+
+  const saveEditedEntry = record => { db.update("timeentries", record); notifyData(); setEditingEntry(null); };
+  const deleteEditedEntry = record => {
+    if (!window.confirm("Delete this entry?")) return;
+    db.remove("timeentries", record._id); notifyData(); setEditingEntry(null);
+  };
 
   const onFiles = async (fileList) => {
     const files = Array.from(fileList || []);
@@ -5736,9 +5997,14 @@ function MobileDailyLog() {
               {e.isMaintenance && <div style={{ fontSize: 12, color: "#D97706", marginTop: 3, fontWeight: 600 }}>🔧 {e.maintUnit}{e.maintMileage ? " · " + e.maintMileage + " km" : ""}{e.maintHours ? " · " + e.maintHours + " hrs" : ""}</div>}
               {e.siteId && <div style={{ fontSize: 12, color: C.secondary, marginTop: 3, fontWeight: 600 }}>🧭 {e.siteName}{e.siteClient ? " — " + e.siteClient : ""}</div>}
               {e.notes && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>{e.notes}</div>}
+              <button type="button" onClick={() => setEditingEntry(e)} style={{ background: "none", border: "none", color: C.accent, fontSize: 12, fontWeight: 700, cursor: "pointer", padding: 0, marginTop: 8 }}>Edit</button>
             </div>
           ))}
         </div>
+      )}
+
+      {editingEntry && (
+        <MobileEditLogSheet entry={editingEntry} jobs={jobs} onSave={saveEditedEntry} onDelete={deleteEditedEntry} onClose={() => setEditingEntry(null)} />
       )}
 
       {myLoads.length > 0 && (
