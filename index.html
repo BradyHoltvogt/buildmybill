@@ -974,6 +974,44 @@ function Modal({ title, onClose, children, width = 560 }) {
   );
 }
 
+// In-app replacement for window.confirm() — the browser's native confirm box
+// can't be styled and looks jarring next to the rest of the UI. Same shape as
+// the old call (await it, get a boolean back), but renders as a normal Modal.
+// Mounted once as <ConfirmHost/> near the app root; confirmDialog() from
+// anywhere queues a request and resolves once the user picks Cancel or confirm.
+let confirmState = null; // { message, confirmLabel, tone, resolve }
+const confirmListeners = new Set();
+function notifyConfirm() { confirmListeners.forEach(fn => { try { fn(); } catch {} }); }
+function confirmDialog(message, opts = {}) {
+  return new Promise(resolve => {
+    confirmState = { message, confirmLabel: opts.confirmLabel || "Delete", tone: opts.tone || "danger", resolve };
+    notifyConfirm();
+  });
+}
+function useConfirmState() {
+  const [, setV] = useState(0);
+  useEffect(() => {
+    const fn = () => setV(x => x + 1);
+    confirmListeners.add(fn);
+    return () => confirmListeners.delete(fn);
+  }, []);
+  return confirmState;
+}
+function ConfirmHost() {
+  const state = useConfirmState();
+  if (!state) return null;
+  const finish = ok => { const resolve = state.resolve; confirmState = null; notifyConfirm(); resolve(ok); };
+  return (
+    <Modal title="Are you sure?" width={420} onClose={() => finish(false)}>
+      <p style={{ fontSize: 14, marginBottom: 20, lineHeight: 1.5 }}>{state.message}</p>
+      <div style={{ display: "flex", gap: 10 }}>
+        <button type="button" onClick={() => finish(false)} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+        <button type="button" onClick={() => finish(true)} style={{ ...(state.tone === "danger" ? btnDanger : btnSecondary), flex: 1, padding: "10px" }}>{state.confirmLabel}</button>
+      </div>
+    </Modal>
+  );
+}
+
 function PageHeader({ title, subtitle, action }) {
   return (
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 24, flexWrap: "wrap", gap: 12 }}>
@@ -1210,8 +1248,8 @@ function CRUDPage({ title, singular, subtitle, collection, columns, formFields, 
     reload();
   };
 
-  const del = (item) => {
-    if (window.confirm("Delete this " + noun.toLowerCase() + "?")) {
+  const del = async (item) => {
+    if (await confirmDialog("Delete this " + noun.toLowerCase() + "? This can't be undone.")) {
       db.remove(collection, item._id);
       reload();
     }
@@ -1641,7 +1679,7 @@ function JobMediaGallery({ job }) {
   };
 
   const toggleCustomer = (m) => { db.update("job_media", { ...m, customerVisible: !m.customerVisible }); bump(); };
-  const del = (m) => { if (window.confirm("Remove this " + m.type + "? This can't be undone.")) { bmbMedia.remove(m); bump(); } };
+  const del = async (m) => { if (await confirmDialog("Remove this " + m.type + "? This can't be undone.")) { bmbMedia.remove(m); bump(); } };
 
   const canDelete = (m) => canAuthorize || m.uploadedBy === user?.id;
   const shown = customerCount(media);
@@ -1740,7 +1778,7 @@ function DocsList({ ownerId, collection = "job_docs", idField = "jobId", folder,
     if (fileRef.current) fileRef.current.value = "";
   };
   const open = async (d) => { const url = await bmbDocs.signedUrl(d.path); if (url) window.open(url, "_blank", "noopener"); else window.alert("Couldn't open that file."); };
-  const del = (d) => { if (window.confirm("Remove “" + (d.name || "this file") + "”?")) { bmbDocs.remove(d, collection); bump(); } };
+  const del = async (d) => { if (await confirmDialog("Remove “" + (d.name || "this file") + "”?")) { bmbDocs.remove(d, collection); bump(); } };
 
   return (
     <div style={{ marginTop: 4 }}>
@@ -2529,11 +2567,11 @@ function DocumentTemplates({ doc, update }) {
 
   const canSave = hasRichContent(doc.documentHtml);
 
-  const insert = (id) => {
+  const insert = async (id) => {
     const t = db.getById("doctemplates", id);
     if (!t) return;
     if (hasRichContent(doc.documentHtml) &&
-        !window.confirm('Replace the current document with the template "' + t.name + '"?')) return;
+        !(await confirmDialog('Replace the current document with the template "' + t.name + '"?', { confirmLabel: "Replace", tone: "primary" }))) return;
     update({ documentTitle: t.title || doc.documentTitle, documentHtml: t.html || "" });
   };
 
@@ -2545,8 +2583,8 @@ function DocumentTemplates({ doc, update }) {
     reload();
   };
 
-  const del = (t) => {
-    if (window.confirm('Delete template "' + t.name + '"?')) { db.remove("doctemplates", t._id); reload(); }
+  const del = async (t) => {
+    if (await confirmDialog('Delete template "' + t.name + '"?')) { db.remove("doctemplates", t._id); reload(); }
   };
 
   return (
@@ -3038,7 +3076,7 @@ function QuotesPage({ startNew }) {
 
   const reload = () => setQuotes(db.getAll("quotes").items);
   const close = () => { setEditing(null); reload(); if (startNew) navigate("quotes"); };
-  const del = q => { if (window.confirm("Delete " + (q.quoteId || "this quote") + "?")) { db.remove("quotes", q._id); reload(); } };
+  const del = async q => { if (await confirmDialog("Delete " + (q.quoteId || "this quote") + "? This can't be undone.")) { db.remove("quotes", q._id); reload(); } };
 
   if (editing !== null) return <QuoteEditor docId={editing === "new" ? null : editing} onClose={close} />;
 
@@ -3286,7 +3324,7 @@ function TimeEntryPage() {
           rows={entries}
           emptyMessage="No entries yet."
           onEdit={e => setEditing({ ...e })}
-          onDelete={e => { if (window.confirm("Delete this entry?")) { db.remove("timeentries", e._id); refresh(); } }}
+          onDelete={async e => { if (await confirmDialog("Delete this entry?")) { db.remove("timeentries", e._id); refresh(); } }}
         />
       </div>
 
@@ -3486,7 +3524,7 @@ function TruckLogBooksPage() {
     reload();
   };
 
-  const del = item => { if (window.confirm("Delete this log?")) { db.remove("trucklogbooks", item._id); reload(); } };
+  const del = async item => { if (await confirmDialog("Delete this log?")) { db.remove("trucklogbooks", item._id); reload(); } };
   const openCreate = () => setModal({ mode: "create", data: blank() });
 
   return (
@@ -4260,7 +4298,7 @@ function TeamPage() {
 
   const doApprove = async (m) => { setBusyId(m.id); await approveMember(m.id); await load(); setBusyId(null); };
   const doRemove = async (m, verb) => {
-    if (!window.confirm(verb + " " + (m.full_name || m.email) + "?")) return;
+    if (!(await confirmDialog(verb + " " + (m.full_name || m.email) + "?"))) return;
     setBusyId(m.id); await removeMember(m.id); await load(); setBusyId(null);
   };
   const doRole = async (m, role) => { setBusyId(m.id); await setMemberRole(m.id, role); await load(); setBusyId(null); };
@@ -4270,7 +4308,7 @@ function TeamPage() {
   const copyCode = () => {
     if (navigator.clipboard) navigator.clipboard.writeText(company?.joinCode || "").then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
   };
-  const regen = async () => { if (window.confirm("Generate a new join code? The current one stops working immediately.")) await regenerateJoinCode(); };
+  const regen = async () => { if (await confirmDialog("Generate a new join code? The current one stops working immediately.", { confirmLabel: "Generate", tone: "primary" })) await regenerateJoinCode(); };
 
   return (
     <div>
@@ -4483,7 +4521,7 @@ function SettingsPage() {
       } catch { window.alert("That file doesn't look like a BuildMyBill backup."); return; }
       const cols = parsed.collections || parsed;
       if (!cols || typeof cols !== "object") { window.alert("That file doesn't look like a BuildMyBill backup."); return; }
-      if (!window.confirm("This REPLACES all of your company's current data with the backup. Continue?")) return;
+      if (!(await confirmDialog("This REPLACES all of your company's current data with the backup. Continue?", { confirmLabel: "Replace" }))) return;
       setBusy("Importing…");
       try {
         await db.deleteAllForCompany();
@@ -4502,15 +4540,15 @@ function SettingsPage() {
   };
 
   const loadDemo = async () => {
-    if (!window.confirm("Add sample clients, jobs, employees, equipment, and an invoice to your account?")) return;
+    if (!(await confirmDialog("Add sample clients, jobs, employees, equipment, and an invoice to your account?", { confirmLabel: "Add sample data", tone: "primary" }))) return;
     setBusy("Adding sample data…");
     try { await seedDemoData(company); window.location.reload(); }
     catch (err) { setBusy(""); window.alert("Couldn't add sample data: " + (err.message || err)); }
   };
 
   const clearAll = async () => {
-    if (!window.confirm("Delete ALL of your company's records? Export a backup first — this cannot be undone.")) return;
-    if (!window.confirm("Really delete everything?")) return;
+    if (!(await confirmDialog("Delete ALL of your company's records? Export a backup first — this cannot be undone."))) return;
+    if (!(await confirmDialog("Really delete everything? There is no undo.", { confirmLabel: "Yes, delete everything" }))) return;
     setBusy("Deleting…");
     try { await db.deleteAllForCompany(); window.location.reload(); }
     catch (err) { setBusy(""); window.alert("Delete failed: " + (err.message || err)); }
@@ -5893,8 +5931,8 @@ function MobileDailyLog() {
   const clearDraft = () => { setDraft({ ...emptyDraft }); storage.remove(DL_DRAFT_KEY); setMsg(""); setSiteResults(null); };
 
   const saveEditedEntry = record => { db.update("timeentries", record); notifyData(); setEditingEntry(null); };
-  const deleteEditedEntry = record => {
-    if (!window.confirm("Delete this entry?")) return;
+  const deleteEditedEntry = async record => {
+    if (!(await confirmDialog("Delete this entry?"))) return;
     db.remove("timeentries", record._id); notifyData(); setEditingEntry(null);
   };
 
@@ -6337,6 +6375,7 @@ function App() {
         <AuthProvider>
           <CompanyProvider>
             <AppShell />
+            <ConfirmHost />
           </CompanyProvider>
         </AuthProvider>
       </Router>
