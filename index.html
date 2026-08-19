@@ -1068,6 +1068,39 @@ function Toast({ message }) {
   );
 }
 
+// A location field with the fast path front and center: tap "Use my location"
+// while standing at the spot (a new warehouse, a job site) and it's done — no
+// modal, no typing. "Look up" still opens the full address/land/GPS picker for
+// anywhere you're not standing right now.
+function MapsField({ field: f, value, onChange, onLookup }) {
+  const [locating, setLocating] = useState(false);
+  const [err, setErr] = useState("");
+  const val = value || "";
+  const has = val.trim().length > 0;
+
+  const useMyLocation = async () => {
+    setErr(""); setLocating(true);
+    const coords = await getGeoCoords();
+    setLocating(false);
+    if (!coords) { setErr("Couldn't get your location — allow location access and try again."); return; }
+    onChange(latLngStr(coords.lat, coords.lng));
+  };
+
+  return (
+    <Field label={f.label} required={f.required}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <input value={val} onChange={e => onChange(e.target.value)} placeholder={f.placeholder || "Address, lat/long, or look it up →"} style={{ ...inputCls, flex: "1 1 180px" }} />
+        <button type="button" onClick={useMyLocation} disabled={locating} style={{ ...btnSecondary, whiteSpace: "nowrap", opacity: locating ? 0.6 : 1 }}>{locating ? "📍 Locating…" : "📍 Use my location"}</button>
+        <button type="button" onClick={onLookup} style={{ ...btnOutline, whiteSpace: "nowrap" }}>🔍 Look up</button>
+        <a href={has ? mapsUrl(val) : undefined} target="_blank" rel="noopener noreferrer"
+           style={{ ...btnOutline, textDecoration: "none", whiteSpace: "nowrap", pointerEvents: has ? "auto" : "none", opacity: has ? 1 : 0.45 }}>🗺️ Open</a>
+      </div>
+      {err && <div style={{ color: "#DC2626", fontSize: 12, marginTop: 6 }}>{err}</div>}
+      <div style={{ fontSize: 11, color: C.textMuted, marginTop: 5 }}>Standing there now? Tap “Use my location.” Otherwise look up an address, town, or land location (SW-14-32-20-W2).</div>
+    </Field>
+  );
+}
+
 /* ─── Generic CRUD page ──────────────────────────────────────────────────── */
 function CRUDForm({ fields, data, onSave, onCancel }) {
   const [form, setForm] = useState({ ...data });
@@ -1118,19 +1151,7 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
           );
         }
         if (f.type === "maps") {
-          const val = form[f.key] || "";
-          const has = val.trim().length > 0;
-          return (
-            <Field key={f.key} label={f.label} required={f.required}>
-              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                <input value={val} onChange={e => set(f.key, e.target.value)} placeholder={f.placeholder || "Address, lat/long, or look it up →"} style={{ ...inputCls, flex: "1 1 180px" }} />
-                <button type="button" onClick={() => setLookupKey(f.key)} style={{ ...btnSecondary, whiteSpace: "nowrap" }}>🔍 Look up</button>
-                <a href={has ? mapsUrl(val) : undefined} target="_blank" rel="noopener noreferrer"
-                   style={{ ...btnOutline, textDecoration: "none", whiteSpace: "nowrap", pointerEvents: has ? "auto" : "none", opacity: has ? 1 : 0.45 }}>🗺️ Open</a>
-              </div>
-              <div style={{ fontSize: 11, color: C.textMuted, marginTop: 5 }}>Search an address/town, convert a land location (SW-14-32-20-W2), or drop your GPS — no need to leave the app.</div>
-            </Field>
-          );
+          return <MapsField key={f.key} field={f} value={form[f.key]} onChange={v => set(f.key, v)} onLookup={() => setLookupKey(f.key)} />;
         }
         return (
           <Field key={f.key} label={f.label} required={f.required}>
