@@ -178,6 +178,25 @@ subquery against `public.records` — Postgres throws `42P17 infinite recursion`
     equipment, since those match by name too.
   - `zones` is just another collection in the generic `records` table — **no SQL
     migration was needed** for any of this.
+- **Quick Command** (⚡ in the desktop top bar / field-app header, Ctrl+K, and the
+  More tab) turns a typed or spoken sentence into one of the app's existing
+  actions. It is **not** a model and calls no service — it's an ordered catalog
+  (`QC_ACTIONS`) where each entry owns its phrasings, a `parse` that pulls values
+  out of the sentence, and a `run` that calls the **same db helpers the forms
+  call**. Keep that last part true: a command must never write a record shape the
+  manual form couldn't produce. Matching is longest-match with a `weight`
+  tiebreaker (that's why "set the mileage" beats "hours" — see `qcMatch`), every
+  parse is shown editable before it saves, and actions are hidden by the same
+  `canAccess` permissions as the sidebar. Adding an entry to `QC_ACTIONS` is all
+  it takes — the parser, review card, and examples pick it up automatically.
+- **Photo-to-data** is the same catalog with an optional `fromPhoto` per action.
+  OCR is Tesseract vendored in `vendor/tesseract/` — read
+  `vendor/tesseract/README.md` before touching it; it explains why the language
+  model is uncompressed, why `corePath` is a directory, and why those files are
+  deliberately **not** in `sw.js`'s `SHELL` (they'd add ~6 MB to every install
+  for a feature most sessions never use; the network-first worker caches them on
+  first scan instead). `QC_PHOTO_KINDS` scores what a document is; the answer is
+  always a dropdown on the review card, never a silent decision.
 - **Shifts have no direct edit UI.** Employees can't edit a clocked `shifts` record —
   they request a correction (My Hours → Request a correction), which lands in
   `shiftrequests` (`status: Pending/Approved/Rejected`) and emails the owner/managers.
@@ -195,6 +214,10 @@ market-priced subscriptions page, "Remember me", map locations, job photos/video
 per-photo customer sharing on quotes, the field-app PWA (installable, iPhone-safe),
 efficiency time-tracking, daily-log polish, in-app location lookup, private-by-default
 jobs, mobilization cost, job & quote documents, equipment maintenance totals.
+
+**Quick Command** (branch `worktree-quick-command`) adds a natural-language command
+bar — type or say what you want done and it performs the matching existing action,
+or read it off a photo. Sixteen actions; all on-device, no external service.
 
 Possible next steps discussed but not built: online payments (Stripe) on invoices,
 QuickBooks/accounting sync, native mobile app, quote-document attachment already done.

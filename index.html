@@ -3574,11 +3574,11 @@ function PreviewModal({ doc, onClose }) {
   );
 }
 
-function QuoteEditor({ docId, onClose }) {
+function QuoteEditor({ docId, onClose, startPreview }) {
   const { company } = useCompany();
   const [doc, setDoc] = useState(() => (docId && db.getById("quotes", docId)) || defaultDoc(company));
   const [savedId, setSavedId] = useState(docId || null);
-  const [preview, setPreview] = useState(false);
+  const [preview, setPreview] = useState(!!startPreview);
   const [saved, setSaved] = useState(false);
   const clients = useMemo(() => db.getAll("clients").items, []);
   const jobs = useMemo(() => db.getAll("jobs").items, []);
@@ -3781,15 +3781,16 @@ function QuoteEditor({ docId, onClose }) {
 }
 
 function QuotesPage({ startNew }) {
-  const { navigate } = useRouter();
+  const { navigate, params } = useRouter();
   const [quotes, setQuotes] = useState(() => db.getAll("quotes").items);
-  const [editing, setEditing] = useState(startNew ? "new" : null);
+  // params.openId lets Quick Command drop you straight into one document.
+  const [editing, setEditing] = useState(startNew ? "new" : (params.openId || null));
 
   const reload = () => setQuotes(db.getAll("quotes").items);
   const close = () => { setEditing(null); reload(); if (startNew) navigate("quotes"); };
   const del = async q => { if (await confirmDialog("Delete " + (q.quoteId || "this quote") + "? This can't be undone.")) { db.remove("quotes", q._id); reload(); } };
 
-  if (editing !== null) return <QuoteEditor docId={editing === "new" ? null : editing} onClose={close} />;
+  if (editing !== null) return <QuoteEditor docId={editing === "new" ? null : editing} startPreview={!!params.preview && editing === params.openId} onClose={close} />;
 
   const outstanding = quotes
     .filter(q => q.status === "Invoice" || q.status === "Quote")
@@ -4276,10 +4277,11 @@ function TruckLogBooksPage() {
 }
 
 function EmployeeLogsPage() {
+  const { params } = useRouter();
   const employeeOptions = useEmployeeOptions();
   const [entries, setEntries] = useState(() => db.getAll("timeentries", {}, { limit: 1000 }).items);
   const employees = useMemo(() => db.getAll("employees").items, []);
-  const [selected, setSelected] = useState("");
+  const [selected, setSelected] = useState(params.employee || "");
   const [editing, setEditing] = useState(null);
 
   const refresh = () => setEntries(db.getAll("timeentries", {}, { limit: 1000 }).items);
@@ -5806,6 +5808,1709 @@ function canAccess(navId, user) {
   return !!(user.permissions && user.permissions[navId]);
 }
 
+/* ═══ Quick Command ═════════════════════════════════════════════════════════
+   Type — or say — what you want done ("invoice Acme $2,500 for gravel
+   hauling", "log 6 hours on the Miller driveway", "received 40 tons of sand")
+   and the app performs the same action the manual form would have.
+
+   How it works: a plain pattern matcher that runs entirely on the device. Each
+   entry in QC_ACTIONS owns the phrasings it recognizes, pulls the details out
+   of the sentence, and then calls exactly the same db/write helpers the app's
+   own forms call — so a command can never do something a person couldn't do by
+   hand, and every record lands in the same shape. Nothing is sent anywhere:
+   no external service, no account, no key to manage, and it works offline.
+
+   Everything it pulled out of the sentence is shown filled in and editable
+   before it's saved, because a guess about someone's money or hours should be
+   correctable in one tap rather than undone afterwards.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const QC_HISTORY_KEY = "bmb_qc_history";
+const QC_Speech = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+
+const qcNorm = s => String(s == null ? "" : s)
+  .replace(/[‘’]/g, "'").replace(/[“”]/g, '"')
+  .replace(/\s+/g, " ").trim().toLowerCase();
+
+// Title-case a name we had to invent from free text ("acme corp" → "Acme Corp").
+// A name matched against an existing record keeps its stored spelling instead.
+const qcTitle = s => String(s || "").replace(/(^|[\s\-/&(])([a-z])/g, (_m, a, b) => a + b.toUpperCase());
+
+/* ── Pulling values out of a sentence ─────────────────────────────────────── */
+
+const QC_DOW = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+const QC_MON = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+const QC_WORD_NUM = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12 };
+
+function qcShiftDays(n) { const d = new Date(); d.setDate(d.getDate() + Number(n)); return dateStr(d); }
+
+// Any date a person would actually type or say. Returns "" when there isn't one.
+function qcDate(text) {
+  const t = qcNorm(text);
+  let m = t.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
+  if (m) return dateStr(new Date(+m[1], +m[2] - 1, +m[3]));
+  if (/\b(today|tonight|this morning|this afternoon|this evening|right now|just now)\b/.test(t)) return today();
+  if (/\byesterday\b/.test(t)) return qcShiftDays(-1);
+  if (/\btomorrow\b/.test(t)) return qcShiftDays(1);
+  m = t.match(/\bin (\d{1,3}) days?\b/); if (m) return qcShiftDays(+m[1]);
+  m = t.match(/\bin (\d{1,2}) weeks?\b/); if (m) return qcShiftDays(+m[1] * 7);
+  m = t.match(/\b(\d{1,3}) days? ago\b/); if (m) return qcShiftDays(-m[1]);
+  m = t.match(/\b(\d{1,2}) weeks? ago\b/); if (m) return qcShiftDays(-m[1] * 7);
+
+  const mons = QC_MON.map(x => x.slice(0, 3)).join("|");
+  m = t.match(new RegExp("\\b(" + mons + ")[a-z]*\\.? (\\d{1,2})(?:st|nd|rd|th)?(?:,? (\\d{4}))?\\b"));
+  if (m) return dateStr(new Date(m[3] ? +m[3] : new Date().getFullYear(), QC_MON.findIndex(x => x.startsWith(m[1])), +m[2]));
+  m = t.match(new RegExp("\\b(\\d{1,2})(?:st|nd|rd|th)? (?:of )?(" + mons + ")[a-z]*\\.?(?:,? (\\d{4}))?\\b"));
+  if (m) return dateStr(new Date(m[3] ? +m[3] : new Date().getFullYear(), QC_MON.findIndex(x => x.startsWith(m[2])), +m[1]));
+
+  m = t.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+  if (m) { let y = m[3] ? +m[3] : new Date().getFullYear(); if (y < 100) y += 2000; return dateStr(new Date(y, +m[1] - 1, +m[2])); }
+
+  m = t.match(new RegExp("\\b(next|last|this|coming|on)?\\s?(" + QC_DOW.join("|") + ")\\b"));
+  if (m) {
+    const d = new Date();
+    let diff = QC_DOW.indexOf(m[2]) - d.getDay();
+    if (m[1] === "last") { if (diff >= 0) diff -= 7; }
+    else if (diff <= 0) diff += 7;
+    d.setDate(d.getDate() + diff);
+    return dateStr(d);
+  }
+  return "";
+}
+
+function qcTo24(h, min, ap) {
+  h = +h; min = min ? +min : 0;
+  if (ap === "pm" && h < 12) h += 12;
+  if (ap === "am" && h === 12) h = 0;
+  return String(h).padStart(2, "0") + ":" + String(min).padStart(2, "0");
+}
+
+// "from 8 to 4:30", "7am-3pm", "between 6 and 2" → { start:"08:00", end:"16:30" }.
+// People almost always leave am/pm off, so assume a normal workday: a start of
+// 5–11 is morning, and the end is read whichever way lands after the start.
+function qcRange(text) {
+  const t = qcNorm(text);
+  const m = t.match(/\b(?:from |between )?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|–|—|to|until|til|till|thru|through|and)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
+  if (!m) return null;
+  const h1 = +m[1], h2 = +m[4];
+  if (h1 > 23 || h2 > 23) return null;
+  const start = qcTo24(h1, m[2], m[3] || (h1 >= 5 && h1 <= 11 ? "am" : "pm"));
+  let end;
+  if (m[6]) end = qcTo24(h2, m[5], m[6]);
+  else {
+    const pm = qcTo24(h2, m[5], "pm"), am = qcTo24(h2, m[5], "am");
+    end = pm > start ? pm : (am > start ? am : pm);
+  }
+  return end > start ? { start, end } : null;
+}
+
+function qcHours(text) {
+  const t = qcNorm(text);
+  let m = t.match(/\b(\d+)\s+and\s+a\s+half\s+hours?\b/);
+  if (m) return +m[1] + 0.5;
+  m = t.match(/\b(\d+(?:[.,]\d+)?)\s*(?:h\b|hrs?\b|hours?\b)/);
+  if (m) {
+    let h = parseFloat(m[1].replace(",", "."));
+    if (/^ ?(?:and )?a half\b/.test(t.slice(t.indexOf(m[0]) + m[0].length))) h += 0.5;
+    return h;
+  }
+  if (/\b(half an hour|a half hour)\b/.test(t)) return 0.5;
+  m = t.match(/\b(an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(?:and a half\s+)?hours?\b/);
+  if (m) return QC_WORD_NUM[m[1]] + (/and a half/.test(m[0]) ? 0.5 : 0);
+  return 0;
+}
+
+function qcMoney(text) {
+  let m = String(text).match(/\$\s?(\d[\d,]*(?:\.\d+)?)/);
+  if (!m) m = String(text).match(/\b(\d[\d,]*(?:\.\d+)?)\s*(?:dollars|bucks|cad|usd)\b/i);
+  return m ? parseFloat(m[1].replace(/,/g, "")) : 0;
+}
+
+// "12 hours at $150", "40 tons @ 22.50" → { qty, unit, rate }
+function qcQtyAtRate(text) {
+  const m = qcNorm(text).match(/\b(\d[\d,]*(?:\.\d+)?)\s*([a-z]{0,10}?)\s*(?:@|at)\s*\$?\s?(\d[\d,]*(?:\.\d+)?)/);
+  if (!m) return null;
+  return { qty: parseFloat(m[1].replace(/,/g, "")), unit: (m[2] || "").trim(), rate: parseFloat(m[3].replace(/,/g, "")) };
+}
+
+const QC_UNITS = "tons?|tonnes?|cubic yards?|yards?|yds?|loads?|bags?|pallets?|boxes|sheets?|units?|pieces?|pcs?|each|ea|litres?|liters?|gallons?|gal|kg|lbs?|pounds?|metres?|meters?|feet|ft|rolls?|drums?|pails?|buckets?|sticks?|bundles?";
+function qcQty(text) {
+  const m = qcNorm(text).match(new RegExp("\\b(\\d[\\d,]*(?:\\.\\d+)?)\\s*(" + QC_UNITS + ")\\b"));
+  return m ? { qty: parseFloat(m[1].replace(/,/g, "")), unit: m[2] } : null;
+}
+
+// The first plain number in the sentence — the last resort for "how many".
+function qcFirstNumber(text) {
+  const m = String(text).match(/\b(\d[\d,]*(?:\.\d+)?)\b/);
+  return m ? parseFloat(m[1].replace(/,/g, "")) : 0;
+}
+
+const qcEmail = t => (String(t).match(/[\w.+-]+@[\w-]+\.[\w.-]+\w/) || [""])[0];
+function qcPhone(text) {
+  const m = String(text).replace(/\b\d{4}-\d{2}-\d{2}\b/g, " ").match(/(\+?\d[\d\s().-]{7,}\d)/);
+  if (!m) return "";
+  return m[1].replace(/\D/g, "").length >= 10 ? m[1].trim() : "";
+}
+function qcQuoted(text) {
+  const m = String(text).match(/["“]([^"”]{2,90})["”]/) || String(text).match(/'([^']{2,90})'/);
+  return m ? m[1].trim() : "";
+}
+
+// Where a name should stop: the next connector, a number, or punctuation.
+const QC_CUT = /(?:,|;|:|\bfor\b|\bat\b|\bon\b|\bas\b|\bwith\b|\bstarting\b|\bstarts\b|\bdue\b|\bfrom\b|\bemail\b|\bphone\b|\brate\b|\bworth\b|\band\b|\busing\b|\bto\b|\bin\b|\btoday\b|\btomorrow\b|\byesterday\b|\$|\d)/i;
+const QC_LEAD = /^(?:a|an|the|new|another|my|our|this|that|please|pls)\s+/i;
+
+// Everything after `startRe`, up to the next connector. Used for names and
+// descriptions — the parts of a sentence with no format to pattern-match on.
+function qcPhrase(text, startRe, cut) {
+  const m = String(text).match(startRe);
+  if (!m) return "";
+  let rest = String(text).slice(m.index + m[0].length);
+  const at = rest.search(cut === null ? /$^/ : (cut || QC_CUT));
+  if (at > 0) rest = rest.slice(0, at);
+  return qcClean(rest);
+}
+function qcClean(s) {
+  let v = String(s || "").replace(/^[\s:—–\-]+/, "").replace(/[\s.,;:!?\-]+$/, "").trim();
+  for (let i = 0; i < 4; i++) { const before = v; v = v.replace(QC_LEAD, "").trim(); if (v === before) break; }
+  return v;
+}
+
+// Find the record a sentence is talking about. An exact name scores highest,
+// then "the sentence contains this record's name", then shared words — so
+// "log 6 hours on the miller driveway" finds the job "Miller Driveway".
+function qcBest(text, items, keyFn) {
+  const q = qcNorm(text);
+  if (!q) return null;
+  let best = null, bestScore = 0;
+  (items || []).forEach(it => {
+    const name = qcNorm(keyFn(it));
+    if (!name || name.length < 2) return;
+    let score = 0;
+    if (name === q) score = 200;
+    else if (q.includes(name)) score = 100 + name.length;
+    else if (name.includes(q) && q.length >= 3) score = 60 + q.length;
+    else {
+      const qt = q.split(" ").filter(w => w.length > 2);
+      const nt = name.split(" ").filter(w => w.length > 2);
+      const hits = nt.filter(w => qt.includes(w)).length;
+      if (hits) score = 20 + hits * 12 + (hits === nt.length ? 15 : 0);
+    }
+    if (score > bestScore) { bestScore = score; best = it; }
+  });
+  return bestScore >= 32 ? best : null;
+}
+
+const qcNames = (col, key) => getCol(col).map(r => r[key]).filter(Boolean);
+const qcCrewNames = () => getCol("employees").filter(e => e.isActive !== false).map(e => e.fullName).filter(Boolean);
+const qcMe = ctx => (ctx.user && (ctx.user.name || ctx.user.email)) || "";
+
+// "assign john and dave" / "crew: john, dave" → ["John", "Dave"], matched
+// against real employees where possible so the names line up with the roster.
+function qcCrew(text) {
+  const found = [];
+  getCol("employees").forEach(e => {
+    const n = qcNorm(e.fullName);
+    if (!n) return;
+    const first = n.split(" ")[0];
+    if (qcNorm(text).includes(n) || (first.length > 2 && new RegExp("\\b" + first + "\\b").test(qcNorm(text)))) found.push(e.fullName);
+  });
+  return Array.from(new Set(found));
+}
+
+/* ── The action catalog ───────────────────────────────────────────────────────
+   One entry per thing the app can already do from a form or a button. Each one
+   declares:
+     patterns / test — the phrasings it answers to (longest match wins; `weight`
+                       breaks ties between actions that share vocabulary)
+     fields          — what the review card shows, in the order a person reads it
+     parse           — sentence → field values (best effort; always editable)
+     run             — the actual write, through the same helpers the forms use
+   `nav` is the section it belongs to, so someone only ever gets the commands
+   their permissions already allow. Adding a command here is all it takes for
+   the parser, the review card, and the examples list to pick it up. */
+
+/* ── Reading a photo ──────────────────────────────────────────────────────────
+   Point the camera at a scale ticket, a delivery slip, a material label or an
+   odometer instead of typing the numbers in. The text recognition is Tesseract
+   (the long-standing open-source OCR engine, vendored in vendor/tesseract/), so
+   the photo never leaves the phone and no account or key is involved.
+
+   It's ~6 MB the first time someone scans — deliberately NOT part of the app
+   shell, so the 99% of sessions that never scan anything don't pay for it. The
+   service worker caches it on the way past, which means the second scan works
+   with no signal at all. */
+
+const QC_OCR_BASE = "vendor/tesseract/";
+let qcOcrScript = null;
+
+function qcLoadOcr() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (qcOcrScript) return qcOcrScript;
+  qcOcrScript = new Promise((resolve, reject) => {
+    const el = document.createElement("script");
+    el.src = QC_OCR_BASE + "tesseract.min.js";
+    el.onload = () => (window.Tesseract ? resolve(window.Tesseract) : reject(new Error("Text recognition failed to start.")));
+    el.onerror = () => { qcOcrScript = null; reject(new Error("Couldn't load text recognition — you may be offline and haven't scanned before.")); };
+    document.head.appendChild(el);
+  });
+  return qcOcrScript;
+}
+
+// Photo → plain text. `onProgress` gets 0–1 so the wait is visible; a phone
+// photo takes a few seconds and silence reads as a hang.
+async function qcReadPhoto(file, onProgress) {
+  const T = await qcLoadOcr();
+  const img = await downscaleImage(file, 1800, 0.92);
+  let worker = null;
+  try {
+    worker = await T.createWorker("eng", 1, {
+      workerPath: QC_OCR_BASE + "worker.min.js",
+      corePath: QC_OCR_BASE,
+      langPath: QC_OCR_BASE,
+      gzip: false,
+      logger: m => {
+        if (!onProgress) return;
+        // Loading the engine is the slow half of a first scan; show it as such.
+        const share = m.status === "recognizing text" ? 0.5 + 0.5 * (m.progress || 0) : 0.5 * (m.progress || 0);
+        onProgress(Math.max(0, Math.min(1, share)), m.status || "");
+      },
+    });
+    const res = await worker.recognize(img);
+    return (res && res.data && res.data.text) || "";
+  } finally {
+    if (worker) { try { await worker.terminate(); } catch (e) {} }
+  }
+}
+
+/* ── Pulling values off a scanned document ────────────────────────────────── */
+
+const qcLines = text => String(text || "").split(/\r?\n/).map(s => s.replace(/\s+/g, " ").trim()).filter(Boolean);
+
+// OCR turns O into 0 and l into 1 as often as not, so read money off the line
+// that says "total" first and only fall back to "the biggest number that looks
+// like money" — which is right on a receipt far more often than it's wrong.
+function qcOcrMoney(text) {
+  const labelled = qcLines(text).filter(l => /\b(total|amount due|balance|grand total|subtotal)\b/i.test(l));
+  for (const l of labelled) { const v = qcMoney(l); if (v > 0) return v; }
+  let best = 0;
+  qcLines(text).forEach(l => {
+    const m = l.match(/\$?\s?\d[\d,]*\.\d{2}\b/g) || [];
+    m.forEach(x => { const v = parseFloat(x.replace(/[^0-9.]/g, "")); if (v > best) best = v; });
+  });
+  return best;
+}
+
+function qcOcrTicket(text) {
+  const m = String(text).match(/\b(?:scale\s*)?ticket\s*(?:no\.?|number|#)?\s*[:#]?\s*([A-Z0-9][A-Z0-9-]{2,})/i)
+    || String(text).match(/\b(?:ticket|tkt)\s*[:#]\s*([A-Z0-9-]{3,})/i);
+  return m ? m[1].trim() : "";
+}
+
+// Scale tickets print gross / tare / net; net is the number that gets billed.
+function qcOcrWeight(text) {
+  const lines = qcLines(text);
+  const net = lines.filter(l => /\bnet\b/i.test(l));
+  const pick = ls => {
+    for (const l of ls) {
+      const m = l.match(/(\d[\d,]*(?:\.\d+)?)\s*(tons?|tonnes?|t\b|yards?|yds?|cu\.?\s?yds?|lbs?|kg)/i);
+      if (m) return { qty: parseFloat(m[1].replace(/,/g, "")), unit: m[2].toLowerCase() };
+    }
+    return null;
+  };
+  return pick(net) || pick(lines) || qcQty(text);
+}
+
+// The vendor is nearly always the biggest thing at the top of the slip: take
+// the first line that reads like a name rather than an address or a number.
+function qcOcrVendor(text) {
+  const lines = qcLines(text).slice(0, 6);
+  for (const l of lines) {
+    const letters = (l.match(/[A-Za-z]/g) || []).length;
+    const digits = (l.match(/\d/g) || []).length;
+    if (letters >= 4 && digits <= 2 && l.length <= 46 && !/\b(invoice|receipt|ticket|date|time|phone|fax)\b/i.test(l)) {
+      return qcTitle(l.toLowerCase());
+    }
+  }
+  return "";
+}
+
+function qcOcrNumberNear(text, labelRe) {
+  for (const l of qcLines(text)) {
+    if (!labelRe.test(l)) continue;
+    const m = l.match(/(\d[\d,]*(?:\.\d+)?)/);
+    if (m) return parseFloat(m[1].replace(/,/g, ""));
+  }
+  return "";
+}
+
+/* ── What kind of document is this? ──────────────────────────────────────────
+   Scored rather than a chain of ifs, so a slip that looks like two things picks
+   the stronger read — and the answer is a dropdown on the review card either
+   way, because a bad guess should cost one tap, not a wrong record. */
+const QC_PHOTO_KINDS = [
+  {
+    id: "log_load", label: "Scale ticket / load slip",
+    score: t => (/\bscale\b/.test(t) ? 3 : 0) + (/\bticket\b/.test(t) ? 3 : 0)
+      + (/\b(gross|tare|net)\b/.test(t) ? 3 : 0) + (/\b(tons?|tonnes?|yards?|yds?)\b/.test(t) ? 2 : 0),
+  },
+  {
+    id: "update_inventory", label: "Delivery slip for material you stock",
+    score: (t, ctx) => (qcBest(t, getCol("inventory"), i => i.materialName) ? 4 : 0)
+      + (/\b(delivered|delivery|received|packing slip|bill of lading)\b/.test(t) ? 3 : 0)
+      + (qcQty(t) ? 1 : 0),
+  },
+  {
+    id: "add_inventory", label: "Receipt / label for something new",
+    score: t => (/\b(receipt|invoice|sold to|qty|quantity|item|sku|part\s*(no|#))\b/.test(t) ? 3 : 0)
+      + (qcOcrMoney(t) > 0 ? 2 : 0),
+  },
+  {
+    id: "update_equipment", label: "Odometer / hour meter",
+    score: t => (/\b(odometer|odo|hour meter|hourmeter|hobbs|engine hours)\b/.test(t) ? 6 : 0)
+      + (/\b(km|kms|miles|mi|hrs|hours)\b/.test(t) ? 1 : 0),
+  },
+  {
+    id: "add_client", label: "Business card / contact details",
+    score: t => (qcEmail(t) ? 3 : 0) + (qcPhone(t) ? 3 : 0)
+      + (/\b(cell|mobile|office|tel|www\.|\.com|\.ca)\b/.test(t) ? 2 : 0)
+      - (/\b(total|ticket|qty|net|tare)\b/.test(t) ? 4 : 0),
+  },
+];
+
+function qcClassifyPhoto(text, actions, ctx) {
+  const t = qcNorm(text);
+  const allowed = QC_PHOTO_KINDS.filter(k => actions.some(a => a.id === k.id));
+  let best = null, bestScore = 0;
+  allowed.forEach(k => {
+    let s = 0;
+    try { s = k.score(t, ctx) || 0; } catch (e) {}
+    if (s > bestScore) { bestScore = s; best = k; }
+  });
+  return { kinds: allowed, kind: best || allowed[0] || null };
+}
+
+const QC_ACTIONS = [
+  /* ── Quotes & invoices ─────────────────────────────────────────────────── */
+  {
+    id: "create_invoice",
+    label: "Create an invoice or quote",
+    icon: "📄",
+    nav: "quotes",
+    weight: 6,
+    examples: ["invoice Acme Corp $2,500 for gravel hauling", "create a quote for Jane Smith, 12 hours at $150"],
+    // Starting the sentence with "invoice"/"quote" settles it, even when the
+    // rest reads like a time entry ("invoice Miller 12 hours at $185").
+    test: t => /^(?:invoice|bill|quote|estimate)\s+\S/.test(t),
+    patterns: [
+      /\b(?:create|make|add|new|start|draft|write|issue|raise|generate|build|open)\s+(?:a\s+|an\s+|new\s+)*(invoice|bill|quote|estimate)\b/,
+      /\b(?:invoice|bill|quote|estimate)\s+(?:for|to)\b/,
+      /^\s*(?:invoice|bill|quote|estimate)\s+[a-z]/i,
+    ],
+    fields: [
+      { key: "status", label: "Type", type: "select", options: QUOTE_STATUSES },
+      { key: "clientName", label: "Client", type: "datalist", options: () => qcNames("clients", "clientName"), required: true, placeholder: "Who is this for?" },
+      { key: "description", label: "What for", placeholder: "Gravel hauling" },
+      { key: "qty", label: "Quantity", type: "number" },
+      { key: "unit", label: "Unit", placeholder: "hours, tons, each…" },
+      { key: "rate", label: "Rate / amount ($)", type: "number" },
+      { key: "taxRate", label: "Tax %", type: "number" },
+      { key: "jobReference", label: "Job", type: "datalist", options: () => qcNames("jobs", "jobTitle") },
+      { key: "dueDate", label: "Due date", type: "date" },
+    ],
+    parse: (text) => {
+      const t = qcNorm(text);
+      const isQuote = /\b(quote|estimate)\b/.test(t) && !/\binvoice\b/.test(t);
+      const client = qcBest(text, getCol("clients"), c => c.clientName);
+      const job = qcBest(text, getCol("jobs"), j => j.jobTitle);
+      const atRate = qcQtyAtRate(text);
+      const money = qcMoney(text);
+      const qty = qcQty(text);
+
+      // "for" carries both the client and the work; when we already know the
+      // client from the roster, the last "for" is what the work was.
+      let who = client ? client.clientName : qcTitle(qcQuoted(text) || qcPhrase(text, /\b(?:invoice|bill|quote|estimate|for|to)\s+/i));
+      let what = "";
+      const fors = t.split(/\bfor\b/).length - 1;
+      if (client || fors > 1) what = qcPhrase(text, /^[\s\S]*\bfor\s+/i, /(?:,|;|\bat\b|\bdue\b|\bstarting\b|\$)/i);
+      if (qcNorm(what) === qcNorm(who)) what = "";
+
+      const v = {
+        status: isQuote ? "Quote" : "Invoice",
+        clientName: who,
+        description: what,
+        jobReference: job ? job.jobTitle : "",
+        taxRate: "",
+        dueDate: /\bdue\b/i.test(text) ? qcDate(text.slice(text.toLowerCase().indexOf("due"))) : "",
+      };
+      if (atRate) { v.qty = atRate.qty; v.unit = atRate.unit; v.rate = atRate.rate; }
+      else if (qty && money) { v.qty = qty.qty; v.unit = qty.unit; v.rate = +(money / qty.qty).toFixed(2); }
+      else { v.qty = 1; v.unit = ""; v.rate = money || ""; }
+      return v;
+    },
+    run: (v, ctx) => {
+      const doc = defaultDoc(ctx.company);
+      const isQuote = v.status === "Quote" || v.status === "Draft";
+      doc.status = v.status || "Invoice";
+      if (isQuote) doc.quoteId = doc.quoteId.replace(/^INV-/, "QTE-");
+      const c = getCol("clients").find(x => qcNorm(x.clientName) === qcNorm(v.clientName));
+      doc.to = {
+        name: c ? c.clientName : String(v.clientName || "").trim(),
+        email: c ? (c.emailAddress || "") : "",
+        phone: c ? (c.phoneNumber || "") : "",
+        address: c ? (c.billingAddress || "") : "",
+      };
+      doc.clientReference = doc.to.name;
+      doc.jobReference = v.jobReference || "";
+      doc.taxRate = num(v.taxRate);
+      if (v.dueDate) doc.dueDate = v.dueDate;
+      doc.items = [{ id: genId(), description: v.description || "Work performed", unit: v.unit || "", qty: num(v.qty, 1) || 1, rate: num(v.rate), taxable: true }];
+      doc.totalAmount = calcTotals(doc).total;
+      const rec = db.create("quotes", doc);
+      return {
+        ok: true,
+        message: doc.status + " " + doc.quoteId + " created for " + doc.to.name + " — " + fmt(doc.totalAmount, doc.currency) + ".",
+        open: { page: "quotes", params: { openId: rec._id } },
+        openLabel: "Open it",
+      };
+    },
+  },
+
+  {
+    id: "send_invoice",
+    label: "Send an invoice",
+    icon: "📤",
+    nav: "quotes",
+    weight: 8,
+    examples: ["send the Acme invoice", "email invoice INV-2026-1042 to the client"],
+    patterns: [
+      /\b(?:send|email|e-mail|deliver|issue|print|share|resend)\b[\s\S]{0,24}\b(invoice|quote|bill|estimate)\b/,
+      /\b(invoice|quote|bill|estimate)\b[\s\S]{0,20}\b(?:out|to the client|to them)\b/,
+    ],
+    fields: [
+      { key: "quoteRecId", label: "Which document", type: "select", options: () => getCol("quotes").slice(0, 40).map(q => ({ value: q._id, label: (q.quoteId || "Untitled") + " · " + (q.clientReference || "no client") + " · " + fmt(num(q.totalAmount), q.currency) })), required: true },
+      { key: "method", label: "How", type: "select", options: [{ value: "print", label: "Open the print / PDF view" }, { value: "email", label: "Draft an email to the client" }] },
+    ],
+    parse: (text) => {
+      const quotes = getCol("quotes");
+      const idm = String(text).match(/\b([A-Za-z]{2,5}-\d{2,4}-\d{2,6})\b/);
+      let doc = idm ? quotes.find(q => qcNorm(q.quoteId) === qcNorm(idm[1])) : null;
+      if (!doc) {
+        const c = qcBest(text, getCol("clients"), x => x.clientName);
+        const who = c ? c.clientName : qcPhrase(text, /\b(?:for|to)\s+/i);
+        if (who) doc = quotes.find(q => qcNorm(q.clientReference) === qcNorm(who)) || qcBest(who, quotes, q => q.clientReference || "");
+      }
+      if (!doc) doc = quotes[0];
+      // "Send" is ambiguous and the app's reliable path is print-to-PDF, so only
+      // an explicit "email" starts a mail draft. Either way it's one tap to switch.
+      return {
+        quoteRecId: doc ? doc._id : "",
+        method: /\b(email|e-mail|mail)\b/.test(qcNorm(text)) ? "email" : "print",
+      };
+    },
+    run: (v, ctx) => {
+      const doc = db.getById("quotes", v.quoteRecId);
+      if (!doc) return { ok: false, message: "Pick which document to send." };
+      if (v.method === "email") {
+        const to = (doc.to && doc.to.email) || "";
+        if (!to) return { ok: false, message: "No email address on " + (doc.clientReference || "that client") + " — add one on the client, or use the print view." };
+        const label = doc.status === "Quote" ? "Quote" : "Invoice";
+        const body = "Hi" + (doc.to.name ? " " + doc.to.name : "") + ",\n\n"
+          + "Please find " + label.toLowerCase() + " " + doc.quoteId + " for " + fmt(num(doc.totalAmount), doc.currency) + " attached"
+          + (doc.dueDate ? ", due " + doc.dueDate : "") + ".\n\n"
+          + "Thank you,\n" + ((ctx.company && ctx.company.companyName) || "");
+        window.location.href = "mailto:" + encodeURIComponent(to)
+          + "?subject=" + encodeURIComponent(label + " " + doc.quoteId + " — " + ((ctx.company && ctx.company.companyName) || ""))
+          + "&body=" + encodeURIComponent(body);
+        return { ok: true, message: "Drafted an email to " + to + " in your mail app — attach the PDF and send it from there." };
+      }
+      return {
+        ok: true,
+        immediate: true,
+        message: "Opening " + (doc.quoteId || "the document") + " for print / PDF.",
+        open: { page: "quotes", params: { openId: doc._id, preview: true } },
+      };
+    },
+  },
+
+  /* ── People ────────────────────────────────────────────────────────────── */
+  {
+    id: "add_employee",
+    label: "Add an employee",
+    icon: "👤",
+    nav: "employees",
+    weight: 4,
+    examples: ["add employee Dave Reimer at $32 an hour", "hire Sara Klassen as a crew lead, sara@mail.com"],
+    patterns: [
+      /\b(?:add|create|new|register|onboard|set ?up|put in)\s+(?:a\s+|an\s+|new\s+)*(?:employee|worker|crew ?member|staff|hand|operator|driver)\b/,
+      /\b(?:hire|onboard)\s+[a-z]/i,
+      /\b(?:employee|worker|crew ?member)\s+(?:named|called)\b/,
+    ],
+    fields: [
+      { key: "fullName", label: "Full name", required: true, placeholder: "Dave Reimer" },
+      { key: "role", label: "Role", type: "select", options: ["Owner", "Manager", "Supervisor", "Crew Lead", "Employee"] },
+      { key: "hourlyRate", label: "Hourly rate ($)", type: "number" },
+      { key: "email", label: "Email", placeholder: "dave@company.com" },
+      { key: "phoneNumber", label: "Phone" },
+      { key: "startDate", label: "Start date", type: "date" },
+      { key: "employeeId", label: "Employee ID" },
+    ],
+    parse: (text) => {
+      const t = qcNorm(text);
+      const role = /\bcrew ?lead\b/.test(t) ? "Crew Lead"
+        : /\bsupervisor\b/.test(t) ? "Supervisor"
+          : /\bmanager\b/.test(t) ? "Manager" : "Employee";
+      const name = qcQuoted(text)
+        || qcPhrase(text, /\b(?:employee|worker|crew ?member|staff|hand|operator|driver)\s+(?:named\s+|called\s+)?/i)
+        || qcPhrase(text, /\b(?:hire|onboard|add|register)\s+/i);
+      return {
+        fullName: qcTitle(name),
+        role,
+        hourlyRate: qcMoney(text) || "",
+        email: qcEmail(text),
+        phoneNumber: qcPhone(text),
+        startDate: /\bstart/i.test(text) ? qcDate(text) : "",
+        employeeId: "",
+      };
+    },
+    run: (v) => {
+      const rec = db.create("employees", {
+        fullName: String(v.fullName).trim(), role: v.role || "Employee", email: v.email || "",
+        phoneNumber: v.phoneNumber || "", hourlyRate: num(v.hourlyRate), startDate: v.startDate || "",
+        employeeId: v.employeeId || "", isActive: true,
+      });
+      return { ok: true, message: rec.fullName + " added to your employees.", open: { page: "employees" }, openLabel: "See employees" };
+    },
+  },
+
+  {
+    id: "invite_employee",
+    label: "Invite someone to the company",
+    icon: "✉️",
+    nav: "team",
+    weight: 9,
+    examples: ["invite dave@mail.com to the company", "send the join code to Sara"],
+    patterns: [
+      /\b(?:invite|send an invite|send the invite)\b/,
+      /\b(?:join code|invite code)\b/,
+    ],
+    fields: [
+      { key: "email", label: "Their email (optional)", placeholder: "Leave blank to just copy the code" },
+      { key: "name", label: "Their name (optional)" },
+    ],
+    parse: (text) => ({
+      email: qcEmail(text),
+      name: qcTitle(qcQuoted(text) || qcPhrase(text, /\b(?:invite|to)\s+/i).replace(/@\S+/g, "").trim()),
+    }),
+    run: (v, ctx) => {
+      const code = (ctx.company && ctx.company.joinCode) || "";
+      if (!code) return { ok: false, message: "No join code on this company yet — open Team to create one." };
+      // Copying can be refused (permission, insecure context) — the code is in
+      // the message either way, so a failure here must not surface as an error.
+      try { if (navigator.clipboard) navigator.clipboard.writeText(code).catch(() => {}); } catch (e) {}
+      if (v.email) {
+        const body = "Hi" + (v.name ? " " + v.name : "") + ",\n\n"
+          + "Join " + ((ctx.company && ctx.company.companyName) || "our company") + " on BuildMyBill:\n\n"
+          + "1. Go to " + window.location.origin + window.location.pathname + "\n"
+          + "2. Sign up and choose \"Join a company\"\n"
+          + "3. Enter this code: " + code + "\n\n"
+          + "I'll approve you once you're in.\n";
+        window.location.href = "mailto:" + encodeURIComponent(v.email)
+          + "?subject=" + encodeURIComponent("Join " + ((ctx.company && ctx.company.companyName) || "our team") + " on BuildMyBill")
+          + "&body=" + encodeURIComponent(body);
+        return { ok: true, message: "Invite drafted to " + v.email + " in your mail app — the join code " + code + " is in it (and on your clipboard).", open: { page: "team" }, openLabel: "Open Team" };
+      }
+      return { ok: true, message: "Join code " + code + " copied. Share it, then approve them on the Team page.", open: { page: "team" }, openLabel: "Open Team" };
+    },
+  },
+
+  {
+    id: "check_logs",
+    label: "Check someone's work logs",
+    icon: "📊",
+    nav: "employee-logs",
+    weight: 7,
+    examples: ["check Dave's logs", "show me the work logs for Sara"],
+    patterns: [
+      /\b(?:check|show|open|view|pull ?up|see|look at|bring ?up)\b[\s\S]{0,30}\b(?:logs?|hours|timesheets?|time sheet|work ?log)\b/,
+      /\b(?:logs?|hours|timesheets?)\s+for\b/,
+    ],
+    fields: [
+      { key: "employeeName", label: "Employee", type: "select", options: () => [{ value: "", label: "Everyone" }].concat(qcNames("employees", "fullName").map(n => ({ value: n, label: n }))) },
+    ],
+    parse: (text) => {
+      const e = qcBest(text, getCol("employees"), x => x.fullName)
+        || qcBest(String(text).replace(/'s\b/g, ""), getCol("employees"), x => (x.fullName || "").split(" ")[0]);
+      return { employeeName: e ? e.fullName : "" };
+    },
+    run: (v, ctx) => {
+      if (ctx.isMobile) return { ok: false, message: "Work logs live in the full app — tap More → Open full app." };
+      return {
+        ok: true, immediate: true,
+        message: "Opening work logs" + (v.employeeName ? " for " + v.employeeName : "") + ".",
+        open: { page: "employee-logs", params: { employee: v.employeeName || "" } },
+      };
+    },
+  },
+
+  /* ── Time ──────────────────────────────────────────────────────────────── */
+  {
+    id: "log_time",
+    label: "Log time on a job",
+    icon: "⏱️",
+    nav: "time-entry",
+    weight: 5,
+    examples: ["log 6 hours on the Miller driveway", "worked 8 to 4:30 at Cedar Ridge running the excavator"],
+    patterns: [
+      /\b(?:log|record|enter|add|track|book|put in)\s+(?:my\s+|his\s+|her\s+|their\s+)?(?:\d+(?:\.\d+)?\s*)?(?:h\b|hrs?\b|hours?\b|time\b|work\b)/,
+      /\b(?:worked|spent|put in|was on)\b[\s\S]{0,16}\b\d/,
+      /\b\d+(?:\.\d+)?\s*(?:h\b|hrs?\b|hours?\b)\s+(?:on|at|for)\b/,
+      /\b(?:log|record|enter|track|book)\b[\s\S]{0,24}\b(?:hours?|hrs?)\b/,
+    ],
+    fields: [
+      { key: "employeeName", label: "Employee", type: "datalist", options: qcCrewNames, required: true },
+      { key: "entryDate", label: "Date", type: "date", required: true },
+      { key: "jobName", label: "Job / location", type: "datalist", options: () => qcNames("jobs", "jobTitle") },
+      { key: "hoursWorked", label: "Hours", type: "number", required: true },
+      { key: "startTime", label: "Start", type: "time" },
+      { key: "endTime", label: "End", type: "time" },
+      { key: "workDescription", label: "Work done", placeholder: "Excavation…" },
+      { key: "equipmentUsed", label: "Equipment", type: "datalist", options: () => qcNames("equipment", "equipmentName") },
+      { key: "mileageDriven", label: "Miles driven", type: "number" },
+      { key: "notes", label: "Notes", type: "textarea" },
+    ],
+    parse: (text, ctx) => {
+      const job = qcBest(text, getCol("jobs"), j => j.jobTitle) || qcBest(text, getCol("sites"), s => s.siteName);
+      const eq = qcBest(text, getCol("equipment"), e => e.equipmentName);
+      const emp = qcBest(text, getCol("employees"), e => e.fullName);
+      const range = qcRange(text);
+      const hours = qcHours(text) || (range ? hoursBetween(range.start, range.end) : 0);
+      const miles = (String(text).match(/\b(\d[\d,]*(?:\.\d+)?)\s*(?:miles?|mi\b|km\b|kilometres?|kilometers?)\b/i) || [])[1];
+      // Only take a description from words that actually introduce one — "to"
+      // would otherwise swallow the second half of "8 to 4:30".
+      let what = qcPhrase(text, /\b(?:doing|working on|did|ran|hauling|digging|task was)\s+/i, /(?:,|;|\bfor\b|\bat\b|\bon\b|\bwith\b|\busing\b)/i);
+      if (job && qcNorm(what) === qcNorm(job.jobTitle)) what = "";
+      return {
+        employeeName: emp ? emp.fullName : qcMe(ctx),
+        entryDate: qcDate(text) || today(),
+        jobName: job ? (job.jobTitle || job.siteName) : qcPhrase(text, /\b(?:on|at)\s+/i),
+        hoursWorked: hours || "",
+        startTime: range ? range.start : "",
+        endTime: range ? range.end : "",
+        workDescription: what,
+        equipmentUsed: eq ? eq.equipmentName : "",
+        mileageDriven: miles ? parseFloat(String(miles).replace(/,/g, "")) : "",
+        notes: "",
+      };
+    },
+    run: (v) => {
+      const hrs = num(v.hoursWorked) || hoursBetween(v.startTime, v.endTime);
+      if (!(hrs > 0)) return { ok: false, message: "How many hours? Add the hours or a start and end time." };
+      db.create("timeentries", {
+        employeeName: v.employeeName, jobName: v.jobName || "", entryDate: v.entryDate || today(),
+        hoursWorked: hrs, startTime: v.startTime || "", endTime: v.endTime || "",
+        workDescription: v.workDescription || "", notes: v.notes || "",
+        equipmentUsed: v.equipmentUsed || "", mileageDriven: num(v.mileageDriven),
+        source: "quick-command",
+      });
+      // Equipment picked for an entry is assumed to have run for those hours —
+      // same rule the time-tracking form uses, so billing stays consistent.
+      if (v.equipmentUsed) logEquipmentUsage({ equipmentName: v.equipmentUsed, hours: hrs, employeeName: v.employeeName, entryDate: v.entryDate || today(), jobName: v.jobName, source: "quick-command" });
+      return {
+        ok: true,
+        message: hrs.toFixed(2) + " h logged for " + v.employeeName + (v.jobName ? " on " + v.jobName : "") + " (" + (v.entryDate || today()) + ")."
+          + (v.equipmentUsed ? " " + v.equipmentUsed + " billed for the same hours." : ""),
+        open: { page: "employee-logs" }, openLabel: "See work logs",
+      };
+    },
+  },
+
+  /* ── Equipment ─────────────────────────────────────────────────────────── */
+  {
+    id: "update_equipment",
+    label: "Update an equipment item",
+    icon: "🚛",
+    nav: "equipment",
+    weight: 10,
+    examples: ["set the mileage on the F350 to 145,000", "the CAT 320 was serviced today"],
+    patterns: [
+      /\b(?:mileage|odometer|engine hours|hour meter|last service|serviced|service date)\b/,
+      /\b(?:update|set|change|correct|adjust|bump)\b[\s\S]{0,30}\b(?:equipment|truck|excavator|loader|dozer|skid ?steer|trailer|machine)\b/,
+    ],
+    fields: [
+      { key: "equipmentId", label: "Equipment", type: "select", options: () => getCol("equipment").map(e => ({ value: e._id, label: e.equipmentName })), required: true },
+      { key: "currentMileage", label: "Mileage (km)", type: "number" },
+      { key: "totalHours", label: "Engine hours", type: "number" },
+      { key: "lastServiceDate", label: "Last service date", type: "date" },
+      { key: "billingRatePerHour", label: "Billing rate ($/hr)", type: "number" },
+      { key: "warehouse", label: "Warehouse", type: "datalist", options: () => qcNames("warehouses", "warehouseName") },
+      { key: "maintenanceNotes", label: "Maintenance note", type: "textarea" },
+    ],
+    parse: (text) => {
+      const t = qcNorm(text);
+      const eq = qcBest(text, getCol("equipment"), e => e.equipmentName);
+      const v = { equipmentId: eq ? eq._id : "", currentMileage: "", totalHours: "", lastServiceDate: "", billingRatePerHour: "", warehouse: "", maintenanceNotes: "" };
+      // Read the number carefully: unit names are attached to machine names too
+      // ("F350", "CAT 320"), so never scan across letters to find one — take the
+      // number next to the unit, or the one after "to"/"is"/"at".
+      const grab = (res) => { for (let i = 0; i < res.length; i++) { const m = t.match(res[i]); if (m) return parseFloat(m[1].replace(/,/g, "")); } return ""; };
+      if (/\b(mileage|odometer|kilometres|kilometers|km|miles)\b/.test(t)) {
+        v.currentMileage = grab([
+          /(\d[\d,]*(?:\.\d+)?)\s*(?:km|kilometres|kilometers|miles)\b/,
+          /(?:mileage|odometer)[^0-9a-z]{0,12}(\d[\d,]*(?:\.\d+)?)/,
+          /\b(?:to|at|is|now|reads?)\s+(\d[\d,]*(?:\.\d+)?)/,
+        ]);
+      }
+      if (/\b(engine hours|hour meter|hours on|hourmeter)\b/.test(t)) {
+        v.totalHours = grab([
+          /(?:engine hours|hour meter|hourmeter|hours on)[^0-9a-z]{0,12}(\d[\d,]*(?:\.\d+)?)/,
+          /(\d[\d,]*(?:\.\d+)?)\s*(?:engine )?hours\b/,
+          /\b(?:to|at|is|now|reads?)\s+(\d[\d,]*(?:\.\d+)?)/,
+        ]);
+      }
+      if (/\b(serviced|service|maintenance|greased|oil change)\b/.test(t)) v.lastServiceDate = qcDate(text) || today();
+      const rate = t.match(/\$\s?(\d[\d,]*(?:\.\d+)?)\s*(?:an?|per|\/)\s*(?:hr|hour)/);
+      if (rate) v.billingRatePerHour = parseFloat(rate[1].replace(/,/g, ""));
+      const wh = qcBest(text, getCol("warehouses"), w => w.warehouseName);
+      if (wh) v.warehouse = wh.warehouseName;
+      if (/\b(note|noted|notes)\b/.test(t)) v.maintenanceNotes = qcPhrase(text, /\bnotes?d?\s*:?\s*/i, null);
+      return v;
+    },
+    fromPhoto: (text) => {
+      const eq = qcBest(text, getCol("equipment"), e => e.equipmentName);
+      const km = qcOcrNumberNear(text, /\b(odometer|odo|km|kms|miles|mi)\b/i);
+      const hrs = qcOcrNumberNear(text, /\b(hour meter|hourmeter|hobbs|engine hours|hrs?)\b/i);
+      // A dash photo is usually one big number and nothing else — if no label
+      // was readable, take the largest number and let the label decide later.
+      const bare = km === "" && hrs === "" ? qcLines(text).map(l => (l.match(/\d[\d,]*/g) || []).map(x => parseFloat(x.replace(/,/g, "")))).flat().sort((a, b) => b - a)[0] : "";
+      return {
+        equipmentId: eq ? eq._id : "",
+        currentMileage: km !== "" ? km : (bare || ""),
+        totalHours: hrs !== "" ? hrs : "",
+        lastServiceDate: "", billingRatePerHour: "", warehouse: "", maintenanceNotes: "",
+      };
+    },
+    run: (v) => {
+      const eq = db.getById("equipment", v.equipmentId);
+      if (!eq) return { ok: false, message: "Pick which equipment item this is about." };
+      const patch = { ...eq };
+      const touched = [];
+      if (String(v.currentMileage) !== "") { patch.currentMileage = num(v.currentMileage); touched.push("mileage " + num(v.currentMileage).toLocaleString() + " km"); }
+      if (String(v.totalHours) !== "") { patch.totalHours = num(v.totalHours); touched.push(num(v.totalHours) + " engine hours"); }
+      if (v.lastServiceDate) { patch.lastServiceDate = v.lastServiceDate; touched.push("serviced " + v.lastServiceDate); }
+      if (String(v.billingRatePerHour) !== "") { patch.billingRatePerHour = num(v.billingRatePerHour); touched.push(fmt(num(v.billingRatePerHour)) + "/hr"); }
+      if (v.warehouse) { patch.warehouse = v.warehouse; touched.push("at " + v.warehouse); }
+      if (v.maintenanceNotes) { patch.maintenanceNotes = [eq.maintenanceNotes, v.maintenanceNotes].filter(Boolean).join("\n"); touched.push("note added"); }
+      if (!touched.length) return { ok: false, message: "Nothing to change — fill in at least one detail." };
+      db.update("equipment", patch);
+      return { ok: true, message: eq.equipmentName + " updated: " + touched.join(", ") + ".", open: { page: "equipment" }, openLabel: "Open Equipment" };
+    },
+  },
+
+  {
+    id: "add_equipment",
+    label: "Add an equipment item",
+    icon: "🚜",
+    nav: "equipment",
+    weight: 4,
+    examples: ["add equipment 2019 Kenworth T880 at $180 an hour", "new excavator CAT 320"],
+    patterns: [
+      /\b(?:add|create|new|register|buy|bought)\s+(?:a\s+|an\s+|new\s+)*(?:equipment|truck|semi|excavator|loader|dozer|bulldozer|crane|skid ?steer|trailer|machine)\b/,
+    ],
+    fields: [
+      { key: "equipmentName", label: "Name", required: true, placeholder: "Excavator CAT 320" },
+      { key: "equipmentType", label: "Type", type: "select", options: ["", "Semi", "Truck", "Wheel Loader", "Excavator", "Bulldozer", "Crane", "Skid Steer", "Other"] },
+      { key: "billingRatePerHour", label: "Billing rate ($/hr)", type: "number" },
+      { key: "manufacturer", label: "Manufacturer" },
+      { key: "yearOfManufacture", label: "Year", type: "number" },
+      { key: "totalHours", label: "Engine hours", type: "number" },
+      { key: "currentMileage", label: "Mileage (km)", type: "number" },
+      { key: "warehouse", label: "Warehouse", type: "datalist", options: () => qcNames("warehouses", "warehouseName") },
+    ],
+    parse: (text) => {
+      const t = qcNorm(text);
+      const type = /\bskid ?steer\b/.test(t) ? "Skid Steer"
+        : /\bexcavator\b/.test(t) ? "Excavator"
+          : /\b(wheel )?loader\b/.test(t) ? "Wheel Loader"
+            : /\b(bull)?dozer\b/.test(t) ? "Bulldozer"
+              : /\bcrane\b/.test(t) ? "Crane"
+                : /\bsemi\b/.test(t) ? "Semi"
+                  : /\btruck\b/.test(t) ? "Truck" : "";
+      const year = (t.match(/\b(19|20)\d{2}\b/) || [])[0] || "";
+      const name = qcQuoted(text) || qcPhrase(text, /\b(?:equipment|truck|semi|excavator|loader|dozer|bulldozer|crane|skid ?steer|trailer|machine)\s+(?:named\s+|called\s+)?/i, /(?:,|;|\bat\b|\bwith\b|\bfor\b|\$)/i)
+        || qcPhrase(text, /\b(?:add|create|new|register)\s+/i, /(?:,|;|\bat\b|\bwith\b|\bfor\b|\$)/i);
+      const rate = t.match(/\$\s?(\d[\d,]*(?:\.\d+)?)\s*(?:an?|per|\/)\s*(?:hr|hour)/);
+      const wh = qcBest(text, getCol("warehouses"), w => w.warehouseName);
+      return {
+        equipmentName: qcTitle(name), equipmentType: type,
+        billingRatePerHour: rate ? parseFloat(rate[1].replace(/,/g, "")) : (qcMoney(text) || ""),
+        manufacturer: "", yearOfManufacture: year, totalHours: "", currentMileage: "",
+        warehouse: wh ? wh.warehouseName : "",
+      };
+    },
+    run: (v) => {
+      const rec = db.create("equipment", {
+        equipmentName: String(v.equipmentName).trim(), equipmentType: v.equipmentType || "",
+        manufacturer: v.manufacturer || "", yearOfManufacture: v.yearOfManufacture || "",
+        billingRatePerHour: num(v.billingRatePerHour), totalHours: num(v.totalHours),
+        currentMileage: String(v.currentMileage) === "" ? "" : num(v.currentMileage),
+        warehouse: v.warehouse || "",
+      });
+      return { ok: true, message: rec.equipmentName + " added to Equipment.", open: { page: "equipment" }, openLabel: "Open Equipment" };
+    },
+  },
+
+  /* ── Inventory ─────────────────────────────────────────────────────────── */
+  {
+    id: "update_inventory",
+    label: "Record a stock movement",
+    icon: "📦",
+    nav: "inventory",
+    weight: 11,
+    examples: ["received 40 tons of crushed gravel", "used 12 bags of cement on the Miller job"],
+    test: t => !!qcBest(t, getCol("inventory"), i => i.materialName)
+      && /\b(received|receive|got|took in|delivered|restock|used|use|consumed|pulled|took|add|added|remove|removed|set|update|adjust|stock|inventory|on hand)\b/.test(t),
+    patterns: [
+      /\b(?:received|got in|took in|delivered|restocked|used|consumed|pulled)\b[\s\S]{0,24}\b(?:of|from|for)?\b/,
+      /\b(?:update|set|adjust|correct)\b[\s\S]{0,20}\b(?:stock|inventory|on hand)\b/,
+    ],
+    fields: [
+      { key: "inventoryId", label: "Material", type: "select", options: () => getCol("inventory").map(i => ({ value: i._id, label: i.materialName + " (" + num(i.currentStock).toLocaleString() + " " + (i.unitOfMeasure || "units") + " on hand)" })), required: true },
+      { key: "movement", label: "What happened", type: "select", options: [{ value: "Received", label: "Received into stock" }, { value: "Used", label: "Used / taken out" }, { value: "Set", label: "Set the count on hand to…" }] },
+      { key: "quantity", label: "Quantity", type: "number", required: true },
+      { key: "entryDate", label: "Date", type: "date" },
+      { key: "note", label: "Note", placeholder: "Job, supplier, ticket #…" },
+    ],
+    parse: (text, ctx) => {
+      const t = qcNorm(text);
+      const item = qcBest(text, getCol("inventory"), i => i.materialName);
+      const q = qcQty(text);
+      const movement = /\b(used|consumed|pulled|took out|out to|remove|removed|drew)\b/.test(t) ? "Used"
+        : /\b(set|adjust|correct|count|now at|on hand is)\b/.test(t) ? "Set" : "Received";
+      const job = qcBest(text, getCol("jobs"), j => j.jobTitle);
+      return {
+        inventoryId: item ? item._id : "",
+        movement,
+        quantity: q ? q.qty : (qcFirstNumber(text) || ""),
+        entryDate: qcDate(text) || today(),
+        note: job ? job.jobTitle : qcPhrase(text, /\b(?:from|for)\s+/i),
+      };
+    },
+    fromPhoto: (text) => {
+      const item = qcBest(text, getCol("inventory"), i => i.materialName);
+      const w = qcOcrWeight(text);
+      const vendor = qcOcrVendor(text);
+      const ticket = qcOcrTicket(text);
+      return {
+        inventoryId: item ? item._id : "",
+        movement: "Received",
+        quantity: w ? w.qty : "",
+        entryDate: qcDate(text) || today(),
+        note: [vendor, ticket && "ticket " + ticket].filter(Boolean).join(" · "),
+      };
+    },
+    run: (v, ctx) => {
+      const item = db.getById("inventory", v.inventoryId);
+      if (!item) return { ok: false, message: "Pick which material this is about." };
+      const qty = num(v.quantity);
+      if (!(qty >= 0)) return { ok: false, message: "How many? Add a quantity." };
+      const unit = item.unitOfMeasure || "units";
+      if (v.movement === "Set") {
+        db.update("inventory", { ...item, currentStock: qty });
+        return { ok: true, message: item.materialName + " set to " + qty.toLocaleString() + " " + unit + " on hand.", open: { page: "inventory" }, openLabel: "Open Inventory" };
+      }
+      if (!(qty > 0)) return { ok: false, message: "How many? Add a quantity." };
+      logInventoryMovement({
+        inventoryId: item._id, type: v.movement, quantity: qty,
+        note: v.note || "", entryDate: v.entryDate || today(), loggedBy: qcMe(ctx),
+      });
+      const after = num(db.getById("inventory", item._id).currentStock);
+      const low = isLowStock(db.getById("inventory", item._id));
+      return {
+        ok: true,
+        message: v.movement.toLowerCase() + " " + qty.toLocaleString() + " " + unit + " of " + item.materialName
+          + " — " + after.toLocaleString() + " " + unit + " on hand" + (low ? " (below the reorder point)" : "") + ".",
+        open: { page: "inventory" }, openLabel: "Open Inventory",
+      };
+    },
+  },
+
+  {
+    id: "add_inventory",
+    label: "Add a material to inventory",
+    icon: "🧱",
+    nav: "inventory",
+    weight: 6,
+    examples: ["add material 3/4 crushed gravel, 200 tons at $22 each", "new inventory item rebar 10mm"],
+    patterns: [
+      /\b(?:add|create|new|start tracking)\s+(?:a\s+|an\s+|new\s+)*(?:material|inventory item|item to inventory|stock item|product)\b/,
+      /\b(?:add|create|new)\b[\s\S]{0,20}\bto inventory\b/,
+    ],
+    fields: [
+      { key: "materialName", label: "Material", required: true, placeholder: "Crushed gravel" },
+      { key: "currentStock", label: "Stock on hand", type: "number" },
+      { key: "unitOfMeasure", label: "Unit", placeholder: "tons, yards, units…" },
+      { key: "unitPrice", label: "Unit price ($)", type: "number" },
+      { key: "reorderPoint", label: "Reorder point", type: "number" },
+      { key: "warehouse", label: "Warehouse", type: "datalist", options: () => qcNames("warehouses", "warehouseName") },
+      { key: "binLocation", label: "Bin / shelf" },
+      { key: "supplier", label: "Supplier" },
+    ],
+    parse: (text) => {
+      const q = qcQty(text);
+      const wh = qcBest(text, getCol("warehouses"), w => w.warehouseName);
+      const name = qcQuoted(text)
+        || qcPhrase(text, /\b(?:material|inventory item|stock item|item|product)\s+(?:named\s+|called\s+)?/i, /(?:,|;|\bat\b|\bwith\b|\$|\bin\b)/i)
+        || qcPhrase(text, /\b(?:add|create|new)\s+/i, /(?:,|;|\bat\b|\bwith\b|\$|\bin\b)/i);
+      const reorder = (qcNorm(text).match(/reorder\D{0,12}(\d[\d,]*(?:\.\d+)?)/) || [])[1];
+      return {
+        materialName: name, currentStock: q ? q.qty : "", unitOfMeasure: q ? q.unit : "",
+        unitPrice: qcMoney(text) || "", reorderPoint: reorder ? parseFloat(reorder.replace(/,/g, "")) : "",
+        warehouse: wh ? wh.warehouseName : "", binLocation: "", supplier: "",
+      };
+    },
+    fromPhoto: (text) => {
+      const w = qcOcrWeight(text) || qcQty(text);
+      const total = qcOcrMoney(text);
+      const wh = getCol("warehouses")[0];
+      const vendor = qcOcrVendor(text);
+      // A labelled "Product:" line is the material; without one, skip the
+      // letterhead at the top (that's the supplier, not the thing being bought)
+      // and offer the best remaining line for correction.
+      const lines = qcLines(text);
+      const labelled = lines.map(l => (l.match(/\b(?:product|item|description|material|commodity)\s*[:\-]\s*(.+)$/i) || [])[1]).filter(Boolean)[0];
+      const nameLine = labelled || lines.slice(1).find(l =>
+        /[A-Za-z]{4}/.test(l)
+        && qcNorm(l) !== qcNorm(vendor)
+        && !/\b(total|subtotal|tax|gst|pst|invoice|receipt|date|time|ticket|gross|tare|net|thank|hauler|driver)\b/i.test(l)
+        && (l.match(/\d/g) || []).length <= 4);
+      return {
+        materialName: nameLine ? qcTitle(String(nameLine).toLowerCase().trim()).slice(0, 60) : "",
+        currentStock: w ? w.qty : "",
+        unitOfMeasure: w ? w.unit : "",
+        unitPrice: w && w.qty > 0 && total > 0 ? +(total / w.qty).toFixed(2) : (total || ""),
+        reorderPoint: "",
+        warehouse: wh ? wh.warehouseName : "",
+        binLocation: "",
+        supplier: vendor,
+      };
+    },
+    run: (v) => {
+      const rec = db.create("inventory", {
+        materialName: String(v.materialName).trim(), currentStock: num(v.currentStock),
+        unitOfMeasure: v.unitOfMeasure || "", unitPrice: num(v.unitPrice),
+        reorderPoint: String(v.reorderPoint) === "" ? "" : num(v.reorderPoint),
+        warehouse: v.warehouse || "", binLocation: v.binLocation || "", supplier: v.supplier || "",
+      });
+      return { ok: true, message: rec.materialName + " added to Inventory.", open: { page: "inventory" }, openLabel: "Open Inventory" };
+    },
+  },
+
+  /* ── Clients & jobs ────────────────────────────────────────────────────── */
+  {
+    id: "add_client",
+    label: "Add a client",
+    icon: "👥",
+    nav: "clients",
+    weight: 5,
+    examples: ["add client Northview Farms, contact Ted, ted@northview.ca", "new customer Miller Construction 306 555 1212"],
+    patterns: [
+      /\b(?:add|create|new|register|set ?up)\s+(?:a\s+|an\s+|new\s+)*(?:client|customer|account)\b/,
+      /\b(?:client|customer)\s+(?:named|called)\b/,
+    ],
+    fields: [
+      { key: "clientName", label: "Client / business name", required: true, placeholder: "Northview Farms" },
+      { key: "contactPerson", label: "Contact person" },
+      { key: "emailAddress", label: "Email" },
+      { key: "phoneNumber", label: "Phone" },
+      { key: "billingAddress", label: "Billing address" },
+      { key: "notes", label: "Notes", type: "textarea" },
+    ],
+    parse: (text) => ({
+      clientName: qcTitle(qcQuoted(text)
+        || qcPhrase(text, /\b(?:client|customer|account)\s+(?:named\s+|called\s+)?/i)
+        || qcPhrase(text, /\b(?:add|create|new|register)\s+/i)),
+      contactPerson: qcTitle(qcPhrase(text, /\b(?:contact|attn|ask for)\s*(?:person\s*)?:?\s*/i)),
+      emailAddress: qcEmail(text),
+      phoneNumber: qcPhone(text),
+      billingAddress: qcPhrase(text, /\b(?:address|located at|bill to)\s*:?\s*/i, /(?:,\s*(?:phone|email)|;|\bemail\b|\bphone\b)/i),
+      notes: "",
+    }),
+    fromPhoto: (text) => {
+      const lines = qcLines(text);
+      const email = qcEmail(text);
+      // On a card the company sits at the top and the person's name just under
+      // it; the lines carrying contact details are never either of those.
+      const plain = lines.filter(l => !qcEmail(l) && !qcPhone(l) && !/\b(www\.|http|tel|cell|mobile|fax|office)\b/i.test(l) && /[A-Za-z]{3}/.test(l));
+      return {
+        clientName: plain[0] ? qcTitle(plain[0].toLowerCase()).slice(0, 60) : "",
+        contactPerson: plain[1] ? qcTitle(plain[1].toLowerCase()).slice(0, 60) : "",
+        emailAddress: email,
+        phoneNumber: qcPhone(text),
+        billingAddress: lines.filter(l => /\d{1,6}\s+[A-Za-z]/.test(l) && !qcPhone(l))[0] || "",
+        notes: "",
+      };
+    },
+    run: (v) => {
+      const rec = db.create("clients", {
+        clientName: String(v.clientName).trim(), contactPerson: v.contactPerson || "",
+        emailAddress: v.emailAddress || "", phoneNumber: v.phoneNumber || "",
+        billingAddress: v.billingAddress || "", notes: v.notes || "",
+      });
+      return { ok: true, message: rec.clientName + " added to Clients.", open: { page: "clients" }, openLabel: "Open Clients" };
+    },
+  },
+
+  {
+    id: "create_job",
+    label: "Create a job",
+    icon: "🏗️",
+    nav: "jobs",
+    weight: 5,
+    examples: ["create job Cedar Ridge Grading for Northview Farms starting Monday", "new project Miller driveway, assign Dave"],
+    patterns: [
+      /\b(?:create|add|new|start|set ?up|open)\s+(?:a\s+|an\s+|new\s+)*(?:job|project|work order|jobsite)\b/,
+      /\b(?:job|project)\s+(?:named|called)\b/,
+    ],
+    fields: [
+      { key: "jobTitle", label: "Job title", required: true, placeholder: "Cedar Ridge Grading" },
+      { key: "clientName", label: "Client", type: "datalist", options: () => qcNames("clients", "clientName") },
+      { key: "jobAddress", label: "Job location" },
+      { key: "startDate", label: "Start date", type: "date" },
+      { key: "endDate", label: "End date", type: "date" },
+      { key: "jobStatus", label: "Status", type: "select", options: ["Pending", "Active", "In Progress", "Completed", "On Hold"] },
+      { key: "assignedEmployees", label: "Crew (comma separated)", type: "datalist", options: qcCrewNames },
+      { key: "mobilizationCost", label: "Mobilization cost ($)", type: "number" },
+      { key: "jobDescription", label: "Description", type: "textarea" },
+    ],
+    parse: (text) => {
+      const t = qcNorm(text);
+      const client = qcBest(text, getCol("clients"), c => c.clientName);
+      const title = qcQuoted(text)
+        || qcPhrase(text, /\b(?:job|project|work order|jobsite)\s+(?:named\s+|called\s+)?/i, /(?:,|;|\bfor\b|\bstarting\b|\bstarts\b|\bassign\b|\bwith\b|\bat\b|\$)/i)
+        || qcPhrase(text, /\b(?:create|add|new|start|open)\s+/i, /(?:,|;|\bfor\b|\bstarting\b|\bassign\b|\$)/i);
+      const startText = /\bstart/i.test(text) ? text.slice(text.toLowerCase().search(/\bstart/)) : text;
+      const endText = /\b(?:end|until|through|finish|done by|wrap)/i.test(text) ? text.slice(text.toLowerCase().search(/\b(?:end|until|through|finish|done by|wrap)/)) : "";
+      return {
+        jobTitle: qcTitle(title),
+        clientName: client ? client.clientName : qcTitle(qcPhrase(text, /\bfor\s+/i)),
+        jobAddress: qcPhrase(text, /\b(?:at|address|located at)\s+/i, /(?:,|;|\bstarting\b|\bfor\b|\bassign\b)/i),
+        startDate: qcDate(startText),
+        endDate: endText ? qcDate(endText) : "",
+        jobStatus: /\bactive|in progress|underway\b/.test(t) ? "Active" : "Pending",
+        assignedEmployees: qcCrew(text).join(", "),
+        mobilizationCost: /\bmobiliz/i.test(text) ? (qcMoney(text) || "") : "",
+        jobDescription: "",
+      };
+    },
+    run: (v, ctx) => {
+      const crew = String(v.assignedEmployees || "").split(",").map(s => s.trim()).filter(Boolean);
+      const canPrivate = ctx.user && (ctx.user.isOwner || ctx.user.role === "Manager");
+      const rec = db.create("jobs", {
+        jobTitle: String(v.jobTitle).trim(), clientName: v.clientName || "", jobAddress: v.jobAddress || "",
+        startDate: v.startDate || "", endDate: v.endDate || "", jobStatus: v.jobStatus || "Pending",
+        assignedEmployees: crew, visibility: canPrivate ? "private" : "all",
+        mobilization: num(v.mobilizationCost) > 0, mobilizationCost: num(v.mobilizationCost),
+        jobDescription: v.jobDescription || "",
+      });
+      return {
+        ok: true,
+        message: rec.jobTitle + " created" + (rec.clientName ? " for " + rec.clientName : "") + (rec.startDate ? ", starting " + rec.startDate : "") + (crew.length ? ", crew: " + crew.join(", ") : "") + ".",
+        open: { page: "jobs" }, openLabel: "Open Jobs",
+      };
+    },
+  },
+
+  {
+    id: "schedule_job",
+    label: "Schedule a job",
+    icon: "📅",
+    nav: "jobs",
+    weight: 12,
+    examples: ["schedule Cedar Ridge for Monday through Friday", "push the Miller driveway to next week"],
+    test: t => /\b(schedule|reschedule|rebook|book|move|push|slot|bump)\b/.test(t) && !!qcBest(t, getCol("jobs"), j => j.jobTitle),
+    patterns: [
+      /\b(?:schedule|reschedule|rebook)\b[\s\S]{0,40}\b(?:for|on|to|starting)\b/,
+    ],
+    fields: [
+      { key: "jobId", label: "Job", type: "select", options: () => getCol("jobs").map(j => ({ value: j._id, label: j.jobTitle + (j.clientName ? " · " + j.clientName : "") })), required: true },
+      { key: "startDate", label: "Start date", type: "date", required: true },
+      { key: "endDate", label: "End date", type: "date" },
+      { key: "jobStatus", label: "Status", type: "select", options: ["Pending", "Active", "In Progress", "Completed", "On Hold"] },
+    ],
+    parse: (text) => {
+      const job = qcBest(text, getCol("jobs"), j => j.jobTitle);
+      const range = String(text).split(/\b(?:through|thru|until|til|till|to)\b/);
+      const start = qcDate(range[0]) || qcDate(text);
+      let end = range.length > 1 ? qcDate(range.slice(1).join(" ")) : "";
+      // "monday through friday" reads each weekday from today, so the end can
+      // land before the start — walk it forward a week at a time until it fits.
+      if (start && end && end < start) {
+        const d = new Date(end + "T00:00:00");
+        while (dateStr(d) < start) d.setDate(d.getDate() + 7);
+        end = dateStr(d);
+      }
+      return {
+        jobId: job ? job._id : "",
+        startDate: start,
+        endDate: end && end !== start ? end : (job ? job.endDate || "" : ""),
+        jobStatus: (job && job.jobStatus) || "Pending",
+      };
+    },
+    run: (v) => {
+      const job = db.getById("jobs", v.jobId);
+      if (!job) return { ok: false, message: "Pick which job to schedule." };
+      if (!v.startDate) return { ok: false, message: "Which day does it start?" };
+      db.update("jobs", { ...job, startDate: v.startDate, endDate: v.endDate || "", jobStatus: v.jobStatus || job.jobStatus });
+      return {
+        ok: true,
+        message: job.jobTitle + " scheduled for " + v.startDate + (v.endDate ? " through " + v.endDate : "") + ".",
+        open: { page: "schedule" }, openLabel: "Open Schedule",
+      };
+    },
+  },
+
+  /* ── Field logging ─────────────────────────────────────────────────────── */
+  {
+    id: "log_load",
+    label: "Log a haul load",
+    icon: "⚖️",
+    nav: "haul-loads",
+    weight: 9,
+    examples: ["hauled 3 loads, 42 yards to Cedar Ridge, ticket 88213", "log a load of 18 yards with the T880"],
+    patterns: [
+      /\b(?:hauled|haul|dumped|delivered|log|record)\b[\s\S]{0,24}\b(?:loads?|yards?|yds?|ticket)\b/,
+      /\b(?:scale )?ticket\s*#?\s*\d/,
+    ],
+    fields: [
+      { key: "entryDate", label: "Date", type: "date", required: true },
+      { key: "employeeName", label: "Employee", type: "datalist", options: qcCrewNames },
+      { key: "truck", label: "Truck", type: "datalist", options: () => getCol("equipment").filter(e => e.equipmentType === "Truck" || e.equipmentType === "Semi").map(e => e.equipmentName), required: true },
+      { key: "jobName", label: "Job", type: "datalist", options: () => qcNames("jobs", "jobTitle") },
+      { key: "yards", label: "Yards", type: "number" },
+      { key: "ticketNumber", label: "Ticket #" },
+    ],
+    parse: (text, ctx) => {
+      const truck = qcBest(text, getCol("equipment"), e => e.equipmentName);
+      const job = qcBest(text, getCol("jobs"), j => j.jobTitle);
+      const emp = qcBest(text, getCol("employees"), e => e.fullName);
+      const yards = (qcNorm(text).match(/(\d[\d,]*(?:\.\d+)?)\s*(?:yards?|yds?|cubic yards?)\b/) || [])[1];
+      const ticket = (String(text).match(/ticket\s*#?\s*([A-Za-z0-9-]+)/i) || [])[1];
+      return {
+        entryDate: qcDate(text) || today(),
+        employeeName: emp ? emp.fullName : qcMe(ctx),
+        truck: truck ? truck.equipmentName : "",
+        jobName: job ? job.jobTitle : qcPhrase(text, /\b(?:to|for|at)\s+/i),
+        yards: yards ? parseFloat(yards.replace(/,/g, "")) : "",
+        ticketNumber: ticket || "",
+      };
+    },
+    fromPhoto: (text, ctx) => {
+      const w = qcOcrWeight(text);
+      const truck = qcBest(text, getCol("equipment"), e => e.equipmentName);
+      const job = qcBest(text, getCol("jobs"), j => j.jobTitle);
+      const emp = qcBest(text, getCol("employees"), e => e.fullName);
+      return {
+        entryDate: qcDate(text) || today(),
+        employeeName: emp ? emp.fullName : qcMe(ctx),
+        truck: truck ? truck.equipmentName : "",
+        jobName: job ? job.jobTitle : "",
+        // Tickets weigh in tons as often as they measure yards; keep the number
+        // and let whoever's holding the ticket confirm the column it came from.
+        yards: w ? w.qty : "",
+        ticketNumber: qcOcrTicket(text),
+      };
+    },
+    run: (v) => {
+      const rec = db.create("loads", {
+        entryDate: v.entryDate || today(), employeeName: v.employeeName || "", truck: v.truck || "",
+        jobName: v.jobName || "", yards: num(v.yards), ticketNumber: v.ticketNumber || "",
+      });
+      return {
+        ok: true,
+        message: "Load logged" + (rec.yards ? " — " + rec.yards + " yards" : "") + (rec.truck ? " on " + rec.truck : "") + (rec.jobName ? " to " + rec.jobName : "") + ".",
+        open: { page: "haul-loads" }, openLabel: "Open Haul Loads",
+      };
+    },
+  },
+
+  {
+    id: "add_subcontractor",
+    label: "Add a subcontractor",
+    icon: "🔧",
+    nav: "subcontractors",
+    weight: 6,
+    examples: ["add subcontractor Prairie Electric at $95 an hour"],
+    patterns: [/\b(?:add|create|new|register)\s+(?:a\s+|an\s+|new\s+)*(?:subcontractor|sub|trade|contractor)\b/],
+    fields: [
+      { key: "subcontractorName", label: "Company name", required: true },
+      { key: "contactPerson", label: "Contact person" },
+      { key: "email", label: "Email" },
+      { key: "phoneNumber", label: "Phone" },
+      { key: "hourlyRate", label: "Hourly rate ($)", type: "number" },
+      { key: "specialties", label: "Specialties" },
+    ],
+    parse: (text) => ({
+      subcontractorName: qcTitle(qcQuoted(text) || qcPhrase(text, /\b(?:subcontractor|sub|trade|contractor)\s+(?:named\s+|called\s+)?/i)),
+      contactPerson: qcTitle(qcPhrase(text, /\b(?:contact|attn|ask for)\s*:?\s*/i)),
+      email: qcEmail(text), phoneNumber: qcPhone(text),
+      hourlyRate: qcMoney(text) || "",
+      specialties: qcPhrase(text, /\b(?:for|does|specializes in|specialty)\s+/i, /(?:,|;|\bat\b|\$)/i),
+    }),
+    run: (v) => {
+      const rec = db.create("subcontractors", {
+        subcontractorName: String(v.subcontractorName).trim(), contactPerson: v.contactPerson || "",
+        email: v.email || "", phoneNumber: v.phoneNumber || "", hourlyRate: num(v.hourlyRate),
+        specialties: v.specialties || "",
+      });
+      return { ok: true, message: rec.subcontractorName + " added to Subcontractors.", open: { page: "subcontractors" }, openLabel: "Open Subcontractors" };
+    },
+  },
+
+  {
+    id: "open_page",
+    label: "Open a section",
+    icon: "➡️",
+    nav: null,
+    weight: 0,
+    examples: ["open billing", "go to inventory"],
+    patterns: [/\b(?:open|go to|show me|take me to|jump to|bring up)\b/],
+    fields: [
+      { key: "page", label: "Section", type: "select", options: () => NAV.map(n => ({ value: n.id, label: n.label })), required: true },
+    ],
+    parse: (text) => {
+      const hit = qcBest(text, NAV, n => n.label) || qcBest(text, NAV, n => n.id.replace(/-/g, " "));
+      return { page: hit ? hit.id : "" };
+    },
+    run: (v, ctx) => {
+      if (!v.page) return { ok: false, message: "Which section?" };
+      if (!canAccess(v.page, ctx.user)) return { ok: false, message: "You don't have access to that section." };
+      if (ctx.isMobile) return { ok: false, message: "That section lives in the full app — tap More → Open full app." };
+      const label = (NAV.find(n => n.id === v.page) || {}).label || v.page;
+      return { ok: true, immediate: true, message: "Opening " + label + ".", open: { page: v.page } };
+    },
+  },
+];
+
+/* ── Matching a sentence to an action ─────────────────────────────────────── */
+// Longest match wins, with `weight` separating actions that share vocabulary
+// ("set the mileage" is equipment, not a stock adjustment). Anything that only
+// scrapes by turns into a suggestion rather than a silent wrong guess.
+function qcMatch(text, actions) {
+  const t = qcNorm(text);
+  let best = null, bestScore = 0;
+  (actions || []).forEach(a => {
+    let score = 0;
+    (a.patterns || []).forEach(re => { const m = t.match(re); if (m && m[0].length + (a.weight || 0) > score) score = m[0].length + (a.weight || 0); });
+    if (a.test) { try { if (a.test(t)) score = Math.max(score, 16 + (a.weight || 0)); } catch (e) {} }
+    if (score > bestScore) { bestScore = score; best = a; }
+  });
+  return bestScore > 0 ? best : null;
+}
+
+// When nothing matched, offer the closest few things it *can* do rather than a
+// dead end — the catalog is the only place to learn the vocabulary.
+function qcSuggest(text, actions) {
+  const words = qcNorm(text).split(" ").filter(w => w.length > 2);
+  const scored = (actions || []).map(a => {
+    const hay = qcNorm(a.label + " " + (a.examples || []).join(" "));
+    return { a, n: words.filter(w => hay.includes(w)).length };
+  }).sort((x, y) => y.n - x.n);
+  const top = scored.filter(s => s.n > 0).slice(0, 3).map(s => s.a);
+  return top.length ? top : (actions || []).slice(0, 3);
+}
+
+/* ── The command bar ──────────────────────────────────────────────────────── */
+
+const qcHistory = () => { try { return JSON.parse(storage.get(QC_HISTORY_KEY) || "[]"); } catch (e) { return []; } };
+
+// Wraps the command bar in whatever a given device expects: a centred dialog on
+// a computer, a full-height sheet on a phone (so the keyboard has room and the
+// crew isn't aiming at a small box with gloves on).
+function QuickCommandFrame({ onClose, isMobile, children }) {
+  useEffect(() => {
+    const onKey = e => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  if (isMobile) {
+    return (
+      <div style={{ position: "fixed", inset: 0, zIndex: 300, background: C.bg, display: "flex", flexDirection: "column", paddingTop: "env(safe-area-inset-top)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", borderBottom: "1px solid " + C.border, background: C.surface }}>
+          <span style={{ fontWeight: 800, fontSize: 17 }}>⚡ Quick Command</span>
+          <button type="button" onClick={onClose} style={{ background: "none", border: "none", fontSize: 26, color: C.textMuted, cursor: "pointer", lineHeight: 1 }}>×</button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: 16, paddingBottom: "calc(24px + env(safe-area-inset-bottom))" }}>{children}</div>
+      </div>
+    );
+  }
+  return (
+    <div
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 300, display: "flex", alignItems: "flex-start", justifyContent: "center", overflowY: "auto", padding: "60px 16px 40px" }}
+      onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div style={{ background: C.surface, borderRadius: 16, padding: 24, width: "100%", maxWidth: 640, boxShadow: "0 24px 60px rgba(0,0,0,0.25)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <h3 style={{ fontSize: 18, fontWeight: 800 }}>⚡ Quick Command</h3>
+          <button type="button" onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: C.textMuted, lineHeight: 1 }}>×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function QuickCommand({ onClose }) {
+  const { user } = useAuth();
+  const { company } = useCompany();
+  const { navigate } = useRouter();
+  const isMobile = useIsMobile();
+  const actions = useMemo(() => QC_ACTIONS.filter(a => !a.nav || canAccess(a.nav, user)), [user]);
+
+  const [text, setText] = useState("");
+  const [stage, setStage] = useState("input");     // input → review → done
+  const [action, setAction] = useState(null);
+  const [values, setValues] = useState({});
+  const [showAll, setShowAll] = useState(false);
+  const [error, setError] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+  const [result, setResult] = useState(null);
+  const [listening, setListening] = useState(false);
+  const [history, setHistory] = useState(qcHistory);
+  const [photoText, setPhotoText] = useState("");   // raw text read off a photo
+  const [photoKinds, setPhotoKinds] = useState([]);
+  const [photoKind, setPhotoKind] = useState("");
+  const [showPhotoText, setShowPhotoText] = useState(false);
+  const [scan, setScan] = useState(null);           // { pct, status } while reading
+  const inputRef = useRef(null);
+  const recRef = useRef(null);
+  const fileRef = useRef(null);
+
+  const ctx = { user, company, navigate, isMobile };
+
+  useEffect(() => {
+    const t = setTimeout(() => { if (inputRef.current) inputRef.current.focus(); }, 80);
+    return () => { clearTimeout(t); try { if (recRef.current) recRef.current.abort(); } catch (e) {} };
+  }, []);
+
+  const interpret = (raw) => {
+    const t = String(raw || "").trim();
+    if (!t) return;
+    const a = qcMatch(t, actions);
+    if (!a) {
+      setAction(null);
+      setSuggestions(qcSuggest(t, actions));
+      setError("That doesn't match anything the app can do yet. Try one of these:");
+      return;
+    }
+    let parsed = {};
+    try { parsed = (a.parse ? a.parse(t, ctx) : {}) || {}; } catch (e) { console.error("Quick Command parse:", e); }
+    setError(""); setSuggestions([]);
+    setAction(a); setValues(parsed); setShowAll(false); setStage("review");
+  };
+
+  const runIt = () => {
+    const missing = (action.fields || []).filter(f => f.required && !String(values[f.key] === undefined ? "" : values[f.key]).trim());
+    if (missing.length) { setShowAll(true); setError("Fill in " + missing.map(f => f.label.toLowerCase()).join(" and ") + " first."); return; }
+    let out;
+    try { out = action.run(values, ctx); } catch (e) {
+      console.error("Quick Command run:", e);
+      out = { ok: false, message: "Couldn't finish that — " + (e && e.message ? e.message : e) };
+    }
+    if (!out || out.ok === false) { setError((out && out.message) || "Couldn't finish that."); return; }
+    const entry = text.trim();
+    const next = [entry].concat(history.filter(h => h !== entry)).slice(0, 6);
+    setHistory(next); storage.set(QC_HISTORY_KEY, JSON.stringify(next));
+    notifyData();   // whatever page is open behind this re-reads the store
+    if (out.immediate && out.open && navigate) { navigate(out.open.page, out.open.params || {}); onClose(); return; }
+    setError(""); setResult(out); setStage("done");
+  };
+
+  const reset = () => {
+    setStage("input"); setAction(null); setValues({}); setResult(null); setError(""); setSuggestions([]); setText("");
+    setPhotoText(""); setPhotoKinds([]); setPhotoKind(""); setShowPhotoText(false); setScan(null);
+    setTimeout(() => { if (inputRef.current) inputRef.current.focus(); }, 40);
+  };
+
+  // Point the camera at a ticket or a label instead of typing it. The photo is
+  // read on the device and thrown away; only the fields you confirm get saved.
+  const onPhoto = async (file) => {
+    if (!file) return;
+    setError(""); setSuggestions([]); setScan({ pct: 0, status: "Getting ready…" });
+    try {
+      const raw = await qcReadPhoto(file, (pct, status) => setScan({ pct, status: status || "Reading…" }));
+      setScan(null);
+      if (!qcNorm(raw)) { setError("Couldn't read any text in that photo. Try again with more light and the page filling the frame."); return; }
+      const { kinds, kind } = qcClassifyPhoto(raw, actions, ctx);
+      if (!kind) { setError("Nothing in the app takes a photo like that yet."); return; }
+      setPhotoText(raw); setPhotoKinds(kinds);
+      applyPhotoKind(kind.id, raw);
+    } catch (e) {
+      console.error("Quick Command photo:", e);
+      setScan(null);
+      setError(e && e.message ? e.message : "Couldn't read that photo.");
+    }
+  };
+
+  const applyPhotoKind = (id, raw) => {
+    const a = actions.find(x => x.id === id);
+    if (!a) return;
+    let v = {};
+    try { v = (a.fromPhoto ? a.fromPhoto(raw || photoText, ctx) : {}) || {}; } catch (e) { console.error("Quick Command photo parse:", e); }
+    setPhotoKind(id); setAction(a); setValues(v); setShowAll(false); setStage("review");
+    setText("Photo — " + a.label.toLowerCase());
+  };
+
+  const listen = () => {
+    if (!QC_Speech) return;
+    if (listening) { try { recRef.current && recRef.current.stop(); } catch (e) {} return; }
+    try {
+      const r = new QC_Speech();
+      recRef.current = r;
+      r.lang = navigator.language || "en-CA";
+      r.interimResults = false;
+      r.continuous = false;
+      r.maxAlternatives = 1;
+      r.onresult = e => { const said = e.results[0][0].transcript; setText(said); interpret(said); };
+      r.onerror = () => { setListening(false); setError("Couldn't hear that — check the microphone permission for this site."); };
+      r.onend = () => setListening(false);
+      setListening(true);
+      r.start();
+    } catch (e) { setListening(false); }
+  };
+
+  /* One field of the review card. Every field is editable — the parse is a head
+     start, not a verdict. */
+  const renderField = (f) => {
+    const v = values[f.key] === undefined || values[f.key] === null ? "" : values[f.key];
+    const set = val => setValues(p => Object.assign({}, p, { [f.key]: val }));
+    const opts = typeof f.options === "function" ? f.options() : (f.options || []);
+    let control;
+    if (f.type === "select") {
+      control = (
+        <select value={v} onChange={e => set(e.target.value)} style={isMobile ? mInput : inputCls}>
+          {!opts.some(o => (typeof o === "string" ? o : o.value) === "") && <option value="">Select…</option>}
+          {opts.map((o, i) => {
+            const val = typeof o === "string" ? o : o.value;
+            const lab = typeof o === "string" ? o : o.label;
+            return <option key={i} value={val}>{lab}</option>;
+          })}
+        </select>
+      );
+    } else if (f.type === "datalist") {
+      const id = "qc-dl-" + f.key;
+      control = (
+        <>
+          <input list={id} value={v} onChange={e => set(e.target.value)} placeholder={f.placeholder || ""} style={isMobile ? mInput : inputCls} />
+          <datalist id={id}>{opts.map((o, i) => <option key={i} value={typeof o === "string" ? o : o.value} />)}</datalist>
+        </>
+      );
+    } else if (f.type === "textarea") {
+      control = <textarea value={v} onChange={e => set(e.target.value)} rows={2} placeholder={f.placeholder || ""} style={Object.assign({}, isMobile ? mInput : inputCls, { resize: "vertical", fontFamily: "inherit" })} />;
+    } else if (f.type === "date" || f.type === "time" || f.type === "number") {
+      control = <input type={f.type} step={f.type === "number" ? "any" : undefined} value={v} onChange={e => set(e.target.value)} placeholder={f.placeholder || ""} style={isMobile ? mInput : inputCls} />;
+    } else {
+      control = <input type="text" value={v} onChange={e => set(e.target.value)} placeholder={f.placeholder || ""} style={isMobile ? mInput : inputCls} />;
+    }
+    return (
+      <div key={f.key} style={{ marginBottom: 10 }}>
+        <label style={{ fontSize: 10.5, fontWeight: 700, color: C.textMuted, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+          {f.label}{f.required && <span style={{ color: C.destructive }}> *</span>}
+        </label>
+        {control}
+      </div>
+    );
+  };
+
+  const exampleChips = useMemo(() => {
+    const out = [];
+    actions.forEach(a => { if (a.examples && a.examples[0] && out.length < 6) out.push(a.examples[0]); });
+    return out;
+  }, [actions]);
+
+  const filled = action ? (action.fields || []).filter(f => String(values[f.key] === undefined ? "" : values[f.key]).trim() !== "" || f.required) : [];
+  const rest = action ? (action.fields || []).filter(f => filled.indexOf(f) === -1) : [];
+
+  return (
+    <QuickCommandFrame onClose={onClose} isMobile={isMobile}>
+      {stage === "input" && (
+        <div>
+          <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
+            <input
+              ref={inputRef}
+              value={text}
+              onChange={e => { setText(e.target.value); if (error) { setError(""); setSuggestions([]); } }}
+              onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); interpret(text); } }}
+              placeholder="What do you want to do?"
+              style={Object.assign({}, isMobile ? mInput : inputCls, { fontSize: isMobile ? 16 : 15, padding: isMobile ? "14px" : "12px 14px" })}
+            />
+            {QC_Speech && (
+              <button
+                type="button" onClick={listen} title="Dictate"
+                style={{ flexShrink: 0, width: isMobile ? 52 : 46, borderRadius: 10, cursor: "pointer", fontSize: 18, border: "1px solid " + (listening ? C.destructive : C.border), background: listening ? "#FEF2F2" : C.surfaceAlt, color: listening ? C.destructive : C.text }}
+              >🎤</button>
+            )}
+          </div>
+          {listening && <div style={{ fontSize: 12.5, color: C.destructive, fontWeight: 700, marginTop: 8 }}>Listening… say what you want done.</div>}
+
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+            <button
+              type="button" onClick={() => interpret(text)} disabled={!text.trim() || !!scan}
+              style={Object.assign({}, isMobile ? mBtn : btnPrimary, { flex: 2, opacity: text.trim() && !scan ? 1 : 0.5 })}
+            >Go</button>
+            <button
+              type="button" onClick={() => fileRef.current && fileRef.current.click()} disabled={!!scan}
+              style={Object.assign({}, isMobile ? mBtn : btnOutline, { flex: 1, background: C.surface, color: C.text, border: "1px solid " + C.border, opacity: scan ? 0.5 : 1, whiteSpace: "nowrap" })}
+            >📷 Photo</button>
+          </div>
+          <input
+            ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }}
+            onChange={e => { const f = e.target.files && e.target.files[0]; e.target.value = ""; onPhoto(f); }}
+          />
+
+          {scan && (
+            <div style={{ marginTop: 14, padding: 14, background: C.surfaceAlt, borderRadius: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>Reading the photo… <span style={{ color: C.textMuted, fontWeight: 500 }}>{scan.status}</span></div>
+              <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: Math.round(scan.pct * 100) + "%", background: C.accent, transition: "width .2s" }} />
+              </div>
+              <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 8, lineHeight: 1.5 }}>
+                The first scan downloads the text reader (about 6 MB) — after that it works with no signal.
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div style={{ marginTop: 14, padding: 12, background: "#FEFCE8", border: "1px solid #FDE68A", borderRadius: 10, fontSize: 13, color: "#92400E" }}>{error}</div>
+          )}
+
+          {(suggestions.length ? suggestions : []).map(a => (
+            <button key={a.id} type="button" onClick={() => { setText(a.examples[0]); interpret(a.examples[0]); }}
+              style={{ display: "block", width: "100%", textAlign: "left", marginTop: 8, padding: "10px 12px", border: "1px solid " + C.border, borderRadius: 10, background: C.surface, cursor: "pointer", fontSize: 13 }}>
+              <span style={{ marginRight: 8 }}>{a.icon}</span><strong>{a.label}</strong>
+              <div style={{ color: C.textMuted, fontSize: 12, marginTop: 2 }}>“{a.examples[0]}”</div>
+            </button>
+          ))}
+
+          {history.length > 0 && !error && (
+            <div style={{ marginTop: 18 }}>
+              <div style={{ fontSize: 10.5, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 6 }}>Recent</div>
+              {history.map((h, i) => (
+                <button key={i} type="button" onClick={() => { setText(h); interpret(h); }}
+                  style={{ display: "block", width: "100%", textAlign: "left", padding: "8px 10px", border: "none", borderRadius: 8, background: "transparent", cursor: "pointer", fontSize: 13, color: C.text }}>
+                  ↺ {h}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {!error && (
+            <div style={{ marginTop: 18 }}>
+              <div style={{ fontSize: 10.5, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 6 }}>Things you can say</div>
+              {exampleChips.map((ex, i) => (
+                <button key={i} type="button" onClick={() => { setText(ex); interpret(ex); }}
+                  style={{ display: "block", width: "100%", textAlign: "left", padding: "8px 10px", marginBottom: 2, border: "none", borderRadius: 8, background: C.surfaceAlt, cursor: "pointer", fontSize: 13, color: C.text }}>
+                  “{ex}”
+                </button>
+              ))}
+              <p style={{ fontSize: 11.5, color: C.textMuted, marginTop: 10, lineHeight: 1.5 }}>
+                Or tap <strong>📷 Photo</strong> to read a scale ticket, delivery slip, material label,
+                odometer or business card instead of typing it.
+              </p>
+              <p style={{ fontSize: 11.5, color: C.textMuted, marginTop: 6, lineHeight: 1.5 }}>
+                All of it runs on this device — nothing is sent anywhere, and it works with no signal.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {stage === "review" && action && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: C.surfaceAlt, borderRadius: 10, marginBottom: 14 }}>
+            <span style={{ fontSize: 20 }}>{action.icon}</span>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 800, fontSize: 14 }}>{action.label}</div>
+              <div style={{ fontSize: 12, color: C.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>“{text}”</div>
+            </div>
+          </div>
+
+          {photoText && photoKinds.length > 1 && (
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10.5, fontWeight: 700, color: C.textMuted, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.5px" }}>What is this photo?</label>
+              <select value={photoKind} onChange={e => applyPhotoKind(e.target.value)} style={isMobile ? mInput : inputCls}>
+                {photoKinds.map(k => <option key={k.id} value={k.id}>{k.label}</option>)}
+              </select>
+            </div>
+          )}
+
+          {filled.map(renderField)}
+
+          {rest.length > 0 && !showAll && (
+            <button type="button" onClick={() => setShowAll(true)}
+              style={{ background: "none", border: "none", color: C.accent, fontWeight: 700, fontSize: 12.5, cursor: "pointer", padding: "4px 0", marginBottom: 8 }}>
+              + Add more details ({rest.length})
+            </button>
+          )}
+          {showAll && rest.map(renderField)}
+
+          {/* Everything the camera actually read, so a wrong-looking number can
+              be checked against the slip without starting over. */}
+          {photoText && (
+            <div style={{ marginTop: 6 }}>
+              <button type="button" onClick={() => setShowPhotoText(v => !v)}
+                style={{ background: "none", border: "none", color: C.textMuted, fontWeight: 700, fontSize: 12, cursor: "pointer", padding: "4px 0" }}>
+                {showPhotoText ? "▾" : "▸"} Text read from the photo
+              </button>
+              {showPhotoText && (
+                <pre style={{ margin: "4px 0 8px", padding: 10, background: C.surfaceAlt, borderRadius: 8, fontSize: 11.5, lineHeight: 1.5, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", color: C.textMuted, fontFamily: "ui-monospace, Menlo, Consolas, monospace" }}>{photoText.trim()}</pre>
+              )}
+            </div>
+          )}
+
+          {error && <div style={{ margin: "6px 0 10px", padding: 10, background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 8, fontSize: 12.5, color: "#991B1B" }}>{error}</div>}
+
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+            <button type="button" onClick={reset} style={Object.assign({}, isMobile ? mBtn : btnOutline, { flex: 1, background: C.surface, color: C.text, border: "1px solid " + C.border })}>Back</button>
+            <button type="button" onClick={runIt} style={Object.assign({}, isMobile ? mBtn : btnPrimary, { flex: 2 })}>Do it</button>
+          </div>
+        </div>
+      )}
+
+      {stage === "done" && result && (
+        <div>
+          <div style={{ textAlign: "center", padding: "10px 0 16px" }}>
+            <div style={{ fontSize: 40, lineHeight: 1 }}>✅</div>
+            <div style={{ fontSize: 14.5, fontWeight: 600, marginTop: 10, lineHeight: 1.5 }}>{result.message}</div>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {result.open && navigate && !isMobile && (
+              <button type="button" onClick={() => { navigate(result.open.page, result.open.params || {}); onClose(); }}
+                style={Object.assign({}, btnSecondary, { flex: 1 })}>{result.openLabel || "Open it"}</button>
+            )}
+            <button type="button" onClick={reset} style={Object.assign({}, isMobile ? mBtn : btnOutline, { flex: 1, background: C.surface, color: C.text, border: "1px solid " + C.border })}>Do another</button>
+            <button type="button" onClick={onClose} style={Object.assign({}, isMobile ? mBtn : btnPrimary, { flex: 1 })}>Done</button>
+          </div>
+        </div>
+      )}
+    </QuickCommandFrame>
+  );
+}
+
+// Opening the bar from anywhere: a button, or ⌘K / Ctrl-K on a keyboard.
+function useQuickCommand() {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const onKey = e => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) { e.preventDefault(); setOpen(o => !o); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  return [open, setOpen];
+}
+
 function Sidebar({ open, onClose }) {
   const { page, navigate } = useRouter();
   const { company } = useCompany();
@@ -6940,7 +8645,7 @@ function MobilePhotos() {
   );
 }
 
-function MobileMore() {
+function MobileMore({ onQuickCommand }) {
   const { user, logout } = useAuth();
   const { company } = useCompany();
   const install = useInstallPrompt();
@@ -6959,6 +8664,10 @@ function MobileMore() {
         <div style={{ fontSize: 13, color: C.textMuted }}>{user?.email}</div>
         <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{company?.companyName} · {user?.role}</div>
       </div>
+      <button type="button" onClick={onQuickCommand} style={{ ...mBtn, background: C.secondary, color: "#fff", marginBottom: 12, fontSize: 15 }}>⚡  Quick Command</button>
+      <p style={{ fontSize: 12, color: C.textMuted, margin: "-6px 2px 14px", lineHeight: 1.5 }}>
+        Say or type what you need done — “log 6 hours on the Miller driveway”, “received 40 tons of gravel” — and it's entered for you.
+      </p>
       <button type="button" onClick={() => setMyHours(true)} style={{ ...mBtn, background: C.surface, color: C.text, border: "1px solid " + C.border, marginBottom: 12, fontSize: 15 }}>📊  My Hours</button>
       {isStandalone()
         ? <div style={{ ...mCard, textAlign: "center", color: C.green, fontWeight: 700, fontSize: 14 }}>✓ Running as an installed app</div>
@@ -6975,6 +8684,7 @@ function MobileMore() {
 function MobileShell() {
   const { user } = useAuth();
   const { company } = useCompany();
+  const [cmdOpen, setCmdOpen] = useQuickCommand();
   // Persist the active tab so an iOS app-reload (e.g. after the camera) returns here.
   const [tab, setTabState] = useState(() => storage.get("bmb_mtab") || "track");
   const setTab = v => { setTabState(v); storage.set("bmb_mtab", v); };
@@ -6998,7 +8708,11 @@ function MobileShell() {
             <div style={{ fontSize: 11, opacity: .6 }}>{company?.companyName || "BuildMyBill"}</div>
           </div>
         </div>
-        <div style={{ fontSize: 12, opacity: .8, maxWidth: 120, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{user?.name}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ fontSize: 12, opacity: .8, maxWidth: 96, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{user?.name}</div>
+          <button type="button" onClick={() => setCmdOpen(true)} aria-label="Quick Command"
+            style={{ flexShrink: 0, width: 38, height: 38, borderRadius: 12, border: "none", background: "rgba(255,255,255,0.16)", color: "#fff", fontSize: 19, cursor: "pointer" }}>⚡</button>
+        </div>
       </div>
       <div className="mmain">
         <MobileInstallBanner />
@@ -7006,7 +8720,7 @@ function MobileShell() {
         {tab === "log" && (can("daily-log") ? <MobileDailyLog /> : <MobileLocked />)}
         {tab === "schedule" && (can("schedule") ? <MobileSchedule /> : <MobileLocked />)}
         {tab === "photos" && (can("jobs") ? <MobilePhotos /> : <MobileLocked />)}
-        {tab === "more" && <MobileMore />}
+        {tab === "more" && <MobileMore onQuickCommand={() => setCmdOpen(true)} />}
       </div>
       <div className="mtabbar">
         {TABS.map(t => (
@@ -7015,6 +8729,7 @@ function MobileShell() {
           </button>
         ))}
       </div>
+      {cmdOpen && <QuickCommand onClose={() => setCmdOpen(false)} />}
     </div>
   );
 }
@@ -7023,6 +8738,7 @@ function AppShell() {
   const { page, navigate } = useRouter();
   const { user, isAuthenticated, pending, noAccess, ready, dataReady } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [cmdOpen, setCmdOpen] = useQuickCommand();
   const dataVersion = useDataVersion();
   const isMobile = useIsMobile();
 
@@ -7050,8 +8766,13 @@ function AppShell() {
         <div className="topbar">
           <button type="button" onClick={() => setMenuOpen(o => !o)} aria-label="Menu" style={{ background: "rgba(255,255,255,0.12)", border: "none", color: "#fff", fontSize: 18, borderRadius: 8, width: 36, height: 36, cursor: "pointer" }}>☰</button>
           <span style={{ fontWeight: 700, fontSize: 15 }}>{label}</span>
+          <button type="button" onClick={() => setCmdOpen(true)} title="Type what you want to do (Ctrl+K)"
+            style={{ marginLeft: "auto", background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 8 }}>
+            ⚡ Quick Command
+            <span style={{ fontSize: 10.5, opacity: 0.7, border: "1px solid rgba(255,255,255,0.35)", borderRadius: 4, padding: "1px 5px" }}>Ctrl K</span>
+          </button>
           <button type="button" onClick={() => { storage.remove(FORCE_DESKTOP_KEY); storage.set(FORCE_MOBILE_KEY, "1"); window.location.reload(); }}
-            style={{ marginLeft: "auto", background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>📱 Field view</button>
+            style={{ background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>📱 Field view</button>
         </div>
         {/* key includes dataVersion so a rolled-back background write re-reads the store */}
         <main className="app-main" key={page + ":" + dataVersion}>
@@ -7068,6 +8789,7 @@ function AppShell() {
             )}
         </main>
       </div>
+      {cmdOpen && <QuickCommand onClose={() => setCmdOpen(false)} />}
     </div>
   );
 }
