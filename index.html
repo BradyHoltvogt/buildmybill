@@ -5307,6 +5307,166 @@ function qcCrew(text) {
    their permissions already allow. Adding a command here is all it takes for
    the parser, the review card, and the examples list to pick it up. */
 
+/* ── Reading a photo ──────────────────────────────────────────────────────────
+   Point the camera at a scale ticket, a delivery slip, a material label or an
+   odometer instead of typing the numbers in. The text recognition is Tesseract
+   (the long-standing open-source OCR engine, vendored in vendor/tesseract/), so
+   the photo never leaves the phone and no account or key is involved.
+
+   It's ~6 MB the first time someone scans — deliberately NOT part of the app
+   shell, so the 99% of sessions that never scan anything don't pay for it. The
+   service worker caches it on the way past, which means the second scan works
+   with no signal at all. */
+
+const QC_OCR_BASE = "vendor/tesseract/";
+let qcOcrScript = null;
+
+function qcLoadOcr() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (qcOcrScript) return qcOcrScript;
+  qcOcrScript = new Promise((resolve, reject) => {
+    const el = document.createElement("script");
+    el.src = QC_OCR_BASE + "tesseract.min.js";
+    el.onload = () => (window.Tesseract ? resolve(window.Tesseract) : reject(new Error("Text recognition failed to start.")));
+    el.onerror = () => { qcOcrScript = null; reject(new Error("Couldn't load text recognition — you may be offline and haven't scanned before.")); };
+    document.head.appendChild(el);
+  });
+  return qcOcrScript;
+}
+
+// Photo → plain text. `onProgress` gets 0–1 so the wait is visible; a phone
+// photo takes a few seconds and silence reads as a hang.
+async function qcReadPhoto(file, onProgress) {
+  const T = await qcLoadOcr();
+  const img = await downscaleImage(file, 1800, 0.92);
+  let worker = null;
+  try {
+    worker = await T.createWorker("eng", 1, {
+      workerPath: QC_OCR_BASE + "worker.min.js",
+      corePath: QC_OCR_BASE,
+      langPath: QC_OCR_BASE,
+      gzip: false,
+      logger: m => {
+        if (!onProgress) return;
+        // Loading the engine is the slow half of a first scan; show it as such.
+        const share = m.status === "recognizing text" ? 0.5 + 0.5 * (m.progress || 0) : 0.5 * (m.progress || 0);
+        onProgress(Math.max(0, Math.min(1, share)), m.status || "");
+      },
+    });
+    const res = await worker.recognize(img);
+    return (res && res.data && res.data.text) || "";
+  } finally {
+    if (worker) { try { await worker.terminate(); } catch (e) {} }
+  }
+}
+
+/* ── Pulling values off a scanned document ────────────────────────────────── */
+
+const qcLines = text => String(text || "").split(/\r?\n/).map(s => s.replace(/\s+/g, " ").trim()).filter(Boolean);
+
+// OCR turns O into 0 and l into 1 as often as not, so read money off the line
+// that says "total" first and only fall back to "the biggest number that looks
+// like money" — which is right on a receipt far more often than it's wrong.
+function qcOcrMoney(text) {
+  const labelled = qcLines(text).filter(l => /\b(total|amount due|balance|grand total|subtotal)\b/i.test(l));
+  for (const l of labelled) { const v = qcMoney(l); if (v > 0) return v; }
+  let best = 0;
+  qcLines(text).forEach(l => {
+    const m = l.match(/\$?\s?\d[\d,]*\.\d{2}\b/g) || [];
+    m.forEach(x => { const v = parseFloat(x.replace(/[^0-9.]/g, "")); if (v > best) best = v; });
+  });
+  return best;
+}
+
+function qcOcrTicket(text) {
+  const m = String(text).match(/\b(?:scale\s*)?ticket\s*(?:no\.?|number|#)?\s*[:#]?\s*([A-Z0-9][A-Z0-9-]{2,})/i)
+    || String(text).match(/\b(?:ticket|tkt)\s*[:#]\s*([A-Z0-9-]{3,})/i);
+  return m ? m[1].trim() : "";
+}
+
+// Scale tickets print gross / tare / net; net is the number that gets billed.
+function qcOcrWeight(text) {
+  const lines = qcLines(text);
+  const net = lines.filter(l => /\bnet\b/i.test(l));
+  const pick = ls => {
+    for (const l of ls) {
+      const m = l.match(/(\d[\d,]*(?:\.\d+)?)\s*(tons?|tonnes?|t\b|yards?|yds?|cu\.?\s?yds?|lbs?|kg)/i);
+      if (m) return { qty: parseFloat(m[1].replace(/,/g, "")), unit: m[2].toLowerCase() };
+    }
+    return null;
+  };
+  return pick(net) || pick(lines) || qcQty(text);
+}
+
+// The vendor is nearly always the biggest thing at the top of the slip: take
+// the first line that reads like a name rather than an address or a number.
+function qcOcrVendor(text) {
+  const lines = qcLines(text).slice(0, 6);
+  for (const l of lines) {
+    const letters = (l.match(/[A-Za-z]/g) || []).length;
+    const digits = (l.match(/\d/g) || []).length;
+    if (letters >= 4 && digits <= 2 && l.length <= 46 && !/\b(invoice|receipt|ticket|date|time|phone|fax)\b/i.test(l)) {
+      return qcTitle(l.toLowerCase());
+    }
+  }
+  return "";
+}
+
+function qcOcrNumberNear(text, labelRe) {
+  for (const l of qcLines(text)) {
+    if (!labelRe.test(l)) continue;
+    const m = l.match(/(\d[\d,]*(?:\.\d+)?)/);
+    if (m) return parseFloat(m[1].replace(/,/g, ""));
+  }
+  return "";
+}
+
+/* ── What kind of document is this? ──────────────────────────────────────────
+   Scored rather than a chain of ifs, so a slip that looks like two things picks
+   the stronger read — and the answer is a dropdown on the review card either
+   way, because a bad guess should cost one tap, not a wrong record. */
+const QC_PHOTO_KINDS = [
+  {
+    id: "log_load", label: "Scale ticket / load slip",
+    score: t => (/\bscale\b/.test(t) ? 3 : 0) + (/\bticket\b/.test(t) ? 3 : 0)
+      + (/\b(gross|tare|net)\b/.test(t) ? 3 : 0) + (/\b(tons?|tonnes?|yards?|yds?)\b/.test(t) ? 2 : 0),
+  },
+  {
+    id: "update_inventory", label: "Delivery slip for material you stock",
+    score: (t, ctx) => (qcBest(t, getCol("inventory"), i => i.materialName) ? 4 : 0)
+      + (/\b(delivered|delivery|received|packing slip|bill of lading)\b/.test(t) ? 3 : 0)
+      + (qcQty(t) ? 1 : 0),
+  },
+  {
+    id: "add_inventory", label: "Receipt / label for something new",
+    score: t => (/\b(receipt|invoice|sold to|qty|quantity|item|sku|part\s*(no|#))\b/.test(t) ? 3 : 0)
+      + (qcOcrMoney(t) > 0 ? 2 : 0),
+  },
+  {
+    id: "update_equipment", label: "Odometer / hour meter",
+    score: t => (/\b(odometer|odo|hour meter|hourmeter|hobbs|engine hours)\b/.test(t) ? 6 : 0)
+      + (/\b(km|kms|miles|mi|hrs|hours)\b/.test(t) ? 1 : 0),
+  },
+  {
+    id: "add_client", label: "Business card / contact details",
+    score: t => (qcEmail(t) ? 3 : 0) + (qcPhone(t) ? 3 : 0)
+      + (/\b(cell|mobile|office|tel|www\.|\.com|\.ca)\b/.test(t) ? 2 : 0)
+      - (/\b(total|ticket|qty|net|tare)\b/.test(t) ? 4 : 0),
+  },
+];
+
+function qcClassifyPhoto(text, actions, ctx) {
+  const t = qcNorm(text);
+  const allowed = QC_PHOTO_KINDS.filter(k => actions.some(a => a.id === k.id));
+  let best = null, bestScore = 0;
+  allowed.forEach(k => {
+    let s = 0;
+    try { s = k.score(t, ctx) || 0; } catch (e) {}
+    if (s > bestScore) { bestScore = s; best = k; }
+  });
+  return { kinds: allowed, kind: best || allowed[0] || null };
+}
+
 const QC_ACTIONS = [
   /* ── Quotes & invoices ─────────────────────────────────────────────────── */
   {
@@ -5693,6 +5853,20 @@ const QC_ACTIONS = [
       if (/\b(note|noted|notes)\b/.test(t)) v.maintenanceNotes = qcPhrase(text, /\bnotes?d?\s*:?\s*/i, null);
       return v;
     },
+    fromPhoto: (text) => {
+      const eq = qcBest(text, getCol("equipment"), e => e.equipmentName);
+      const km = qcOcrNumberNear(text, /\b(odometer|odo|km|kms|miles|mi)\b/i);
+      const hrs = qcOcrNumberNear(text, /\b(hour meter|hourmeter|hobbs|engine hours|hrs?)\b/i);
+      // A dash photo is usually one big number and nothing else — if no label
+      // was readable, take the largest number and let the label decide later.
+      const bare = km === "" && hrs === "" ? qcLines(text).map(l => (l.match(/\d[\d,]*/g) || []).map(x => parseFloat(x.replace(/,/g, "")))).flat().sort((a, b) => b - a)[0] : "";
+      return {
+        equipmentId: eq ? eq._id : "",
+        currentMileage: km !== "" ? km : (bare || ""),
+        totalHours: hrs !== "" ? hrs : "",
+        lastServiceDate: "", billingRatePerHour: "", warehouse: "", maintenanceNotes: "",
+      };
+    },
     run: (v) => {
       const eq = db.getById("equipment", v.equipmentId);
       if (!eq) return { ok: false, message: "Pick which equipment item this is about." };
@@ -5799,6 +5973,19 @@ const QC_ACTIONS = [
         note: job ? job.jobTitle : qcPhrase(text, /\b(?:from|for)\s+/i),
       };
     },
+    fromPhoto: (text) => {
+      const item = qcBest(text, getCol("inventory"), i => i.materialName);
+      const w = qcOcrWeight(text);
+      const vendor = qcOcrVendor(text);
+      const ticket = qcOcrTicket(text);
+      return {
+        inventoryId: item ? item._id : "",
+        movement: "Received",
+        quantity: w ? w.qty : "",
+        entryDate: qcDate(text) || today(),
+        note: [vendor, ticket && "ticket " + ticket].filter(Boolean).join(" · "),
+      };
+    },
     run: (v, ctx) => {
       const item = db.getById("inventory", v.inventoryId);
       if (!item) return { ok: false, message: "Pick which material this is about." };
@@ -5859,6 +6046,32 @@ const QC_ACTIONS = [
         warehouse: wh ? wh.warehouseName : "", binLocation: "", supplier: "",
       };
     },
+    fromPhoto: (text) => {
+      const w = qcOcrWeight(text) || qcQty(text);
+      const total = qcOcrMoney(text);
+      const wh = getCol("warehouses")[0];
+      const vendor = qcOcrVendor(text);
+      // A labelled "Product:" line is the material; without one, skip the
+      // letterhead at the top (that's the supplier, not the thing being bought)
+      // and offer the best remaining line for correction.
+      const lines = qcLines(text);
+      const labelled = lines.map(l => (l.match(/\b(?:product|item|description|material|commodity)\s*[:\-]\s*(.+)$/i) || [])[1]).filter(Boolean)[0];
+      const nameLine = labelled || lines.slice(1).find(l =>
+        /[A-Za-z]{4}/.test(l)
+        && qcNorm(l) !== qcNorm(vendor)
+        && !/\b(total|subtotal|tax|gst|pst|invoice|receipt|date|time|ticket|gross|tare|net|thank|hauler|driver)\b/i.test(l)
+        && (l.match(/\d/g) || []).length <= 4);
+      return {
+        materialName: nameLine ? qcTitle(String(nameLine).toLowerCase().trim()).slice(0, 60) : "",
+        currentStock: w ? w.qty : "",
+        unitOfMeasure: w ? w.unit : "",
+        unitPrice: w && w.qty > 0 && total > 0 ? +(total / w.qty).toFixed(2) : (total || ""),
+        reorderPoint: "",
+        warehouse: wh ? wh.warehouseName : "",
+        binLocation: "",
+        supplier: vendor,
+      };
+    },
     run: (v) => {
       const rec = db.create("inventory", {
         materialName: String(v.materialName).trim(), currentStock: num(v.currentStock),
@@ -5900,6 +6113,21 @@ const QC_ACTIONS = [
       billingAddress: qcPhrase(text, /\b(?:address|located at|bill to)\s*:?\s*/i, /(?:,\s*(?:phone|email)|;|\bemail\b|\bphone\b)/i),
       notes: "",
     }),
+    fromPhoto: (text) => {
+      const lines = qcLines(text);
+      const email = qcEmail(text);
+      // On a card the company sits at the top and the person's name just under
+      // it; the lines carrying contact details are never either of those.
+      const plain = lines.filter(l => !qcEmail(l) && !qcPhone(l) && !/\b(www\.|http|tel|cell|mobile|fax|office)\b/i.test(l) && /[A-Za-z]{3}/.test(l));
+      return {
+        clientName: plain[0] ? qcTitle(plain[0].toLowerCase()).slice(0, 60) : "",
+        contactPerson: plain[1] ? qcTitle(plain[1].toLowerCase()).slice(0, 60) : "",
+        emailAddress: email,
+        phoneNumber: qcPhone(text),
+        billingAddress: lines.filter(l => /\d{1,6}\s+[A-Za-z]/.test(l) && !qcPhone(l))[0] || "",
+        notes: "",
+      };
+    },
     run: (v) => {
       const rec = db.create("clients", {
         clientName: String(v.clientName).trim(), contactPerson: v.contactPerson || "",
@@ -6052,6 +6280,22 @@ const QC_ACTIONS = [
         jobName: job ? job.jobTitle : qcPhrase(text, /\b(?:to|for|at)\s+/i),
         yards: yards ? parseFloat(yards.replace(/,/g, "")) : "",
         ticketNumber: ticket || "",
+      };
+    },
+    fromPhoto: (text, ctx) => {
+      const w = qcOcrWeight(text);
+      const truck = qcBest(text, getCol("equipment"), e => e.equipmentName);
+      const job = qcBest(text, getCol("jobs"), j => j.jobTitle);
+      const emp = qcBest(text, getCol("employees"), e => e.fullName);
+      return {
+        entryDate: qcDate(text) || today(),
+        employeeName: emp ? emp.fullName : qcMe(ctx),
+        truck: truck ? truck.equipmentName : "",
+        jobName: job ? job.jobTitle : "",
+        // Tickets weigh in tons as often as they measure yards; keep the number
+        // and let whoever's holding the ticket confirm the column it came from.
+        yards: w ? w.qty : "",
+        ticketNumber: qcOcrTicket(text),
       };
     },
     run: (v) => {
@@ -6211,8 +6455,14 @@ function QuickCommand({ onClose }) {
   const [result, setResult] = useState(null);
   const [listening, setListening] = useState(false);
   const [history, setHistory] = useState(qcHistory);
+  const [photoText, setPhotoText] = useState("");   // raw text read off a photo
+  const [photoKinds, setPhotoKinds] = useState([]);
+  const [photoKind, setPhotoKind] = useState("");
+  const [showPhotoText, setShowPhotoText] = useState(false);
+  const [scan, setScan] = useState(null);           // { pct, status } while reading
   const inputRef = useRef(null);
   const recRef = useRef(null);
+  const fileRef = useRef(null);
 
   const ctx = { user, company, navigate, isMobile };
 
@@ -6254,7 +6504,40 @@ function QuickCommand({ onClose }) {
     setError(""); setResult(out); setStage("done");
   };
 
-  const reset = () => { setStage("input"); setAction(null); setValues({}); setResult(null); setError(""); setSuggestions([]); setText(""); setTimeout(() => { if (inputRef.current) inputRef.current.focus(); }, 40); };
+  const reset = () => {
+    setStage("input"); setAction(null); setValues({}); setResult(null); setError(""); setSuggestions([]); setText("");
+    setPhotoText(""); setPhotoKinds([]); setPhotoKind(""); setShowPhotoText(false); setScan(null);
+    setTimeout(() => { if (inputRef.current) inputRef.current.focus(); }, 40);
+  };
+
+  // Point the camera at a ticket or a label instead of typing it. The photo is
+  // read on the device and thrown away; only the fields you confirm get saved.
+  const onPhoto = async (file) => {
+    if (!file) return;
+    setError(""); setSuggestions([]); setScan({ pct: 0, status: "Getting ready…" });
+    try {
+      const raw = await qcReadPhoto(file, (pct, status) => setScan({ pct, status: status || "Reading…" }));
+      setScan(null);
+      if (!qcNorm(raw)) { setError("Couldn't read any text in that photo. Try again with more light and the page filling the frame."); return; }
+      const { kinds, kind } = qcClassifyPhoto(raw, actions, ctx);
+      if (!kind) { setError("Nothing in the app takes a photo like that yet."); return; }
+      setPhotoText(raw); setPhotoKinds(kinds);
+      applyPhotoKind(kind.id, raw);
+    } catch (e) {
+      console.error("Quick Command photo:", e);
+      setScan(null);
+      setError(e && e.message ? e.message : "Couldn't read that photo.");
+    }
+  };
+
+  const applyPhotoKind = (id, raw) => {
+    const a = actions.find(x => x.id === id);
+    if (!a) return;
+    let v = {};
+    try { v = (a.fromPhoto ? a.fromPhoto(raw || photoText, ctx) : {}) || {}; } catch (e) { console.error("Quick Command photo parse:", e); }
+    setPhotoKind(id); setAction(a); setValues(v); setShowAll(false); setStage("review");
+    setText("Photo — " + a.label.toLowerCase());
+  };
 
   const listen = () => {
     if (!QC_Speech) return;
@@ -6348,10 +6631,32 @@ function QuickCommand({ onClose }) {
           </div>
           {listening && <div style={{ fontSize: 12.5, color: C.destructive, fontWeight: 700, marginTop: 8 }}>Listening… say what you want done.</div>}
 
-          <button
-            type="button" onClick={() => interpret(text)} disabled={!text.trim()}
-            style={Object.assign({}, isMobile ? mBtn : btnPrimary, { marginTop: 12, width: "100%", opacity: text.trim() ? 1 : 0.5 })}
-          >Go</button>
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+            <button
+              type="button" onClick={() => interpret(text)} disabled={!text.trim() || !!scan}
+              style={Object.assign({}, isMobile ? mBtn : btnPrimary, { flex: 2, opacity: text.trim() && !scan ? 1 : 0.5 })}
+            >Go</button>
+            <button
+              type="button" onClick={() => fileRef.current && fileRef.current.click()} disabled={!!scan}
+              style={Object.assign({}, isMobile ? mBtn : btnOutline, { flex: 1, background: C.surface, color: C.text, border: "1px solid " + C.border, opacity: scan ? 0.5 : 1, whiteSpace: "nowrap" })}
+            >📷 Photo</button>
+          </div>
+          <input
+            ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }}
+            onChange={e => { const f = e.target.files && e.target.files[0]; e.target.value = ""; onPhoto(f); }}
+          />
+
+          {scan && (
+            <div style={{ marginTop: 14, padding: 14, background: C.surfaceAlt, borderRadius: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>Reading the photo… <span style={{ color: C.textMuted, fontWeight: 500 }}>{scan.status}</span></div>
+              <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: Math.round(scan.pct * 100) + "%", background: C.accent, transition: "width .2s" }} />
+              </div>
+              <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 8, lineHeight: 1.5 }}>
+                The first scan downloads the text reader (about 6 MB) — after that it works with no signal.
+              </div>
+            </div>
+          )}
 
           {error && (
             <div style={{ marginTop: 14, padding: 12, background: "#FEFCE8", border: "1px solid #FDE68A", borderRadius: 10, fontSize: 13, color: "#92400E" }}>{error}</div>
@@ -6387,7 +6692,11 @@ function QuickCommand({ onClose }) {
                 </button>
               ))}
               <p style={{ fontSize: 11.5, color: C.textMuted, marginTop: 10, lineHeight: 1.5 }}>
-                Runs on this device — nothing is sent anywhere, and it works with no signal.
+                Or tap <strong>📷 Photo</strong> to read a scale ticket, delivery slip, material label,
+                odometer or business card instead of typing it.
+              </p>
+              <p style={{ fontSize: 11.5, color: C.textMuted, marginTop: 6, lineHeight: 1.5 }}>
+                All of it runs on this device — nothing is sent anywhere, and it works with no signal.
               </p>
             </div>
           )}
@@ -6404,6 +6713,15 @@ function QuickCommand({ onClose }) {
             </div>
           </div>
 
+          {photoText && photoKinds.length > 1 && (
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10.5, fontWeight: 700, color: C.textMuted, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.5px" }}>What is this photo?</label>
+              <select value={photoKind} onChange={e => applyPhotoKind(e.target.value)} style={isMobile ? mInput : inputCls}>
+                {photoKinds.map(k => <option key={k.id} value={k.id}>{k.label}</option>)}
+              </select>
+            </div>
+          )}
+
           {filled.map(renderField)}
 
           {rest.length > 0 && !showAll && (
@@ -6413,6 +6731,20 @@ function QuickCommand({ onClose }) {
             </button>
           )}
           {showAll && rest.map(renderField)}
+
+          {/* Everything the camera actually read, so a wrong-looking number can
+              be checked against the slip without starting over. */}
+          {photoText && (
+            <div style={{ marginTop: 6 }}>
+              <button type="button" onClick={() => setShowPhotoText(v => !v)}
+                style={{ background: "none", border: "none", color: C.textMuted, fontWeight: 700, fontSize: 12, cursor: "pointer", padding: "4px 0" }}>
+                {showPhotoText ? "▾" : "▸"} Text read from the photo
+              </button>
+              {showPhotoText && (
+                <pre style={{ margin: "4px 0 8px", padding: 10, background: C.surfaceAlt, borderRadius: 8, fontSize: 11.5, lineHeight: 1.5, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", color: C.textMuted, fontFamily: "ui-monospace, Menlo, Consolas, monospace" }}>{photoText.trim()}</pre>
+              )}
+            </div>
+          )}
 
           {error && <div style={{ margin: "6px 0 10px", padding: 10, background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 8, fontSize: 12.5, color: "#991B1B" }}>{error}</div>}
 
