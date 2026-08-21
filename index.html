@@ -217,7 +217,7 @@ const COLLECTIONS = [
   "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
   "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs", "quote_docs",
   "sites", "loads", "activeclocks", "locationpings", "equipmentlogs", "shiftrequests",
-  "inventorylogs",
+  "inventorylogs", "zones",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -390,6 +390,77 @@ function logInventoryMovement({ inventoryId, materialName, type, quantity, note,
 // A material is flagged low the moment its stock reaches (or drops under) the
 // reorder point someone set for it — no reorder point means no alert.
 const isLowStock = i => i && i.reorderPoint !== undefined && i.reorderPoint !== "" && num(i.currentStock) <= num(i.reorderPoint);
+
+/* ─── Warehouse layout & storage zones ───────────────────────────────────────
+   A warehouse's floor plan is a coarse grid of cells (cols × rows). Every rack
+   / bin / pile on that plan is its own `zones` record carrying its own x/y/w/h
+   in grid cells, plus a capacity.
+
+   The spec sketched the zone rectangles BOTH as a layout blob on the warehouse
+   AND as coordinates on the zone. Storing them twice guarantees drift, so the
+   zone record is the single source of truth for its own rectangle, and the
+   warehouse's `layout` field holds the genuinely warehouse-level part: the size
+   of the grid those zones sit on. Reading a layout = warehouse.layout + its
+   zones, which is exactly what LayoutCanvas takes.
+──────────────────────────────────────────────────────────────────────────────*/
+const DEFAULT_LAYOUT = { cols: 20, rows: 12 };
+const whLayout = wh => {
+  const l = (wh && wh.layout) || {};
+  return {
+    cols: Math.max(4, Math.min(60, num(l.cols) || DEFAULT_LAYOUT.cols)),
+    rows: Math.max(4, Math.min(60, num(l.rows) || DEFAULT_LAYOUT.rows)),
+  };
+};
+
+const ZONE_KINDS = ["Rack", "Shelf", "Bin", "Bulk Pile", "Cold Storage", "Staging", "Yard", "Other"];
+const ZONE_FILL = {
+  Rack: "#DBEAFE", Shelf: "#E0E7FF", Bin: "#FEF3C7", "Bulk Pile": "#DCFCE7",
+  "Cold Storage": "#CFFAFE", Staging: "#FCE7F3", Yard: "#ECFCCB", Other: "#F3F4F6",
+};
+const ZONE_EDGE = {
+  Rack: "#93C5FD", Shelf: "#A5B4FC", Bin: "#FCD34D", "Bulk Pile": "#86EFAC",
+  "Cold Storage": "#67E8F9", Staging: "#F9A8D4", Yard: "#BEF264", Other: "#D1D5DB",
+};
+
+// Zones belong to a warehouse by id; warehouseName is kept alongside it so the
+// plain-text matching the rest of the app uses (equipment/inventory → warehouse)
+// still works for rows that predate ids or come from an import.
+function zonesForWarehouse(wh) {
+  if (!wh) return [];
+  return getCol("zones")
+    .filter(z => (z.warehouseId && z.warehouseId === wh._id) || (!z.warehouseId && z.warehouseName === wh.warehouseName))
+    .sort((a, b) => String(a.label || "").localeCompare(String(b.label || ""), undefined, { numeric: true }));
+}
+
+// An inventory item sits in a zone by zoneId. Items created before zones existed
+// (or restored from an export) fall back to warehouse-name + zone-label text.
+const itemInZone = (item, zone) => (item && zone) ? (
+  item.zoneId ? item.zoneId === zone._id
+    : !!(item.zoneLabel && String(item.warehouse || "") === String(zone.warehouseName || "") && item.zoneLabel === zone.label)
+) : false;
+
+const stockForWarehouse = wh => getCol("inventory").filter(i => String(i.warehouse || "") === String(wh.warehouseName || ""));
+const itemsInZone = zone => getCol("inventory").filter(i => itemInZone(i, zone));
+const zoneUsed = zone => itemsInZone(zone).reduce((s, i) => s + num(i.currentStock), 0);
+
+// Everything the dashboard and detail page need about one warehouse, derived
+// live from zones + inventory — there is no stored rollup to go stale.
+function warehouseStats(wh) {
+  const zones = zonesForWarehouse(wh);
+  const stock = stockForWarehouse(wh);
+  const capacity = zones.reduce((s, z) => s + num(z.capacity), 0);
+  const used = zones.reduce((s, z) => s + zoneUsed(z), 0);
+  const low = stock.filter(isLowStock);
+  const zoned = new Set();
+  zones.forEach(z => itemsInZone(z).forEach(i => zoned.add(i._id)));
+  return {
+    zones, stock, capacity, used, low,
+    pct: capacity > 0 ? Math.round((used / capacity) * 100) : null,
+    unassigned: stock.filter(i => !zoned.has(i._id)),
+    value: stock.reduce((s, i) => s + num(i.currentStock) * num(i.unitPrice), 0),
+    footprint: zones.reduce((s, z) => s + num(z.w) * num(z.h), 0),
+  };
+}
 
 /* ─── Job media (photos & videos) ────────────────────────────────────────────
    Files live in a PRIVATE Supabase Storage bucket, foldered by company then job:
@@ -1421,6 +1492,24 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
             </Field>
           );
         }
+        // Storage zone picker — the only field that depends on a sibling answer:
+        // the zones offered are the ones drawn on the warehouse chosen above it.
+        if (f.type === "zone") {
+          const whName = String(form[f.warehouseKey || "warehouse"] || "").trim();
+          const wh = getCol("warehouses").find(w => String(w.warehouseName || "") === whName);
+          const opts = wh
+            ? zonesForWarehouse(wh).map(z => ({ value: z._id, label: z.label + (z.kind ? " — " + z.kind : "") }))
+            : [];
+          return (
+            <Field key={f.key} label={f.label}>
+              {!whName
+                ? <div style={{ fontSize: 12, color: C.textMuted }}>Pick a warehouse first.</div>
+                : opts.length === 0
+                  ? <div style={{ fontSize: 12, color: C.textMuted }}>“{whName}” has no storage zones drawn yet — build its layout on the Warehouses page.</div>
+                  : <Select value={form[f.key] || ""} onChange={v => set(f.key, v)} options={opts} placeholder="Not assigned to a zone" />}
+            </Field>
+          );
+        }
         if (f.type === "maps") {
           return <MapsField key={f.key} field={f} value={form[f.key]} onChange={v => set(f.key, v)} onLookup={() => setLookupKey(f.key)} />;
         }
@@ -1443,7 +1532,7 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
   );
 }
 
-function CRUDPage({ title, singular, subtitle, collection, columns, formFields, emptyIcon, defaultValues = {}, detail, sort, beforeSave, extra }) {
+function CRUDPage({ title, singular, subtitle, collection, columns, formFields, emptyIcon, defaultValues = {}, detail, sort, beforeSave, prepareEdit, extra }) {
   const applySort = arr => (sort ? arr.slice().sort(sort) : arr);
   const [items, setItems] = useState(() => applySort(db.getAll(collection).items));
   const [modal, setModal] = useState(null);
@@ -1469,7 +1558,9 @@ function CRUDPage({ title, singular, subtitle, collection, columns, formFields, 
   };
 
   const openCreate = () => setModal({ mode: "create", data: { _id: genId(), ...defaultValues } });
-  const openEdit = (item) => setModal({ mode: "edit", data: { ...item } });
+  // prepareEdit lets a page normalise a row before it hits the form (e.g.
+  // Inventory resolving a legacy zone label into the zone's id).
+  const openEdit = (item) => setModal({ mode: "edit", data: prepareEdit ? prepareEdit({ ...item }) : { ...item } });
 
   const filtered = query.trim()
     ? items.filter(item => columns.some(c => String(item[c.key] ?? "").toLowerCase().includes(query.trim().toLowerCase())))
@@ -2333,15 +2424,17 @@ function InventoryDetailView({ item }) {
       <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 4 }}>{live.materialName}</div>
       <div style={{ marginBottom: 14, display: "flex", gap: 8, alignItems: "center" }}>
         <span style={{ fontSize: 14 }}>{num(live.currentStock)} {live.unitOfMeasure || "units"} on hand</span>
-        {low && <Badge color="#FEF2F2" textColor="#DC2626">Low stock — reorder point {num(live.reorderPoint)}</Badge>}
+        {low && <Badge color="#FEF2F2" textColor="#DC2626">Low stock — reorder threshold {num(live.reorderPoint)}</Badge>}
       </div>
       <div className="grid-2" style={{ gap: 8 }}>
+        {field("SKU / Reference", live.sku)}
         {field("Unit Price", live.unitPrice ? money(live.unitPrice) : null)}
         {field("Stock Value", fmt(num(live.currentStock) * num(live.unitPrice)))}
         {field("Warehouse", live.warehouse)}
+        {field("Storage Zone", zoneLabelFor(live))}
         {field("Bin / Shelf Location", live.binLocation)}
         {field("Supplier", live.supplier)}
-        {field("Reorder Point", live.reorderPoint !== undefined && live.reorderPoint !== "" ? num(live.reorderPoint) + " " + (live.unitOfMeasure || "units") : null)}
+        {field("Reorder Threshold", live.reorderPoint !== undefined && live.reorderPoint !== "" ? num(live.reorderPoint) + " " + (live.unitOfMeasure || "units") : null)}
       </div>
 
       {Array.isArray(live.customFields) && live.customFields.some(r => r.label || r.value) && (
@@ -2399,11 +2492,33 @@ function InventoryPage() {
     </div>
   );
 
+  // Zone assignment is stored as an id; the warehouse name and the zone's label
+  // are written alongside it so the plain-text matching used across the app (and
+  // the low-stock tables on the Warehouses screens) keeps working either way.
+  // A row seeded/imported before zones existed points at its zone by label.
+  // Resolve that to the real id as the form opens so the picker shows the right
+  // zone and saving keeps it, instead of silently dropping the link.
+  const prepareEdit = item => {
+    if (item.zoneId || !item.zoneLabel) return item;
+    const z = getCol("zones").find(x => x.label === item.zoneLabel && String(x.warehouseName || "") === String(item.warehouse || ""));
+    return z ? { ...item, zoneId: z._id } : item;
+  };
+
+  const beforeSave = data => {
+    if (!data.zoneId) return { ...data, zoneId: "", zoneLabel: "" };
+    const z = getCol("zones").find(x => x._id === data.zoneId);
+    if (!z) return { ...data, zoneId: "", zoneLabel: "" };
+    return { ...data, zoneLabel: z.label, warehouse: z.warehouseName || data.warehouse };
+  };
+
   return <CRUDPage
     title="Inventory" singular="Material" subtitle="Track stock levels, locations, and movements" collection="inventory" emptyIcon="📦"
     extra={extra}
+    beforeSave={beforeSave}
+    prepareEdit={prepareEdit}
     columns={[
       { key: "materialName", label: "Material" },
+      { key: "sku", label: "SKU", render: v => v || "—" },
       {
         key: "currentStock", label: "Stock", render: (v, row) => (
           <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -2412,6 +2527,7 @@ function InventoryPage() {
           </span>
         )
       },
+      { key: "_zone", label: "Zone", render: (_v, row) => zoneLabelFor(row) || "—" },
       { key: "binLocation", label: "Location", render: v => v || "—" },
       { key: "unitPrice", label: "Unit Price", render: money },
       { key: "currentStock2", label: "Stock Value", render: (_v, row) => fmt(num(row.currentStock) * num(row.unitPrice)) },
@@ -2420,11 +2536,13 @@ function InventoryPage() {
     ]}
     formFields={[
       { key: "materialName", label: "Material Name", required: true, placeholder: "Gravel, Sand, Lumber…" },
+      { key: "sku", label: "SKU / Reference Code", placeholder: "GRV-034" },
       { key: "currentStock", label: "Current Stock", type: "number", placeholder: "100" },
       { key: "unitOfMeasure", label: "Unit of Measure", placeholder: "tons, yards, units…" },
-      { key: "reorderPoint", label: "Reorder Point (optional)", type: "number", placeholder: "Flag as low stock at or below this" },
+      { key: "reorderPoint", label: "Reorder Threshold (optional)", type: "number", placeholder: "Flag as low stock at or below this" },
       { key: "unitPrice", label: "Unit Price ($)", type: "number", placeholder: "25.00" },
       { key: "warehouse", label: "Warehouse", type: "datalist", options: warehouseNames, placeholder: "Which warehouse?" },
+      { key: "zoneId", label: "Storage Zone", type: "zone" },
       { key: "binLocation", label: "Bin / Shelf Location (optional)", placeholder: "Bay 3, Shelf B…" },
       { key: "supplier", label: "Supplier", placeholder: "Supplier name" },
       { key: "description", label: "Description", type: "textarea", placeholder: "Material details…" },
@@ -2480,30 +2598,508 @@ function SafetyPage() {
   />;
 }
 
-function WarehousesPage() {
-  const detail = wh => {
-    const field = (label, node) => node ? (
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</div>
-        <div style={{ fontSize: 14 }}>{node}</div>
+/* ─── Warehouses ─────────────────────────────────────────────────────────────
+   Three screens behind one nav item:
+     • Dashboard — every warehouse, how full it is, how many items are below
+       their reorder threshold.
+     • Detail    — the saved floor plan drawn to scale; click a rack to see
+       exactly what's stored in it.
+     • Builder   — drag/resize the racks on that plan and save.
+   Reorder-threshold alerts aren't a stored flag or a cron job: every count on
+   these screens is derived from live inventory the moment it renders, so a
+   quantity edited anywhere in the app shows up here immediately.
+──────────────────────────────────────────────────────────────────────────────*/
+const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// What zone is this item in? The id is authoritative; the stored label is the
+// fallback for rows that predate zones or came back through an export/import.
+function zoneLabelFor(item) {
+  if (item && item.zoneId) {
+    const z = getCol("zones").find(x => x._id === item.zoneId);
+    if (z) return z.label;
+  }
+  return (item && item.zoneLabel) || "";
+}
+
+const WAREHOUSE_FIELDS = [
+  { key: "warehouseName", label: "Warehouse Name", required: true, placeholder: "Main Warehouse" },
+  { key: "address", label: "Location (optional)", type: "maps", placeholder: "Address or pin (lat, lng) — fill in later if you don't know it yet" },
+  { key: "contactPerson", label: "Contact Person", placeholder: "John Doe" },
+  { key: "phoneNumber", label: "Phone Number", placeholder: "+1 555 000 0000" },
+  { key: "capacity", label: "Total Square Footage", type: "number", placeholder: "10000" },
+  { key: "description", label: "What's stored here", type: "textarea", placeholder: "General notes — staging area, spare parts bin, bulk materials not tracked as line-item stock…" },
+  { key: "customFields", label: "Additional Details", type: "customFields", hint: "Gate code, landlord, hours, a quirk worth remembering… whatever's useful, no fixed list." },
+  { key: "isActive", label: "Currently active", type: "boolean" },
+];
+
+/* Floor plan renderer. Read-only by default; the builder passes `editable` plus
+   an onDragStart so the very same boxes can be dragged and resized. */
+function LayoutCanvas({ layout, zones, cell = 34, selectedKey, onSelect, editable, onDragStart, mini }) {
+  const { cols, rows } = layout;
+  return (
+    <div className="scroll-x" style={{ paddingBottom: 2 }}>
+      <div
+        style={{
+          position: "relative", width: cols * cell, height: rows * cell, flexShrink: 0,
+          background: C.surface, borderRadius: mini ? 6 : 10, border: "1px solid " + C.border,
+          backgroundImage: "linear-gradient(to right, #EFF1F4 1px, transparent 1px), linear-gradient(to bottom, #EFF1F4 1px, transparent 1px)",
+          backgroundSize: cell + "px " + cell + "px",
+          touchAction: editable ? "none" : "auto",
+        }}
+      >
+        {zones.length === 0 && !mini && (
+          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: C.textMuted, fontSize: 13, textAlign: "center", padding: 20 }}>
+            {editable ? "Add a rack, then drag it where it belongs." : "No storage zones drawn yet — use Edit layout to lay this place out."}
+          </div>
+        )}
+        {zones.map(z => {
+          const key = z._key || z._id;
+          const used = z._new ? 0 : zoneUsed(z);
+          const cap = num(z.capacity);
+          const over = cap > 0 && used > cap;
+          const hasLow = !z._new && itemsInZone(z).some(isLowStock);
+          const sel = selectedKey === key;
+          return (
+            <div
+              key={key}
+              onPointerDown={editable ? e => onDragStart(e, z, "move") : undefined}
+              onClick={editable ? undefined : () => onSelect && onSelect(key)}
+              title={(z.label || "Untitled") + (cap > 0 ? " — " + used.toLocaleString() + " of " + cap.toLocaleString() : "")}
+              style={{
+                position: "absolute", left: z.x * cell + 1, top: z.y * cell + 1,
+                width: Math.max(2, z.w * cell - 2), height: Math.max(2, z.h * cell - 2),
+                boxSizing: "border-box", borderRadius: mini ? 3 : 6, padding: mini ? 0 : 4, overflow: "hidden",
+                background: ZONE_FILL[z.kind] || ZONE_FILL.Other,
+                border: (mini ? 1 : 2) + "px solid " + (sel ? C.accent : over ? C.destructive : hasLow ? "#F59E0B" : (ZONE_EDGE[z.kind] || ZONE_EDGE.Other)),
+                boxShadow: sel ? "0 0 0 3px rgba(99,102,241,0.25)" : "none",
+                cursor: editable ? "move" : (mini ? "default" : "pointer"),
+                display: "flex", flexDirection: "column", justifyContent: "space-between",
+                userSelect: "none", touchAction: editable ? "none" : "auto",
+              }}
+            >
+              {!mini && (
+                <React.Fragment>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: C.text, lineHeight: 1.15, wordBreak: "break-word" }}>{z.label || "Untitled"}</div>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: over ? C.destructive : C.textMuted, whiteSpace: "nowrap" }}>
+                    {cap > 0 ? used.toLocaleString() + " / " + cap.toLocaleString() : used.toLocaleString()}{hasLow ? " ⚠️" : ""}
+                  </div>
+                </React.Fragment>
+              )}
+              {editable && (
+                <div
+                  onPointerDown={e => onDragStart(e, z, "resize")}
+                  title="Drag to resize"
+                  style={{ position: "absolute", right: -1, bottom: -1, width: 14, height: 14, background: C.accent, borderRadius: "5px 0 4px 0", cursor: "nwse-resize", touchAction: "none" }}
+                />
+              )}
+            </div>
+          );
+        })}
       </div>
-    ) : null;
-    // What's here, pulled live from Equipment/Inventory — both link back by
-    // warehouse name (same plain-text matching convention used everywhere else
-    // in the app, e.g. jobs/employees), not a foreign key.
-    const equipmentHere = getCol("equipment").filter(e => (e.warehouse || "") === wh.warehouseName);
-    const stockHere = getCol("inventory").filter(i => (i.warehouse || "") === wh.warehouseName);
-    const stockValue = stockHere.reduce((s, i) => s + num(i.currentStock) * num(i.unitPrice), 0);
-    return (
-      <div>
-        <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 4 }}>{wh.warehouseName}</div>
-        <div style={{ marginBottom: 14 }}>
+    </div>
+  );
+}
+
+function ZoneLegend() {
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 10 }}>
+      {ZONE_KINDS.map(k => (
+        <span key={k} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: C.textMuted, fontWeight: 600 }}>
+          <span style={{ width: 12, height: 12, borderRadius: 3, background: ZONE_FILL[k], border: "1px solid " + ZONE_EDGE[k] }} />
+          {k}
+        </span>
+      ))}
+      <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: C.textMuted, fontWeight: 600 }}>
+        <span style={{ width: 12, height: 12, borderRadius: 3, background: "#FFF", border: "2px solid #F59E0B" }} />
+        Holds low stock
+      </span>
+      <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: C.textMuted, fontWeight: 600 }}>
+        <span style={{ width: 12, height: 12, borderRadius: 3, background: "#FFF", border: "2px solid " + C.destructive }} />
+        Over capacity
+      </span>
+    </div>
+  );
+}
+
+/* Drag-and-drop grid editor. Everything happens on a local draft; nothing is
+   written until Save, so an accidental drag costs nothing. */
+function WarehouseLayoutBuilder({ warehouse, onDone }) {
+  const CELL = 34;
+  const original = useMemo(() => zonesForWarehouse(warehouse), [warehouse._id]);
+  const [layout, setLayout] = useState(() => whLayout(warehouse));
+  const [draft, setDraft] = useState(() => original.map(z => ({ ...z, _key: z._id })));
+  const [selectedKey, setSelectedKey] = useState(null);
+  // Drag handlers and the grid steppers both need the CURRENT grid, not the one
+  // captured when they were created — a ref keeps them right even when several
+  // updates land before React re-renders.
+  const layoutRef = useRef(layout);
+  layoutRef.current = layout;
+
+  const selected = draft.find(z => z._key === selectedKey) || null;
+  const patch = (key, p) => setDraft(list => list.map(z => (z._key === key ? { ...z, ...p } : z)));
+
+  // First free cell, scanning top-left to bottom-right, so a new rack never
+  // lands on top of one that's already placed.
+  const freeSpot = (w, h) => {
+    const overlaps = (x, y) => draft.some(z => x < z.x + z.w && x + w > z.x && y < z.y + z.h && y + h > z.y);
+    for (let y = 0; y + h <= layoutRef.current.rows; y++)
+      for (let x = 0; x + w <= layoutRef.current.cols; x++)
+        if (!overlaps(x, y)) return { x, y };
+    return { x: 0, y: 0 };
+  };
+
+  const addZone = kind => {
+    const w = Math.min(3, layout.cols);
+    const spot = freeSpot(w, 1);
+    const key = genId();
+    const n = draft.filter(z => (z.kind || "Rack") === kind).length + 1;
+    setDraft(list => [...list, { _key: key, _new: true, label: kind + " " + n, kind, capacity: "", x: spot.x, y: spot.y, w, h: 1 }]);
+    setSelectedKey(key);
+  };
+
+  const startDrag = (e, z, mode) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setSelectedKey(z._key);
+    const start = { sx: e.clientX, sy: e.clientY, x: z.x, y: z.y, w: z.w, h: z.h };
+    const move = ev => {
+      const dx = Math.round((ev.clientX - start.sx) / CELL);
+      const dy = Math.round((ev.clientY - start.sy) / CELL);
+      const g = layoutRef.current;
+      setDraft(list => list.map(item => {
+        if (item._key !== z._key) return item;
+        if (mode === "move") {
+          return { ...item, x: clampNum(start.x + dx, 0, g.cols - item.w), y: clampNum(start.y + dy, 0, g.rows - item.h) };
+        }
+        return { ...item, w: clampNum(start.w + dx, 1, g.cols - item.x), h: clampNum(start.h + dy, 1, g.rows - item.y) };
+      }));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  };
+
+  // Growing the grid is free; shrinking it pulls any zone that would fall off
+  // the edge back inside instead of losing it.
+  const setGrid = (key, delta) => {
+    const next = { ...layoutRef.current, [key]: clampNum(layoutRef.current[key] + delta, 4, 60) };
+    layoutRef.current = next;
+    setLayout(next);
+    setDraft(list => list.map(z => {
+      const w = clampNum(z.w, 1, next.cols);
+      const h = clampNum(z.h, 1, next.rows);
+      return { ...z, w, h, x: clampNum(z.x, 0, next.cols - w), y: clampNum(z.y, 0, next.rows - h) };
+    }));
+  };
+
+  const removeZone = async z => {
+    const held = z._new ? 0 : itemsInZone(z).length;
+    if (held > 0) {
+      const ok = await confirmDialog(
+        "“" + (z.label || "This zone") + "” holds " + held + " item" + (held === 1 ? "" : "s") +
+        ". Deleting the zone leaves what's in it unassigned — the stock itself is kept.",
+        { confirmLabel: "Delete zone" });
+      if (!ok) return;
+    }
+    setDraft(list => list.filter(x => x._key !== z._key));
+    setSelectedKey(null);
+  };
+
+  const save = () => {
+    const kept = new Set(draft.filter(z => z._id).map(z => z._id));
+    // Zones taken off the plan: release whatever they held, then delete.
+    original.forEach(z => {
+      if (kept.has(z._id)) return;
+      itemsInZone(z).forEach(i => db.update("inventory", { ...i, zoneId: "", zoneLabel: "" }));
+      db.remove("zones", z._id);
+    });
+    draft.forEach(z => {
+      const body = {
+        warehouseId: warehouse._id,
+        warehouseName: warehouse.warehouseName,
+        label: String(z.label || "").trim() || "Untitled",
+        kind: z.kind || "Rack",
+        capacity: (z.capacity === "" || z.capacity === undefined || z.capacity === null) ? "" : num(z.capacity),
+        x: z.x, y: z.y, w: z.w, h: z.h,
+      };
+      if (!z._id) { db.create("zones", body); return; }
+      db.update("zones", { _id: z._id, ...body });
+      // A renamed zone drags its label along on the items it holds, so the
+      // plain-text fallback match never points at a name that's gone.
+      if (z.label !== (original.find(o => o._id === z._id) || {}).label) {
+        itemsInZone(z).forEach(i => db.update("inventory", { ...i, zoneLabel: body.label }));
+      }
+    });
+    db.update("warehouses", { ...warehouse, layout: { cols: layout.cols, rows: layout.rows } });
+    onDone();
+  };
+
+  const stepper = (label, key) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <button type="button" onClick={() => setGrid(key, -1)} style={{ ...btnOutline, padding: "4px 10px" }}>−</button>
+      <span style={{ fontSize: 12, fontWeight: 700, minWidth: 62, textAlign: "center" }}>{layout[key]} {label}</span>
+      <button type="button" onClick={() => setGrid(key, 1)} style={{ ...btnOutline, padding: "4px 10px" }}>+</button>
+    </div>
+  );
+
+  return (
+    <div>
+      <PageHeader
+        title="Layout Builder"
+        subtitle={warehouse.warehouseName + " — drag racks to place them, drag the corner to resize"}
+        action={
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" onClick={onDone} style={btnOutline}>Cancel</button>
+            <button type="button" onClick={save} style={btnSecondary}>Save Layout</button>
+          </div>
+        }
+      />
+
+      <div style={card}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
+          <Select value="" onChange={v => v && addZone(v)} options={ZONE_KINDS} placeholder="+ Add zone…" style={{ maxWidth: 190 }} />
+          <div style={{ flex: 1 }} />
+          {stepper("wide", "cols")}
+          {stepper("deep", "rows")}
+        </div>
+
+        <LayoutCanvas
+          layout={layout} zones={draft} cell={CELL}
+          selectedKey={selectedKey} editable onDragStart={startDrag}
+        />
+        <ZoneLegend />
+      </div>
+
+      <div style={card}>
+        <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>
+          {selected ? "Selected zone" : "Zone settings"}
+        </h3>
+        {!selected
+          ? <p style={{ color: C.textMuted, fontSize: 13 }}>Click a zone on the plan to rename it, set its capacity, or remove it.</p>
+          : (
+            <div>
+              <div className="grid-3" style={{ gap: 12 }}>
+                <Field label="Label">
+                  <TextInput value={selected.label} onChange={v => patch(selected._key, { label: v })} placeholder="Rack A3" />
+                </Field>
+                <Field label="Type">
+                  <Select value={selected.kind || "Rack"} onChange={v => patch(selected._key, { kind: v })} options={ZONE_KINDS} />
+                </Field>
+                <Field label="Capacity (units held)">
+                  <TextInput type="number" value={selected.capacity} onChange={v => patch(selected._key, { capacity: v })} placeholder="Optional" />
+                </Field>
+              </div>
+              <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 12 }}>
+                Position {selected.x}, {selected.y} · {selected.w} × {selected.h} cells
+                {selected._new ? " · not saved yet" : " · holds " + itemsInZone(selected).length + " item(s)"}
+              </div>
+              <button type="button" onClick={() => removeZone(selected)} style={btnDanger}>Delete zone</button>
+            </div>
+          )}
+      </div>
+    </div>
+  );
+}
+
+/* One warehouse: its plan, what each rack holds, and what needs reordering. */
+function WarehouseDetail({ warehouse, onBack, onEdit, onBuild }) {
+  const [selectedZoneId, setSelectedZoneId] = useState(null);
+  const [assignId, setAssignId] = useState("");
+  const [, bump] = useState(0);
+  const refresh = () => bump(x => x + 1);
+
+  const wh = db.getById("warehouses", warehouse._id) || warehouse;
+  const s = warehouseStats(wh);
+  const layout = whLayout(wh);
+  const zone = s.zones.find(z => z._id === selectedZoneId) || null;
+  const zoneItems = zone ? itemsInZone(zone) : [];
+  const zoneCap = zone ? num(zone.capacity) : 0;
+  const zoneFill = zone ? zoneUsed(zone) : 0;
+  const equipmentHere = getCol("equipment").filter(e => (e.warehouse || "") === wh.warehouseName);
+
+  const assign = () => {
+    const item = db.getById("inventory", assignId);
+    if (!item || !zone) return;
+    db.update("inventory", { ...item, warehouse: wh.warehouseName, zoneId: zone._id, zoneLabel: zone.label });
+    setAssignId("");
+    refresh();
+  };
+  const unassign = item => { db.update("inventory", { ...item, zoneId: "", zoneLabel: "" }); refresh(); };
+
+  const field = (label, node) => node ? (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</div>
+      <div style={{ fontSize: 14 }}>{node}</div>
+    </div>
+  ) : null;
+
+  const stockCols = [
+    { key: "materialName", label: "Item" },
+    { key: "sku", label: "SKU", render: v => v || "—" },
+    {
+      key: "currentStock", label: "Qty", render: (v, row) => (
+        <span style={{ display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
+          {num(v).toLocaleString() + " " + (row.unitOfMeasure || "units")}
+          {isLowStock(row) && <Badge color="#FEF2F2" textColor="#DC2626">Low</Badge>}
+        </span>
+      )
+    },
+    { key: "reorderPoint", label: "Reorder At", render: v => (v === "" || v === undefined ? "—" : num(v).toLocaleString()) },
+    { key: "unitPrice", label: "Unit Price", render: money },
+  ];
+
+  return (
+    <div>
+      <button type="button" onClick={onBack} style={{ ...btnOutline, marginBottom: 14, padding: "6px 12px" }}>← All warehouses</button>
+      <PageHeader
+        title={wh.warehouseName}
+        subtitle={wh.address || "No location set"}
+        action={
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" onClick={onEdit} style={btnOutline}>Edit details</button>
+            <button type="button" onClick={onBuild} style={btnSecondary}>✏️ Edit layout</button>
+          </div>
+        }
+      />
+
+      <div className="grid-3" style={{ marginBottom: 16 }}>
+        <StatCard label="Capacity Used" value={s.pct === null ? "—" : s.pct + "%"} />
+        <StatCard label="Storage Zones" value={s.zones.length} />
+        <StatCard label="Low Stock" value={s.low.length} />
+      </div>
+      <div className="grid-3" style={{ marginBottom: 20 }}>
+        <StatCard label="Items Stored" value={s.stock.length} />
+        <StatCard label="Stock Value" value={fmt(s.value)} />
+        <StatCard label="Total Square Footage" value={wh.capacity ? num(wh.capacity).toLocaleString() + " sq ft" : "—"} />
+      </div>
+
+      {s.low.length > 0 && (
+        <div style={{ ...card, background: "#FEF2F2", border: "1px solid #FECACA" }}>
+          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10, color: "#991B1B" }}>
+            ⚠️ Below reorder threshold ({s.low.length})
+          </h3>
+          <DataTable
+            columns={[
+              { key: "materialName", label: "Item" },
+              { key: "sku", label: "SKU", render: v => v || "—" },
+              { key: "_zone", label: "Zone", render: (_v, row) => zoneLabelFor(row) || "Unassigned" },
+              { key: "currentStock", label: "On Hand", render: (v, row) => num(v).toLocaleString() + " " + (row.unitOfMeasure || "units") },
+              { key: "reorderPoint", label: "Reorder At", render: v => num(v).toLocaleString() },
+              { key: "supplier", label: "Supplier", render: v => v || "—" },
+            ]}
+            rows={s.low}
+            emptyMessage="Nothing low."
+          />
+        </div>
+      )}
+
+      <div style={card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
+          <h3 style={{ fontSize: 14, fontWeight: 700 }}>Floor Plan</h3>
+          <span style={{ fontSize: 12, color: C.textMuted }}>
+            {s.zones.length > 0 ? "Click a zone to see what's stored in it" : "Nothing laid out yet"}
+          </span>
+        </div>
+        <LayoutCanvas layout={layout} zones={s.zones} selectedKey={selectedZoneId} onSelect={id => { setSelectedZoneId(id === selectedZoneId ? null : id); setAssignId(""); }} />
+        {s.zones.length > 0 && <ZoneLegend />}
+      </div>
+
+      {zone && (
+        <div style={{ ...card, border: "2px solid " + C.accent }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
+            <div>
+              <div style={{ fontSize: 17, fontWeight: 800 }}>{zone.label}</div>
+              <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>
+                {zone.kind || "Zone"} · {zone.w} × {zone.h} cells
+                {zoneCap > 0 ? " · " + zoneFill.toLocaleString() + " of " + zoneCap.toLocaleString() + " capacity" : " · " + zoneFill.toLocaleString() + " units held"}
+              </div>
+            </div>
+            <button type="button" onClick={() => setSelectedZoneId(null)} style={{ ...btnOutline, padding: "6px 12px" }}>Close</button>
+          </div>
+
+          {zoneCap > 0 && (
+            <div style={{ height: 8, borderRadius: 999, background: C.surfaceAlt, overflow: "hidden", marginBottom: 14 }}>
+              <div style={{
+                width: Math.min(100, Math.round((zoneFill / zoneCap) * 100)) + "%", height: "100%",
+                background: zoneFill > zoneCap ? C.destructive : (zoneFill / zoneCap >= 0.85 ? "#F59E0B" : C.green),
+              }} />
+            </div>
+          )}
+
+          <DataTable
+            columns={stockCols}
+            rows={zoneItems}
+            onDelete={item => unassign(item)}
+            emptyMessage="Nothing stored in this zone yet."
+          />
+          {zoneItems.length > 0 && (
+            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>“Del” takes an item out of this zone — it does not delete the stock.</div>
+          )}
+
+          <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid " + C.border }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 8 }}>Put stock in this zone</div>
+            {s.unassigned.length === 0
+              ? <p style={{ fontSize: 13, color: C.textMuted }}>Every item in this warehouse is already assigned to a zone. Add new materials on the Inventory page.</p>
+              : (
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  <Select
+                    value={assignId} onChange={setAssignId} placeholder="Unassigned stock here…"
+                    options={s.unassigned.map(i => ({ value: i._id, label: i.materialName + " (" + num(i.currentStock).toLocaleString() + " " + (i.unitOfMeasure || "units") + ")" }))}
+                    style={{ maxWidth: 320 }}
+                  />
+                  <button type="button" onClick={assign} disabled={!assignId} style={{ ...btnSecondary, opacity: assignId ? 1 : 0.5 }}>Assign</button>
+                </div>
+              )}
+          </div>
+        </div>
+      )}
+
+      <div style={card}>
+        <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Unassigned Stock ({s.unassigned.length})</h3>
+        {s.unassigned.length === 0
+          ? <p style={{ color: C.textMuted, fontSize: 13 }}>Everything stored here has a zone.</p>
+          : (
+            <React.Fragment>
+              <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 10 }}>
+                {s.zones.length === 0
+                  ? "In this warehouse, but there's no floor plan to place it on yet — use Edit layout to draw one."
+                  : "In this warehouse but not placed on the plan yet — pick a zone above and assign them, or set the zone on the Inventory page."}
+              </p>
+              <DataTable columns={stockCols} rows={s.unassigned} emptyMessage="None." />
+            </React.Fragment>
+          )}
+      </div>
+
+      <div style={card}>
+        <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Equipment Here ({equipmentHere.length})</h3>
+        {equipmentHere.length === 0
+          ? <p style={{ color: C.textMuted, fontSize: 13 }}>No equipment assigned to this warehouse yet — set it on the Equipment page.</p>
+          : (
+            <DataTable
+              columns={[
+                { key: "equipmentName", label: "Name" },
+                { key: "equipmentType", label: "Type" },
+                { key: "totalHours", label: "Engine Hrs", render: v => (v || v === 0) ? num(v).toLocaleString() : "—" },
+              ]}
+              rows={equipmentHere}
+              emptyMessage="No equipment."
+            />
+          )}
+      </div>
+
+      <div style={card}>
+        <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Details</h3>
+        <div style={{ marginBottom: 12 }}>
           {wh.isActive !== false ? <Badge color="#F0FDF4" textColor="#16A34A">Active</Badge> : <Badge color="#FEF2F2" textColor="#DC2626">Inactive</Badge>}
         </div>
         <div className="grid-2" style={{ gap: 8 }}>
           {field("Contact", wh.contactPerson)}
           {field("Phone", wh.phoneNumber)}
-          {field("Capacity", wh.capacity ? num(wh.capacity).toLocaleString() + " sq ft" : null)}
         </div>
         {wh.address && field("Location", (
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
@@ -2512,95 +3108,210 @@ function WarehousesPage() {
           </div>
         ))}
         {field("What's stored here", wh.description)}
-
         {Array.isArray(wh.customFields) && wh.customFields.some(r => r.label || r.value) && (
           <div className="grid-2" style={{ gap: 8 }}>
             {wh.customFields.filter(r => r.label || r.value).map((r, i) => <React.Fragment key={i}>{field(r.label || "Detail", r.value)}</React.Fragment>)}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
 
-        <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Equipment Here ({equipmentHere.length})</h3>
-          {equipmentHere.length === 0
-            ? <p style={{ color: C.textMuted, fontSize: 13 }}>No equipment assigned to this warehouse yet — set it on the Equipment page.</p>
-            : (
-              <DataTable
-                columns={[
-                  { key: "equipmentName", label: "Name" },
-                  { key: "equipmentType", label: "Type" },
-                  { key: "totalHours", label: "Engine Hrs", render: v => (v || v === 0) ? num(v).toLocaleString() : "—" },
-                ]}
-                rows={equipmentHere}
-                emptyMessage="No equipment."
-              />
-            )}
-        </div>
+function WarehousesPage() {
+  const [openId, setOpenId] = useState(null);
+  const [builderId, setBuilderId] = useState(null);
+  const [modal, setModal] = useState(null);
+  const [, bump] = useState(0);
+  const reload = () => bump(x => x + 1);
 
-        <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Stock Here ({stockHere.length})</h3>
-          {stockHere.length === 0
-            ? <p style={{ color: C.textMuted, fontSize: 13 }}>No inventory assigned to this warehouse yet — set it on the Inventory page.</p>
-            : (
-              <>
-                <div className="grid-2" style={{ gap: 8 }}>
-                  <StatCard label="Total Stock Value" value={fmt(stockValue)} />
-                  <StatCard label="Low Stock Items" value={stockHere.filter(isLowStock).length} />
-                </div>
-                <div style={{ marginTop: 10 }}>
-                  <DataTable
-                    columns={[
-                      { key: "materialName", label: "Material" },
-                      {
-                        key: "currentStock", label: "Quantity", render: (v, row) => (
-                          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                            {num(v).toLocaleString() + " " + (row.unitOfMeasure || "units")}
-                            {isLowStock(row) && <Badge color="#FEF2F2" textColor="#DC2626">Low</Badge>}
-                          </span>
-                        )
-                      },
-                      { key: "binLocation", label: "Location", render: v => v || "—" },
-                      { key: "unitPrice", label: "Unit Price", render: money },
-                    ]}
-                    rows={stockHere}
-                    emptyMessage="No stock."
-                  />
-                </div>
-              </>
-            )}
-        </div>
+  const warehouses = getCol("warehouses");
+  const openWh = openId ? db.getById("warehouses", openId) : null;
+  const buildWh = builderId ? db.getById("warehouses", builderId) : null;
+
+  const saveWarehouse = async data => {
+    const ll = await resolveLatLng(data.address);
+    const payload = { ...data, addressLat: ll ? ll.lat : null, addressLng: ll ? ll.lng : null };
+    if (modal.mode === "edit") {
+      const prev = db.getById("warehouses", data._id);
+      db.update("warehouses", payload);
+      // Zones, stock and equipment are matched to a warehouse by name as well
+      // as by id — carry a rename through so nothing here gets orphaned.
+      if (prev && prev.warehouseName !== payload.warehouseName) {
+        getCol("zones").filter(z => z.warehouseId === data._id || z.warehouseName === prev.warehouseName)
+          .forEach(z => db.update("zones", { ...z, warehouseId: data._id, warehouseName: payload.warehouseName }));
+        getCol("inventory").filter(i => i.warehouse === prev.warehouseName)
+          .forEach(i => db.update("inventory", { ...i, warehouse: payload.warehouseName }));
+        getCol("equipment").filter(e => e.warehouse === prev.warehouseName)
+          .forEach(e => db.update("equipment", { ...e, warehouse: payload.warehouseName }));
+      }
+    } else {
+      db.create("warehouses", payload);
+    }
+    setModal(null);
+    reload();
+  };
+
+  const del = async wh => {
+    const zones = zonesForWarehouse(wh);
+    const stock = stockForWarehouse(wh);
+    const warn = "Delete “" + wh.warehouseName + "”? This can't be undone."
+      + (zones.length ? " Its " + zones.length + " storage zone" + (zones.length === 1 ? "" : "s") + " go with it." : "")
+      + (stock.length ? " The " + stock.length + " item" + (stock.length === 1 ? "" : "s") + " stored here stay in Inventory — the stock is kept, only its zone is cleared." : "");
+    if (!(await confirmDialog(warn))) return;
+    zones.forEach(z => {
+      itemsInZone(z).forEach(i => db.update("inventory", { ...i, zoneId: "", zoneLabel: "" }));
+      db.remove("zones", z._id);
+    });
+    db.remove("warehouses", wh._id);
+    if (openId === wh._id) setOpenId(null);
+    reload();
+  };
+
+  const openCreate = () => setModal({ mode: "create", data: { _id: genId(), isActive: true, layout: DEFAULT_LAYOUT } });
+  const openEdit = wh => setModal({ mode: "edit", data: { ...wh } });
+
+  const modalNode = modal && (
+    <Modal title={(modal.mode === "create" ? "New " : "Edit ") + "Warehouse"} onClose={() => setModal(null)}>
+      <CRUDForm fields={WAREHOUSE_FIELDS} data={modal.data} onSave={saveWarehouse} onCancel={() => setModal(null)} />
+    </Modal>
+  );
+
+  // ── Layout builder ────────────────────────────────────────────────────────
+  if (buildWh) {
+    return (
+      <WarehouseLayoutBuilder
+        key={buildWh._id}
+        warehouse={buildWh}
+        onDone={() => { setBuilderId(null); reload(); }}
+      />
+    );
+  }
+
+  // ── One warehouse ─────────────────────────────────────────────────────────
+  if (openWh) {
+    return (
+      <div>
+        <WarehouseDetail
+          key={openWh._id}
+          warehouse={openWh}
+          onBack={() => { setOpenId(null); reload(); }}
+          onEdit={() => openEdit(openWh)}
+          onBuild={() => setBuilderId(openWh._id)}
+        />
+        {modalNode}
       </div>
     );
-  };
+  }
 
-  const beforeSave = async data => {
-    const ll = await resolveLatLng(data.address);
-    return { ...data, addressLat: ll ? ll.lat : null, addressLng: ll ? ll.lng : null };
-  };
+  // ── Dashboard ─────────────────────────────────────────────────────────────
+  const rows = warehouses.map(wh => ({ wh, s: warehouseStats(wh) }));
+  const totalLow = rows.reduce((n, r) => n + r.s.low.length, 0);
+  const totalZones = rows.reduce((n, r) => n + r.s.zones.length, 0);
+  const totalValue = rows.reduce((n, r) => n + r.s.value, 0);
 
-  return <CRUDPage
-    title="Warehouses" singular="Warehouse" subtitle="Storage locations — what's stored there, equipment on site, and stock on hand" collection="warehouses" emptyIcon="🏭"
-    defaultValues={{ isActive: true }}
-    columns={[
-      { key: "warehouseName", label: "Warehouse Name" },
-      { key: "address", label: "Location", render: v => <MapLink query={v} label="Map" /> },
-      { key: "_equipment", label: "Equipment", render: (_v, row) => getCol("equipment").filter(e => (e.warehouse || "") === row.warehouseName).length || "—" },
-      { key: "_stock", label: "Stock Items", render: (_v, row) => getCol("inventory").filter(i => (i.warehouse || "") === row.warehouseName).length || "—" },
-      { key: "capacity", label: "Capacity", render: v => (v ? num(v).toLocaleString() + " sq ft" : "—") },
-      { key: "isActive", label: "Active", render: v => (v !== false ? "✅" : "❌") },
-    ]}
-    formFields={[
-      { key: "warehouseName", label: "Warehouse Name", required: true, placeholder: "Main Warehouse" },
-      { key: "address", label: "Location (optional)", type: "maps", placeholder: "Address or pin (lat, lng) — fill in later if you don't know it yet" },
-      { key: "contactPerson", label: "Contact Person", placeholder: "John Doe" },
-      { key: "phoneNumber", label: "Phone Number", placeholder: "+1 555 000 0000" },
-      { key: "capacity", label: "Capacity (sq ft)", type: "number", placeholder: "10000" },
-      { key: "description", label: "What's stored here", type: "textarea", placeholder: "General notes — staging area, spare parts bin, bulk materials not tracked as line-item stock…" },
-      { key: "customFields", label: "Additional Details", type: "customFields", hint: "Gate code, landlord, hours, a quirk worth remembering… whatever's useful, no fixed list." },
-      { key: "isActive", label: "Currently active", type: "boolean" },
-    ]}
-    detail={detail}
-    beforeSave={beforeSave}
-  />;
+  return (
+    <div>
+      <PageHeader
+        title="Warehouses"
+        subtitle="Every storage location, how full it is, and what needs reordering"
+        action={<button type="button" onClick={openCreate} style={btnSecondary}>+ New Warehouse</button>}
+      />
+
+      {warehouses.length === 0
+        ? <EmptyState
+            icon="🏭"
+            title="No warehouses yet"
+            subtitle="Add your first warehouse, then lay out its racks and put stock in them."
+            action={<button type="button" onClick={openCreate} style={btnSecondary}>Create Warehouse</button>}
+          />
+        : (
+          <React.Fragment>
+            <div className="grid-3" style={{ marginBottom: 20 }}>
+              <StatCard label="Warehouses" value={warehouses.length} />
+              <StatCard label="Storage Zones" value={totalZones} />
+              <StatCard label="Low Stock Items" value={totalLow} />
+            </div>
+
+            {totalLow > 0 && (
+              <div style={{ ...card, background: "#FEF2F2", border: "1px solid #FECACA" }}>
+                <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 10, color: "#991B1B" }}>
+                  ⚠️ Below reorder threshold ({totalLow})
+                </h3>
+                <DataTable
+                  columns={[
+                    { key: "materialName", label: "Item" },
+                    { key: "sku", label: "SKU", render: v => v || "—" },
+                    { key: "warehouse", label: "Warehouse", render: v => v || "—" },
+                    { key: "_zone", label: "Zone", render: (_v, row) => zoneLabelFor(row) || "Unassigned" },
+                    { key: "currentStock", label: "On Hand", render: (v, row) => num(v).toLocaleString() + " " + (row.unitOfMeasure || "units") },
+                    { key: "reorderPoint", label: "Reorder At", render: v => num(v).toLocaleString() },
+                  ]}
+                  rows={rows.reduce((all, r) => all.concat(r.s.low), [])}
+                  emptyMessage="Nothing low."
+                />
+              </div>
+            )}
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(310px, 1fr))", gap: 16 }}>
+              {rows.map(({ wh, s }) => {
+                const pct = s.pct === null ? 0 : s.pct;
+                const barColor = s.pct === null ? C.border : pct > 100 ? C.destructive : pct >= 85 ? "#F59E0B" : C.green;
+                return (
+                  <div
+                    key={wh._id}
+                    onClick={() => setOpenId(wh._id)}
+                    style={{ ...card, marginBottom: 0, cursor: "pointer", display: "flex", flexDirection: "column", gap: 10 }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 16, fontWeight: 800, lineHeight: 1.25 }}>{wh.warehouseName}</div>
+                        <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>
+                          {wh.address || "No location set"}
+                        </div>
+                      </div>
+                      {wh.isActive === false && <Badge color="#FEF2F2" textColor="#DC2626">Inactive</Badge>}
+                    </div>
+
+                    <div style={{ opacity: 0.95, pointerEvents: "none" }}>
+                      <LayoutCanvas layout={whLayout(wh)} zones={s.zones} cell={9} mini />
+                    </div>
+
+                    <div>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, fontWeight: 700, color: C.textMuted, marginBottom: 4 }}>
+                        <span>Capacity used</span>
+                        <span>{s.pct === null ? "no capacity set" : pct + "%"}</span>
+                      </div>
+                      <div style={{ height: 8, borderRadius: 999, background: C.surfaceAlt, overflow: "hidden" }}>
+                        <div style={{ width: Math.min(100, pct) + "%", height: "100%", background: barColor }} />
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <Badge>{s.zones.length} zone{s.zones.length === 1 ? "" : "s"}</Badge>
+                      <Badge>{s.stock.length} item{s.stock.length === 1 ? "" : "s"}</Badge>
+                      <Badge>{fmt(s.value)}</Badge>
+                      {s.low.length > 0
+                        ? <Badge color="#FEF2F2" textColor="#DC2626">{s.low.length} low</Badge>
+                        : <Badge color="#F0FDF4" textColor="#16A34A">Stock OK</Badge>}
+                    </div>
+
+                    <div style={{ display: "flex", gap: 6, marginTop: "auto", paddingTop: 4 }} onClick={e => e.stopPropagation()}>
+                      <button type="button" onClick={() => setOpenId(wh._id)} style={{ ...btnOutline, padding: "5px 11px", fontSize: 12 }}>Open</button>
+                      <button type="button" onClick={() => setBuilderId(wh._id)} style={{ ...btnOutline, padding: "5px 11px", fontSize: 12 }}>Layout</button>
+                      <button type="button" onClick={() => openEdit(wh)} style={{ ...btnOutline, padding: "5px 11px", fontSize: 12 }}>Edit</button>
+                      <button type="button" onClick={() => del(wh)} style={btnDanger}>Del</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </React.Fragment>
+        )}
+
+      {modalNode}
+    </div>
+  );
 }
 
 function ManagerLogsPage() {
@@ -4673,9 +5384,21 @@ async function seedDemoData(company) {
       { equipmentName: "CAT 320 Excavator", equipmentType: "Excavator", manufacturer: "Caterpillar", yearOfManufacture: "2021", billingRatePerHour: "165", totalHours: "3120" },
       { equipmentName: "Kenworth T880", equipmentType: "Truck", manufacturer: "Kenworth", yearOfManufacture: "2019", billingRatePerHour: "120", totalHours: "88400" },
     ],
+    warehouses: [
+      { warehouseName: "Main Yard", address: "Humboldt, SK", capacity: "12000", contactPerson: "Cole Bennett", isActive: true, layout: { cols: 20, rows: 12 },
+        description: "Home yard — bulk aggregate out front, small parts and steel inside." },
+    ],
+    // Zones link to the warehouse by name and inventory links back by zone label
+    // (the id-free fallback), so the seeded floor plan comes up already stocked.
+    zones: [
+      { warehouseName: "Main Yard", label: "Yard Pile 2", kind: "Bulk Pile", capacity: 900, x: 1, y: 1, w: 6, h: 3 },
+      { warehouseName: "Main Yard", label: "Rack B", kind: "Rack", capacity: 200, x: 10, y: 1, w: 3, h: 1 },
+      { warehouseName: "Main Yard", label: "Rack C", kind: "Rack", capacity: 200, x: 10, y: 3, w: 3, h: 1 },
+      { warehouseName: "Main Yard", label: "Staging Bay", kind: "Staging", capacity: "", x: 1, y: 7, w: 8, h: 3 },
+    ],
     inventory: [
-      { materialName: "3/4\" Crushed Gravel", currentStock: "480", unitOfMeasure: "tons", unitPrice: "22.50", supplier: "Humboldt Aggregates", warehouse: "Main Yard", binLocation: "Yard Pile 2", reorderPoint: "100" },
-      { materialName: "Rebar #4", currentStock: "45", unitOfMeasure: "lengths", unitPrice: "8.75", supplier: "SteelCo", warehouse: "Main Yard", binLocation: "Bay 3, Rack B", reorderPoint: "50" },
+      { materialName: "3/4\" Crushed Gravel", sku: "AGG-034", currentStock: "480", unitOfMeasure: "tons", unitPrice: "22.50", supplier: "Humboldt Aggregates", warehouse: "Main Yard", zoneLabel: "Yard Pile 2", binLocation: "Yard Pile 2", reorderPoint: "100" },
+      { materialName: "Rebar #4", sku: "STL-R04", currentStock: "45", unitOfMeasure: "lengths", unitPrice: "8.75", supplier: "SteelCo", warehouse: "Main Yard", zoneLabel: "Rack B", binLocation: "Bay 3, Rack B", reorderPoint: "50" },
     ],
     timeentries: [
       { employeeName: "Cole Bennett", jobName: "Highway 5 Culvert Replacement", entryDate: today(), hoursWorked: 8.5, startTime: "07:00", endTime: "15:30", workDescription: "Culvert excavation and backfill", equipmentUsed: "CAT 320 Excavator", mileageDriven: 42 },
