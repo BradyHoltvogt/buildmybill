@@ -21,7 +21,9 @@ Features built: quotes & invoices (line items, tax, PDF print), client CRM, jobs
 (photos/videos, documents, map locations, crew, private/assigned visibility,
 mobilization cost), team management (company join-code + owner approval + granular
 per-section permissions), **time tracking with clocked-vs-logged efficiency**, daily
-logs, work/manager logs, equipment (maintenance readings + general billable equipment
+logs, work/manager logs, **safety & compliance** (build-your-own digital
+forms with signature capture and photos, offline submission queue, submission
+history, worker certifications with expiry alerts), equipment (maintenance readings + general billable equipment
 usage, rolled into Billing & Reports + a per-item usage log), vehicle logs, safety
 checks, inventory, warehouses, scheduling, subcontractors, contracts, billing/reports,
 a market-priced subscriptions page, and an **installable phone-first field app (PWA)**
@@ -127,6 +129,13 @@ live project** unless noted:
    from `emails.sql`, which must be run first) when an employee submits a shift-edit
    request from My Hours. Trigger lives on `public.records`, filtered to
    `collection = 'shiftrequests'` inside the function body (not the trigger clause).
+9. `migration_safety.sql` — row-level rules for the Safety module: a worker sees
+   and files only their OWN `formsubmissions`; owners/managers see all; only they
+   can write `formtemplates` / `certifications`; submissions can never be edited
+   or deleted. Re-creates the records SELECT policy including everything the
+   job-media / job-docs / private-jobs migrations enforce — run it AFTER those.
+   **NOT YET RUN on the live project** — and optional: without it the Safety
+   module still works, but every member of the company can read every submission.
 
 **RLS lesson (once caused an outage):** a policy on `public.records` must NOT run a
 subquery against `public.records` — Postgres throws `42P17 infinite recursion`, which
@@ -156,6 +165,30 @@ subquery against `public.records` — Postgres throws `42P17 infinite recursion`
   onto the matching `equipment` record (running totals) — separate from general
   **equipment usage** (also loggable from the daily log), which bills hours at the
   equipment's rate and *adds* to its running total instead of overwriting it.
+- **Safety forms are offline-first, and that's the whole point.** A crew in a pit
+  has no signal, so EVERY submission goes into a localStorage queue first
+  (`bmb_safety_queue`, status `pending`) and is pushed by `flushSafetyQueue()` on
+  submit, on the browser's `online` event, and on a 45-second timer. The row id is
+  generated client-side and reused on retry: if a push landed but the reply was
+  lost, the retry hits the primary key, Postgres returns `23505`, and that counts
+  as synced instead of writing a duplicate. Signature PNGs and photos ride in the
+  queue as (downscaled) data URLs and upload during the flush, each path written
+  back into the queue as it succeeds. Don't "simplify" this into a plain
+  `db.create()` — that path rolls back and alerts when the network is down, which
+  is exactly when a safety form must not be lost.
+- **Safety files reuse the `job-media` bucket**, under `{company_id}/safety/`. That
+  bucket's policy keys off the first path segment (the company id), so safety
+  photos and signatures are already isolated per company — no new bucket, and the
+  module works even before `migration_safety.sql` is run.
+- **Safety data lives in `records` like everything else** — collections
+  `formtemplates`, `formsubmissions`, `certifications`. The spec that drove this
+  asked for three separate Postgres tables; they'd need a second data layer beside
+  the store/`db` one, and every rule the spec wanted is expressible on `records`.
+  See the header of `supabase/migration_safety.sql`.
+- **Expired certifications warn, they don't block.** An expired ticket marks the
+  name in the Jobs crew picker (`⛔ expired cert`) and raises a dashboard banner on
+  every sign-in, but assignment still goes through — only the office knows whether
+  a given job actually needs that ticket, and a hard block would stall real work.
 - **Shifts have no direct edit UI.** Employees can't edit a clocked `shifts` record —
   they request a correction (My Hours → Request a correction), which lands in
   `shiftrequests` (`status: Pending/Approved/Rejected`) and emails the owner/managers.
@@ -173,6 +206,10 @@ market-priced subscriptions page, "Remember me", map locations, job photos/video
 per-photo customer sharing on quotes, the field-app PWA (installable, iPhone-safe),
 efficiency time-tracking, daily-log polish, in-app location lookup, private-by-default
 jobs, mobilization cost, job & quote documents, equipment maintenance totals.
+
+Possible next steps for Safety: emailing an admin when a certification is about to
+lapse (the plumbing exists in `emails.sql`), and required-certification rules per
+form or per job.
 
 Possible next steps discussed but not built: online payments (Stripe) on invoices,
 QuickBooks/accounting sync, native mobile app, quote-document attachment already done.

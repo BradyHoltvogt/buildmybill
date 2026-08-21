@@ -217,7 +217,7 @@ const COLLECTIONS = [
   "inventory", "timeentries", "contracts", "safetychecks", "trucklogbooks",
   "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs", "quote_docs",
   "sites", "loads", "activeclocks", "locationpings", "equipmentlogs", "shiftrequests",
-  "inventorylogs",
+  "inventorylogs", "formtemplates", "formsubmissions", "certifications",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -507,6 +507,229 @@ const bmbDocs = {
     db.remove(collection, rec._id);
   },
 };
+
+/* ─── Safety & compliance ────────────────────────────────────────────────────
+   Digital safety forms (templates → submissions), worker certifications, and an
+   offline-first submit path for crews with no signal on site.
+
+   Three collections carry it, in the same company-isolated `records` table as
+   everything else (see supabase/migration_safety.sql for the row-level rules
+   that keep a worker's submissions their own):
+     formtemplates   — what a form asks: title, category, repeat schedule, fields
+     formsubmissions — one filled-out form: answers, signature, photos
+     certifications  — a worker's ticket/card with an expiry date
+
+   Files (signature PNGs and job-site photos) live in the existing private
+   `job-media` bucket under {company_id}/safety/, so they're isolated per company
+   by the same storage policy as job photos. Only the path is stored on the row. */
+
+const SAFETY_FIELD_TYPES = [
+  { value: "text", label: "Short text" },
+  { value: "choice", label: "Multiple choice" },
+  { value: "checkbox", label: "Checkbox" },
+  { value: "signature", label: "Signature" },
+  { value: "photo", label: "Photo" },
+];
+const SAFETY_CATEGORIES = ["Hazard Assessment", "Toolbox Talk", "Equipment Inspection", "Incident Report", "Site Orientation"];
+const REPEAT_SCHEDULES = [
+  { value: "none", label: "No schedule — fill out any time" },
+  { value: "daily", label: "Daily — once per worker, per job, per day" },
+  { value: "weekly", label: "Weekly — once per worker, per job, per week" },
+];
+
+const SAFETY_FOLDER = "safety";
+const bmbSafetyFiles = {
+  async upload(blob, ext, contentType) {
+    const path = CURRENT_COMPANY_ID + "/" + SAFETY_FOLDER + "/" + uuid() + "." + ext;
+    const { error } = await supa.storage.from(MEDIA_BUCKET).upload(path, blob, { contentType, upsert: false });
+    if (error) throw error;
+    return path;
+  },
+  signedUrl: (path, expires = 3600) => bmbMedia.signedUrl(path, expires),
+};
+
+const blobToDataUrl = blob => new Promise(res => {
+  const r = new FileReader();
+  r.onload = () => res(r.result);
+  r.onerror = () => res(null);
+  r.readAsDataURL(blob);
+});
+const dataUrlToBlob = async dataUrl => (await fetch(dataUrl)).blob();
+
+/* ── Offline submit queue ────────────────────────────────────────────────────
+   A crew in a gravel pit has no signal, and a safety form they filled out is not
+   allowed to evaporate. So EVERY submission takes the same path: it's written to
+   this localStorage queue first (status "pending"), then pushed to the server as
+   soon as there's a connection — on submit, when the browser fires `online`, and
+   on a slow timer in between.
+
+   The row id is generated here, client-side, and reused on every retry. That's
+   what makes a retry safe: if a push actually landed but the response never came
+   back, the retry hits the primary key and Postgres returns 23505 (duplicate),
+   which we treat as "already synced" rather than writing a second copy.
+
+   Photos and signatures ride along as data URLs (already downscaled) and are
+   uploaded to storage during the flush, before the row is inserted. Each upload
+   is written back into the queue as it succeeds, so a flush interrupted halfway
+   doesn't re-upload the files it already got through. */
+const SAFETY_QUEUE_KEY = "bmb_safety_queue";
+const SAFETY_QUEUE_MAX_BYTES = 4 * 1024 * 1024; // localStorage is ~5 MB in most browsers
+
+const safetyListeners = new Set();
+function notifySafetyQueue() { safetyListeners.forEach(fn => { try { fn(); } catch (e) {} }); }
+function readSafetyQueue() { try { return JSON.parse(storage.get(SAFETY_QUEUE_KEY) || "[]"); } catch (e) { return []; } }
+function writeSafetyQueue(q) {
+  const ok = storage.set(SAFETY_QUEUE_KEY, JSON.stringify(q));
+  notifySafetyQueue();
+  return ok;
+}
+// The pending submissions for THIS company — what the UI shows as "not synced yet".
+function pendingSubmissions() { return readSafetyQueue().filter(i => i.companyId === CURRENT_COMPANY_ID); }
+
+// Re-renders a component whenever the queue changes (submit, sync, retry).
+function useSafetyQueue() {
+  const [, setV] = useState(0);
+  useEffect(() => {
+    const fn = () => setV(x => x + 1);
+    safetyListeners.add(fn);
+    return () => safetyListeners.delete(fn);
+  }, []);
+  return pendingSubmissions();
+}
+
+// Queue a submission and try to push it right away. Returns { queued, synced }.
+async function submitSafetyForm({ data, files }) {
+  const item = {
+    id: uuid(),
+    companyId: CURRENT_COMPANY_ID,
+    queuedAt: new Date().toISOString(),
+    data: { ...data, syncStatus: "pending" },
+    files: (files || []).map(f => ({ ...f })),
+  };
+  const q = readSafetyQueue().concat([item]);
+  if (JSON.stringify(q).length > SAFETY_QUEUE_MAX_BYTES) {
+    throw new Error("There are too many un-synced forms stored on this device. Get back in range so they can upload, then try again.");
+  }
+  if (!writeSafetyQueue(q)) throw new Error("Couldn't save this form on the device. Free up some storage and try again.");
+  await flushSafetyQueue();
+  return { queued: true, synced: !readSafetyQueue().some(x => x.id === item.id) };
+}
+
+let safetyFlushing = false;
+async function flushSafetyQueue() {
+  if (safetyFlushing || !CURRENT_COMPANY_ID) return;
+  if (navigator.onLine === false) return;
+  const queued = readSafetyQueue().filter(i => i.companyId === CURRENT_COMPANY_ID);
+  if (!queued.length) return;
+  safetyFlushing = true;
+  try {
+    for (const item of queued) {
+      try {
+        // 1. Upload any file that hasn't made it to storage yet, recording each
+        //    path back into the queue so a later retry doesn't upload it twice.
+        for (const f of item.files || []) {
+          if (f.path) continue;
+          const blob = await dataUrlToBlob(f.dataUrl);
+          f.path = await bmbSafetyFiles.upload(blob, f.ext || "jpg", f.mime || "image/jpeg");
+          f.dataUrl = ""; // uploaded — drop the heavy copy from local storage
+          writeSafetyQueue(readSafetyQueue().map(x => (x.id === item.id ? item : x)));
+        }
+        // 2. Insert the row under its client-generated id.
+        const sig = (item.files || []).find(f => f.kind === "signature");
+        const data = {
+          ...item.data,
+          signaturePath: sig ? sig.path : "",
+          photoPaths: (item.files || []).filter(f => f.kind === "photo").map(f => f.path).filter(Boolean),
+          syncStatus: "synced",
+          syncedAt: new Date().toISOString(),
+        };
+        const { error } = await supa.from("records").insert({ id: item.id, company_id: item.companyId, collection: "formsubmissions", data });
+        if (error && error.code !== "23505") throw error; // 23505 → a previous try already landed it
+        writeSafetyQueue(readSafetyQueue().filter(x => x.id !== item.id));
+        if (!(store.formsubmissions || []).some(r => r._id === item.id)) {
+          const now = new Date().toISOString();
+          store.formsubmissions.unshift({ ...data, _id: item.id, _createdDate: item.queuedAt || now, _updatedDate: now });
+        }
+        notifyData();
+      } catch (e) {
+        // Still offline, or the upload failed — leave everything queued and stop;
+        // the next online event or timer tick picks up where this left off.
+        console.warn("Safety form still pending sync:", e && (e.message || e));
+        break;
+      }
+    }
+  } finally {
+    safetyFlushing = false;
+    notifySafetyQueue();
+  }
+}
+
+// Keeps the queue draining for as long as the app is open.
+function startSafetySync() {
+  if (window.__bmbSafetySync) return;
+  window.__bmbSafetySync = true;
+  window.addEventListener("online", () => { flushSafetyQueue(); });
+  setInterval(() => { flushSafetyQueue(); }, 45000);
+  flushSafetyQueue();
+}
+
+/* ── Certifications ────────────────────────────────────────────────────────── */
+const CERT_WARN_DAYS = 30; // "expiring soon" window
+
+function certState(cert) {
+  const exp = (cert && cert.expiryDate) || "";
+  if (!exp) return { state: "none", days: null };
+  const days = Math.round((new Date(exp + "T00:00:00") - new Date(today() + "T00:00:00")) / 86400000);
+  if (days < 0) return { state: "expired", days };
+  if (days <= CERT_WARN_DAYS) return { state: "expiring", days };
+  return { state: "valid", days };
+}
+// Everything expired or inside the warning window, soonest first — the list the
+// admin dashboard flags on sign-in.
+function certAlerts() {
+  return getCol("certifications")
+    .map(c => ({ cert: c, ...certState(c) }))
+    .filter(x => x.state === "expired" || x.state === "expiring")
+    .sort((a, b) => a.days - b.days);
+}
+function workersWithExpiredCerts() {
+  const names = new Set();
+  getCol("certifications").forEach(c => {
+    if (certState(c).state === "expired") names.add(String(c.workerName || "").trim());
+  });
+  return names;
+}
+
+/* ── Templates ─────────────────────────────────────────────────────────────── */
+// An empty assignedJobs list means "every job" — the common case.
+const templateAppliesToJob = (t, jobId) =>
+  !Array.isArray(t.assignedJobs) || t.assignedJobs.length === 0 || t.assignedJobs.includes(jobId);
+
+// Which repeat window a timestamp falls in. Two submissions share a key when the
+// schedule considers them the same round ("already done today" / "…this week").
+function schedulePeriodKey(schedule, iso) {
+  const d = iso ? new Date(iso) : new Date();
+  if (schedule === "daily") return dateStr(d);
+  if (schedule === "weekly") {
+    const monday = new Date(d);
+    monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+    return "W" + dateStr(monday);
+  }
+  return ""; // no schedule → never counts as already done
+}
+
+// Has this worker already filed this form for this job in the current window?
+function submissionDoneThisPeriod(template, jobId, workerName, extraPending) {
+  if (!template.repeatSchedule || template.repeatSchedule === "none") return null;
+  const key = schedulePeriodKey(template.repeatSchedule);
+  const all = getCol("formsubmissions").concat((extraPending || []).map(p => p.data));
+  return all.find(s =>
+    s.templateId === template._id &&
+    s.jobId === jobId &&
+    s.workerName === workerName &&
+    schedulePeriodKey(template.repeatSchedule, s.submittedAt) === key
+  ) || null;
+}
 
 /* ─── Shared helpers ─────────────────────────────────────────────────────── */
 function fmt(n, currency = "CAD") {
@@ -1818,6 +2041,12 @@ function JobsPage() {
   const clientNames = useMemo(() => db.getAll("clients").items.map(c => c.clientName).filter(Boolean), []);
   const employeeNames = useMemo(() => db.getAll("employees").items.filter(e => e.isActive !== false).map(e => e.fullName).filter(Boolean), []);
   const canPrivate = user?.role === "Owner" || user?.role === "Manager";
+  // Someone with a lapsed ticket can still be assigned — blocking it outright would
+  // stall real work, and only the office knows whether this particular job needs
+  // that ticket. But the name is marked in the picker, so it's a decision rather
+  // than a surprise. Certifications live on the Safety & Compliance page.
+  const expiredCertWorkers = workersWithExpiredCerts();
+  const crewOptions = employeeNames.map(n => ({ value: n, label: expiredCertWorkers.has(n) ? n + "  ⛔ expired cert" : n }));
 
   const crew = v => (Array.isArray(v) && v.length ? v.join(", ") : "—");
 
@@ -1828,7 +2057,7 @@ function JobsPage() {
     { key: "startDate", label: "Start Date", type: "date" },
     { key: "endDate", label: "End Date", type: "date" },
     { key: "jobStatus", label: "Status", type: "select", options: ["Pending", "Active", "In Progress", "Completed", "On Hold"] },
-    { key: "assignedEmployees", label: "Assign Employees", type: "multiselect", options: employeeNames, emptyHint: "Add employees on the Employees page first." },
+    { key: "assignedEmployees", label: "Assign Employees", type: "multiselect", options: crewOptions, emptyHint: "Add employees on the Employees page first." },
     ...(canPrivate ? [{
       key: "visibility", label: "Visibility", type: "select",
       options: [{ value: "private", label: "Private — only owners, managers & assigned crew" }, { value: "all", label: "Everyone in the company" }],
@@ -2245,9 +2474,755 @@ function ContractsPage() {
   />;
 }
 
+/* ─── Safety module UI ───────────────────────────────────────────────────────
+   Four screens sharing one nav entry:
+     Fill Out       — the worker view: their job, the forms it needs, sign & send
+     Submissions    — the admin history, filterable by job / worker / date
+     Templates      — the form builder (admin)
+     Certifications — tickets and expiry dates (admin edits, workers see their own)
+   Plus "Equipment Checks", the original simple checklist page, kept as-is.
+──────────────────────────────────────────────────────────────────────────────*/
+
+// Draw-with-your-finger signature box. Exports a PNG data URL; the file itself
+// isn't uploaded until the submission syncs, so signing works offline.
+function SignaturePad({ value, onChange, height = 150 }) {
+  const ref = useRef(null);
+  const drawing = useRef(false);
+  const last = useRef(null);
+
+  const ctxOf = () => ref.current && ref.current.getContext("2d");
+  const paintBase = (ctx, w, h) => {
+    ctx.fillStyle = "#FFFFFF"; ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = "#111827"; ctx.lineWidth = 2.2; ctx.lineCap = "round"; ctx.lineJoin = "round";
+  };
+
+  useEffect(() => {
+    const c = ref.current;
+    if (!c) return;
+    // Back the canvas at device resolution so the line isn't a blurry smear on a
+    // phone, but keep drawing in CSS pixels.
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth || 300;
+    c.width = Math.round(w * dpr); c.height = Math.round(height * dpr);
+    const ctx = c.getContext("2d");
+    ctx.scale(dpr, dpr);
+    paintBase(ctx, w, height);
+    if (value) { const img = new Image(); img.onload = () => ctx.drawImage(img, 0, 0, w, height); img.src = value; }
+  }, []);
+
+  const at = e => {
+    const r = ref.current.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+  const down = e => {
+    e.preventDefault();
+    if (ref.current.setPointerCapture) { try { ref.current.setPointerCapture(e.pointerId); } catch (err) {} }
+    drawing.current = true; last.current = at(e);
+  };
+  const move = e => {
+    if (!drawing.current) return;
+    e.preventDefault();
+    const ctx = ctxOf(); const p = at(e);
+    ctx.beginPath(); ctx.moveTo(last.current.x, last.current.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+    last.current = p;
+  };
+  const up = () => {
+    if (!drawing.current) return;
+    drawing.current = false;
+    onChange(ref.current.toDataURL("image/png"));
+  };
+  const clear = () => {
+    const c = ref.current;
+    paintBase(c.getContext("2d"), c.clientWidth || 300, height);
+    onChange("");
+  };
+
+  return (
+    <div>
+      <canvas
+        ref={ref}
+        onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up} onPointerLeave={up}
+        style={{ width: "100%", height, border: "1px dashed " + C.border, borderRadius: 10, background: "#fff", touchAction: "none", cursor: "crosshair", display: "block" }}
+      />
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 }}>
+        <span style={{ fontSize: 11, color: value ? C.green : C.textMuted }}>{value ? "✓ Signed" : "Sign above with your finger or mouse"}</span>
+        <button type="button" onClick={clear} style={{ ...btnOutline, padding: "4px 10px", fontSize: 11 }}>Clear</button>
+      </div>
+    </div>
+  );
+}
+
+// A stored signature/photo, fetched through a short-lived signed URL.
+function SafetyImage({ path, alt, height = 120 }) {
+  const [url, setUrl] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    bmbSafetyFiles.signedUrl(path).then(u => { if (alive) setUrl(u); });
+    return () => { alive = false; };
+  }, [path]);
+  if (!url) return <div style={{ height, background: C.surfaceAlt, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: C.textMuted }}>Loading…</div>;
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer">
+      <img src={url} alt={alt || "Attachment"} style={{ width: "100%", height, objectFit: "contain", background: "#fff", border: "1px solid " + C.border, borderRadius: 8, display: "block" }} />
+    </a>
+  );
+}
+
+/* ── Filling out a form ─────────────────────────────────────────────────────
+   Answers are held in local state until Submit, then handed to the offline queue
+   in one piece. Photos are downscaled hard (1400px / q0.65): they have to sit in
+   localStorage until there's signal, so a 12 MP original is not an option. */
+function SafetyFormFill({ template, job, workerName, workerId, onDone, onCancel, compact }) {
+  const fields = Array.isArray(template.fields) ? template.fields : [];
+  const [answers, setAnswers] = useState({});
+  const [photos, setPhotos] = useState({});   // fieldId → { dataUrl, name }
+  const [sigs, setSigs] = useState({});       // fieldId → PNG data URL
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const set = (id, v) => setAnswers(a => ({ ...a, [id]: v }));
+
+  const addPhoto = async (fieldId, file) => {
+    if (!file) return;
+    setError("");
+    try {
+      const blob = await downscaleImage(file, 1400, 0.65);
+      const dataUrl = await blobToDataUrl(blob);
+      if (!dataUrl) throw new Error("Couldn't read that photo.");
+      setPhotos(p => ({ ...p, [fieldId]: { dataUrl, name: file.name || "photo.jpg" } }));
+    } catch (e) { setError(e.message || String(e)); }
+  };
+
+  const submit = async () => {
+    // Required fields: a signature/photo counts as answered when one is captured.
+    const missing = fields.filter(f => {
+      if (!f.required) return false;
+      if (f.type === "signature") return !sigs[f.id];
+      if (f.type === "photo") return !photos[f.id];
+      if (f.type === "checkbox") return !answers[f.id];
+      return !String(answers[f.id] ?? "").trim();
+    });
+    if (missing.length) { setError('"' + (missing[0].label || "A field") + '" is required.'); return; }
+
+    setBusy(true); setError("");
+    const files = [];
+    fields.forEach(f => {
+      if (f.type === "signature" && sigs[f.id]) files.push({ kind: "signature", fieldId: f.id, dataUrl: sigs[f.id], ext: "png", mime: "image/png" });
+      if (f.type === "photo" && photos[f.id]) files.push({ kind: "photo", fieldId: f.id, dataUrl: photos[f.id].dataUrl, ext: "jpg", mime: "image/jpeg", name: photos[f.id].name });
+    });
+    // Answers are keyed by field id, but the label is stored alongside so a
+    // submission still reads correctly after someone renames a template field.
+    const answerRows = fields.map(f => ({
+      id: f.id, label: f.label, type: f.type,
+      value: f.type === "signature" ? (sigs[f.id] ? "Signed" : "")
+        : f.type === "photo" ? (photos[f.id] ? (photos[f.id].name || "Photo") : "")
+        : f.type === "checkbox" ? !!answers[f.id]
+        : (answers[f.id] ?? ""),
+    }));
+    try {
+      const res = await submitSafetyForm({
+        data: {
+          templateId: template._id, templateTitle: template.title, category: template.category || "",
+          repeatSchedule: template.repeatSchedule || "none",
+          workerName, workerId: workerId || null,
+          jobId: job ? job._id : "", jobName: job ? job.jobTitle : "",
+          submittedAt: new Date().toISOString(), entryDate: today(),
+          answers: answerRows,
+        },
+        files,
+      });
+      onDone(res);
+    } catch (e) { setError(e.message || String(e)); setBusy(false); }
+  };
+
+  const lbl = f => (
+    <div style={{ fontSize: 12, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 5 }}>
+      {f.label}{f.required && <span style={{ color: C.destructive }}> *</span>}
+    </div>
+  );
+
+  return (
+    <div>
+      {!compact && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 13, color: C.textMuted }}>{job ? job.jobTitle : "No job"} · {workerName}</div>
+        </div>
+      )}
+      {error && <div style={{ background: "#FEF2F2", color: "#DC2626", padding: "10px 14px", borderRadius: 8, marginBottom: 14, fontSize: 13 }}>{error}</div>}
+
+      {fields.length === 0 && <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 14 }}>This template has no questions yet.</div>}
+
+      {fields.map(f => (
+        <div key={f.id} style={{ marginBottom: 16 }}>
+          {f.type !== "checkbox" && lbl(f)}
+          {f.type === "text" && <TextInput value={answers[f.id]} onChange={v => set(f.id, v)} placeholder={f.placeholder || ""} style={compact ? mInput : {}} />}
+          {f.type === "choice" && (
+            <div style={{ display: "grid", gap: 6 }}>
+              {(f.options || []).map(o => {
+                const on = answers[f.id] === o;
+                return (
+                  <button type="button" key={o} onClick={() => set(f.id, o)}
+                    style={{ textAlign: "left", padding: "10px 12px", borderRadius: 9, cursor: "pointer", fontSize: 14, fontWeight: on ? 700 : 500,
+                             border: "1px solid " + (on ? C.green : C.border), background: on ? "#F0FDF4" : C.surface, color: C.text }}>
+                    {on ? "● " : "○ "}{o}
+                  </button>
+                );
+              })}
+              {(f.options || []).length === 0 && <div style={{ fontSize: 12, color: C.textMuted }}>No choices set on this question.</div>}
+            </div>
+          )}
+          {f.type === "checkbox" && <Checkbox checked={!!answers[f.id]} onChange={v => set(f.id, v)} label={f.label + (f.required ? " *" : "")} />}
+          {f.type === "signature" && <SignaturePad value={sigs[f.id] || ""} onChange={v => setSigs(s => ({ ...s, [f.id]: v }))} />}
+          {f.type === "photo" && (
+            <div>
+              {photos[f.id]
+                ? <img src={photos[f.id].dataUrl} alt={f.label} style={{ width: "100%", maxHeight: 220, objectFit: "contain", border: "1px solid " + C.border, borderRadius: 10, background: "#fff", display: "block", marginBottom: 6 }} />
+                : null}
+              <label style={{ ...btnOutline, display: "inline-block", cursor: "pointer" }}>
+                {photos[f.id] ? "Retake / choose another" : "📷 Take or choose a photo"}
+                <input type="file" accept="image/*" style={{ display: "none" }} onChange={e => addPhoto(f.id, e.target.files && e.target.files[0])} />
+              </label>
+            </div>
+          )}
+        </div>
+      ))}
+
+      <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+        <button type="button" onClick={onCancel} disabled={busy} style={{ ...btnOutline, flex: 1, ...(compact ? { padding: 14, fontSize: 15 } : {}) }}>Cancel</button>
+        <button type="button" onClick={submit} disabled={busy} style={{ ...btnSecondary, flex: 2, opacity: busy ? 0.6 : 1, ...(compact ? { padding: 14, fontSize: 15 } : {}) }}>
+          {busy ? "Submitting…" : "Submit form"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ── The form builder (admin) ─────────────────────────────────────────────── */
+function TemplateBuilder({ template, onSave, onCancel }) {
+  const [t, setT] = useState(() => ({
+    title: "", category: SAFETY_CATEGORIES[0], repeatSchedule: "none", assignedJobs: [], active: true, fields: [],
+    ...template,
+  }));
+  const [error, setError] = useState("");
+  const jobs = useMemo(() => jobsByClient(getCol("jobs")), []);
+  const set = (k, v) => setT(p => ({ ...p, [k]: v }));
+  const fields = t.fields || [];
+  const setFields = f => set("fields", f);
+  const patch = (i, p) => setFields(fields.map((f, fi) => (fi === i ? { ...f, ...p } : f)));
+  const addField = () => setFields([...fields, { id: genId(), type: "text", label: "", required: false, options: [] }]);
+  const removeField = i => setFields(fields.filter((_, fi) => fi !== i));
+  const moveField = (i, d) => {
+    const j = i + d;
+    if (j < 0 || j >= fields.length) return;
+    const next = fields.slice();
+    next[i] = fields[j]; next[j] = fields[i];
+    setFields(next);
+  };
+
+  const save = () => {
+    if (!String(t.title || "").trim()) { setError("Give the form a title."); return; }
+    if (!fields.length) { setError("Add at least one question."); return; }
+    const unlabelled = fields.find(f => !String(f.label || "").trim());
+    if (unlabelled) { setError("Every question needs a label."); return; }
+    const emptyChoice = fields.find(f => f.type === "choice" && (f.options || []).filter(o => String(o).trim()).length < 2);
+    if (emptyChoice) { setError('"' + emptyChoice.label + '" needs at least two choices.'); return; }
+    onSave({ ...t, fields: fields.map(f => ({ ...f, options: (f.options || []).map(o => String(o).trim()).filter(Boolean) })) });
+  };
+
+  return (
+    <div>
+      {error && <div style={{ background: "#FEF2F2", color: "#DC2626", padding: "10px 14px", borderRadius: 8, marginBottom: 14, fontSize: 13 }}>{error}</div>}
+      <Field label="Form Title" required><TextInput value={t.title} onChange={v => set("title", v)} placeholder="Daily Hazard Assessment" /></Field>
+      <div className="grid-2" style={{ gap: 12 }}>
+        <Field label="Category">
+          <input list="safety-categories" value={t.category || ""} onChange={e => set("category", e.target.value)} placeholder="Hazard Assessment" style={inputCls} />
+          <datalist id="safety-categories">{SAFETY_CATEGORIES.map(c => <option key={c} value={c} />)}</datalist>
+        </Field>
+        <Field label="Repeat Schedule">
+          <Select value={t.repeatSchedule || "none"} onChange={v => set("repeatSchedule", v)} options={REPEAT_SCHEDULES} />
+        </Field>
+      </div>
+      <Field label={"Jobs this form applies to" + ((t.assignedJobs || []).length ? " (" + t.assignedJobs.length + ")" : " — leave empty for every job")}>
+        {jobs.length === 0
+          ? <div style={{ fontSize: 13, color: C.textMuted }}>No jobs yet.</div>
+          : (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 6, maxHeight: 170, overflowY: "auto" }}>
+              {jobs.map(j => {
+                const on = (t.assignedJobs || []).includes(j._id);
+                return <Checkbox key={j._id} checked={on} label={j.jobTitle} onChange={v => set("assignedJobs", v ? [...(t.assignedJobs || []), j._id] : (t.assignedJobs || []).filter(x => x !== j._id))} />;
+              })}
+            </div>
+          )}
+      </Field>
+      <div style={{ marginBottom: 10 }}><Checkbox checked={t.active !== false} onChange={v => set("active", v)} label="Active — crews can fill this out" /></div>
+
+      <div style={{ borderTop: "1px solid " + C.border, paddingTop: 14, marginTop: 6 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <span style={{ fontSize: 13, fontWeight: 700 }}>Questions ({fields.length})</span>
+          <button type="button" onClick={addField} style={btnOutline}>+ Add question</button>
+        </div>
+        {fields.length === 0 && <div style={{ fontSize: 13, color: C.textMuted, background: C.surfaceAlt, borderRadius: 8, padding: 16, textAlign: "center" }}>No questions yet — add the first one.</div>}
+        {fields.map((f, i) => (
+          <div key={f.id} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 12, marginBottom: 10, background: C.surfaceAlt }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+              <span style={{ fontSize: 12, fontWeight: 800, color: C.textMuted, width: 20 }}>{i + 1}.</span>
+              <input value={f.label} onChange={e => patch(i, { label: e.target.value })} placeholder="Question / item…" style={{ ...inputCls, flex: 1 }} />
+              <button type="button" onClick={() => moveField(i, -1)} disabled={i === 0} title="Move up" style={{ ...btnOutline, padding: "7px 9px", opacity: i === 0 ? 0.4 : 1 }}>↑</button>
+              <button type="button" onClick={() => moveField(i, 1)} disabled={i === fields.length - 1} title="Move down" style={{ ...btnOutline, padding: "7px 9px", opacity: i === fields.length - 1 ? 0.4 : 1 }}>↓</button>
+              <button type="button" onClick={() => removeField(i)} title="Remove" style={{ ...btnOutline, padding: "7px 9px", color: C.destructive }}>×</button>
+            </div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <Select value={f.type} onChange={v => patch(i, { type: v })} options={SAFETY_FIELD_TYPES} style={{ width: 170 }} />
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                <input type="checkbox" checked={!!f.required} onChange={e => patch(i, { required: e.target.checked })} style={{ accentColor: C.green, cursor: "pointer" }} />
+                Required
+              </label>
+            </div>
+            {f.type === "choice" && (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 4 }}>Choices (one per line)</div>
+                <textarea
+                  value={(f.options || []).join("\n")}
+                  onChange={e => patch(i, { options: e.target.value.split("\n") })}
+                  rows={3} placeholder={"Pass\nFail\nN/A"} style={{ ...inputCls, resize: "vertical" }}
+                />
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+        <button type="button" onClick={onCancel} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+        <button type="button" onClick={save} style={{ ...btnSecondary, flex: 1 }}>Save template</button>
+      </div>
+    </div>
+  );
+}
+
+// One submission, read-only — the same view for the admin history and for a
+// worker looking back at what they signed.
+function SubmissionDetail({ sub }) {
+  const rows = Array.isArray(sub.answers) ? sub.answers : [];
+  const photos = Array.isArray(sub.photoPaths) ? sub.photoPaths : [];
+  return (
+    <div>
+      <div style={{ fontSize: 17, fontWeight: 800 }}>{sub.templateTitle || "Form"}</div>
+      <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 14 }}>
+        {sub.workerName} · {sub.jobName || "No job"} · {new Date(sub.submittedAt).toLocaleString()}
+        {sub.syncStatus === "pending" && <> · <Badge color="#FEFCE8" textColor="#CA8A04">Pending sync</Badge></>}
+      </div>
+      {rows.map(r => (
+        <div key={r.id} style={{ padding: "9px 0", borderBottom: "1px solid " + C.border }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{r.label}</div>
+          <div style={{ fontSize: 14 }}>
+            {r.type === "checkbox" ? (r.value ? "✅ Yes" : "❌ No") : (String(r.value ?? "").trim() || "—")}
+          </div>
+        </div>
+      ))}
+      {sub.signaturePath && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 5 }}>Signature</div>
+          <SafetyImage path={sub.signaturePath} alt="Signature" height={110} />
+        </div>
+      )}
+      {photos.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 5 }}>Photos</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 8 }}>
+            {photos.map(p => <SafetyImage key={p} path={p} alt="Form photo" height={130} />)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Small badge telling the crew whether their work is on the server yet.
+// Tracks the browser's own online/offline flag so the banner below can say which
+// it is. (It only reports whether there's a network at all — a "connected" phone
+// with one bar and no throughput still fails; that's what the retry loop is for.)
+function useOnline() {
+  const [on, setOn] = useState(() => (typeof navigator.onLine === "boolean" ? navigator.onLine : true));
+  useEffect(() => {
+    const up = () => setOn(true), down = () => setOn(false);
+    window.addEventListener("online", up);
+    window.addEventListener("offline", down);
+    return () => { window.removeEventListener("online", up); window.removeEventListener("offline", down); };
+  }, []);
+  return on;
+}
+
+function SyncStatusBar({ pending }) {
+  const online = useOnline();
+  if (!pending.length) return null;
+  return (
+    <div style={{ background: "#FEFCE8", border: "1px solid #FDE68A", color: "#92400E", borderRadius: 10, padding: "10px 14px", marginBottom: 14, fontSize: 13, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <span>⏳ {pending.length} form{pending.length > 1 ? "s" : ""} saved on this device, waiting to sync{online ? "" : " — you're offline"}.</span>
+      <button type="button" onClick={() => flushSafetyQueue()} style={{ ...btnOutline, padding: "5px 12px", fontSize: 12 }}>Try now</button>
+    </div>
+  );
+}
+
+/* ── Worker view: pick your job, fill what it needs ────────────────────────── */
+function SafetyFillOut({ compact }) {
+  useDataVersion();
+  const pending = useSafetyQueue();
+  const { user } = useAuth();
+  const workerName = user?.name || "";
+  const allJobs = jobsByClient(getCol("jobs"));
+  // "Their current job": the jobs they're assigned to, if any — otherwise every
+  // job they can see, because assignment is optional in this app.
+  const myJobs = allJobs.filter(j => Array.isArray(j.assignedEmployees) && j.assignedEmployees.includes(workerName));
+  const jobs = myJobs.length ? myJobs : allJobs;
+  const [jobId, setJobId] = useState(() => (jobs[0] ? jobs[0]._id : ""));
+  const job = jobs.find(j => j._id === jobId) || null;
+  const [filling, setFilling] = useState(null);
+  const [done, setDone] = useState("");
+
+  const templates = getCol("formtemplates")
+    .filter(t => t.active !== false && templateAppliesToJob(t, jobId))
+    .sort((a, b) => String(a.title || "").localeCompare(String(b.title || "")));
+
+  const finish = res => {
+    setFilling(null);
+    setDone(res.synced ? "Form submitted." : "Saved on this device — it'll upload when you're back in range.");
+    setTimeout(() => setDone(""), 6000);
+  };
+
+  const CardW = compact ? mCard : card;
+
+  return (
+    <div>
+      <SyncStatusBar pending={pending} />
+      {done && <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", color: "#166534", borderRadius: 10, padding: "10px 14px", marginBottom: 14, fontSize: 13 }}>✓ {done}</div>}
+
+      <div style={{ ...CardW, marginBottom: 12 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 6 }}>Job</div>
+        {jobs.length === 0
+          ? <div style={{ fontSize: 13, color: C.textMuted }}>No jobs yet — forms attach to a job.</div>
+          : <Select value={jobId} onChange={setJobId} options={jobs.map(j => ({ value: j._id, label: jobLabel(j) }))} style={compact ? mInput : {}} />}
+        {myJobs.length > 0 && <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>Showing the jobs you're assigned to.</div>}
+      </div>
+
+      {templates.length === 0
+        ? <div style={{ ...CardW, textAlign: "center", color: C.textMuted, fontSize: 13, padding: "26px 16px" }}>
+            No safety forms are set up for this job yet.
+          </div>
+        : templates.map(t => {
+          const already = submissionDoneThisPeriod(t, jobId, workerName, pending);
+          const period = t.repeatSchedule === "daily" ? "today" : t.repeatSchedule === "weekly" ? "this week" : "";
+          return (
+            <div key={t._id} style={{ ...CardW, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 15, fontWeight: 700 }}>{t.title}</div>
+                <div style={{ fontSize: 12, color: C.textMuted }}>
+                  {t.category || "Safety form"} · {(t.fields || []).length} question{(t.fields || []).length === 1 ? "" : "s"}
+                  {period ? " · " + (t.repeatSchedule === "daily" ? "Daily" : "Weekly") : ""}
+                </div>
+              </div>
+              {already
+                ? <Badge color="#F0FDF4" textColor="#16A34A">✓ Done {period}</Badge>
+                : <button type="button" onClick={() => { setFilling(t); setDone(""); }} style={{ ...btnSecondary, ...(compact ? { padding: "12px 18px", fontSize: 15 } : {}) }}>Fill out</button>}
+            </div>
+          );
+        })}
+
+      {filling && !compact && (
+        <Modal title={filling.title} width={620} onClose={() => setFilling(null)}>
+          <SafetyFormFill template={filling} job={job} workerName={workerName} workerId={user?.id} onDone={finish} onCancel={() => setFilling(null)} />
+        </Modal>
+      )}
+      {filling && compact && (
+        <MobileSheet title={filling.title} onClose={() => setFilling(null)}>
+          <div style={{ padding: 16 }}>
+            <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 12 }}>{job ? job.jobTitle : "No job"} · {workerName}</div>
+            <SafetyFormFill template={filling} job={job} workerName={workerName} workerId={user?.id} onDone={finish} onCancel={() => setFilling(null)} compact />
+          </div>
+        </MobileSheet>
+      )}
+    </div>
+  );
+}
+
+/* ── Admin: submission history ─────────────────────────────────────────────── */
+function SafetySubmissions() {
+  useDataVersion();
+  const pending = useSafetyQueue();
+  const { user } = useAuth();
+  const isAdmin = user?.isOwner || user?.role === "Manager";
+  const [f, setF] = useState({ jobId: "", worker: "", from: "", to: "", templateId: "" });
+  const [viewing, setViewing] = useState(null);
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+
+  const jobs = jobsByClient(getCol("jobs"));
+  const templates = getCol("formtemplates");
+  // A worker only ever sees their own submissions — the database enforces the
+  // same rule, this just keeps the UI honest about it.
+  const mine = s => s.workerName === user?.name || s.workerId === user?.id;
+  const rows = getCol("formsubmissions")
+    .concat(pending.map(p => ({ ...p.data, _id: p.id, _pending: true })))
+    .filter(s => isAdmin || mine(s))
+    .filter(s => !f.jobId || s.jobId === f.jobId)
+    .filter(s => !f.templateId || s.templateId === f.templateId)
+    .filter(s => !f.worker || String(s.workerName || "").toLowerCase().includes(f.worker.toLowerCase()))
+    .filter(s => !f.from || (s.entryDate || "") >= f.from)
+    .filter(s => !f.to || (s.entryDate || "") <= f.to)
+    .sort((a, b) => String(b.submittedAt || "").localeCompare(String(a.submittedAt || "")));
+
+  const exportCsv = () => {
+    const head = ["Submitted", "Form", "Category", "Worker", "Job", "Status", "Answers"];
+    const body = rows.map(s => [
+      new Date(s.submittedAt).toLocaleString(), s.templateTitle || "", s.category || "", s.workerName || "", s.jobName || "",
+      s._pending ? "Pending sync" : "Synced",
+      (Array.isArray(s.answers) ? s.answers : []).map(a => a.label + ": " + (a.type === "checkbox" ? (a.value ? "Yes" : "No") : a.value)).join(" | "),
+    ]);
+    downloadFile("safety-submissions-" + today() + ".csv", toCSV([head, ...body]), "text/csv");
+  };
+
+  return (
+    <div>
+      <SyncStatusBar pending={pending} />
+      <div style={card}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 14 }}>
+          <Field label="Job" style={{ marginBottom: 0 }}>
+            <Select value={f.jobId} onChange={v => set("jobId", v)} placeholder="All jobs" options={jobs.map(j => ({ value: j._id, label: j.jobTitle }))} />
+          </Field>
+          <Field label="Form" style={{ marginBottom: 0 }}>
+            <Select value={f.templateId} onChange={v => set("templateId", v)} placeholder="All forms" options={templates.map(t => ({ value: t._id, label: t.title }))} />
+          </Field>
+          {isAdmin && (
+            <Field label="Worker" style={{ marginBottom: 0 }}>
+              <TextInput value={f.worker} onChange={v => set("worker", v)} placeholder="Name…" />
+            </Field>
+          )}
+          <Field label="From" style={{ marginBottom: 0 }}><TextInput type="date" value={f.from} onChange={v => set("from", v)} /></Field>
+          <Field label="To" style={{ marginBottom: 0 }}><TextInput type="date" value={f.to} onChange={v => set("to", v)} /></Field>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 12, color: C.textMuted }}>{rows.length} submission{rows.length === 1 ? "" : "s"}</span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" onClick={() => setF({ jobId: "", worker: "", from: "", to: "", templateId: "" })} style={btnOutline}>Clear filters</button>
+            <button type="button" onClick={exportCsv} disabled={!rows.length} style={{ ...btnOutline, opacity: rows.length ? 1 : 0.5 }}>Export CSV</button>
+          </div>
+        </div>
+      </div>
+
+      <div style={card}>
+        <DataTable
+          columns={[
+            { key: "submittedAt", label: "Submitted", render: v => (v ? new Date(v).toLocaleString() : "—") },
+            { key: "templateTitle", label: "Form" },
+            { key: "workerName", label: "Worker" },
+            { key: "jobName", label: "Job" },
+            { key: "category", label: "Category" },
+            { key: "syncStatus", label: "Status", render: (v, row) => row._pending
+              ? <Badge color="#FEFCE8" textColor="#CA8A04">Pending sync</Badge>
+              : <Badge color="#F0FDF4" textColor="#16A34A">Synced</Badge> },
+          ]}
+          rows={rows}
+          onView={setViewing}
+          emptyMessage="No submissions match these filters."
+        />
+      </div>
+
+      {viewing && (
+        <Modal title="Submission" width={620} onClose={() => setViewing(null)}>
+          <SubmissionDetail sub={viewing} />
+          <div style={{ marginTop: 20 }}><button type="button" onClick={() => setViewing(null)} style={{ ...btnSecondary, width: "100%" }}>Close</button></div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ── Admin: template list + builder ────────────────────────────────────────── */
+function SafetyTemplates() {
+  useDataVersion();
+  const [modal, setModal] = useState(null);
+  const templates = getCol("formtemplates").sort((a, b) => String(a.title || "").localeCompare(String(b.title || "")));
+
+  const save = t => {
+    if (t._id && getCol("formtemplates").some(x => x._id === t._id)) db.update("formtemplates", t);
+    else db.create("formtemplates", t);
+    setModal(null);
+    notifyData();
+  };
+  const del = async t => {
+    const used = getCol("formsubmissions").filter(s => s.templateId === t._id).length;
+    const msg = used
+      ? "Delete “" + t.title + "”? Its " + used + " past submission" + (used === 1 ? "" : "s") + " stay in the history, but no one can fill it out again."
+      : "Delete “" + t.title + "”? This can't be undone.";
+    if (await confirmDialog(msg)) { db.remove("formtemplates", t._id); notifyData(); }
+  };
+  const jobLabelFor = ids => {
+    if (!Array.isArray(ids) || !ids.length) return "All jobs";
+    const jobs = getCol("jobs");
+    return ids.map(id => (jobs.find(j => j._id === id) || {}).jobTitle || "?").join(", ");
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 14 }}>
+        <button type="button" onClick={() => setModal({ mode: "create", data: {} })} style={btnSecondary}>+ New template</button>
+      </div>
+      {templates.length === 0
+        ? <EmptyState icon="📋" title="No form templates yet"
+            subtitle="Build the forms your crews fill out — hazard assessments, toolbox talks, equipment inspections."
+            action={<button type="button" onClick={() => setModal({ mode: "create", data: {} })} style={btnSecondary}>Create template</button>} />
+        : (
+          <div style={card}>
+            <DataTable
+              columns={[
+                { key: "title", label: "Form" },
+                { key: "category", label: "Category" },
+                { key: "repeatSchedule", label: "Repeats", render: v => ((REPEAT_SCHEDULES.find(r => r.value === (v || "none")) || {}).label || "").split(" — ")[0] },
+                { key: "fields", label: "Questions", render: v => (Array.isArray(v) ? v.length : 0) },
+                { key: "assignedJobs", label: "Applies to", render: jobLabelFor },
+                { key: "_subs", label: "Submissions", render: (_v, row) => getCol("formsubmissions").filter(s => s.templateId === row._id).length },
+                { key: "active", label: "Active", render: v => (v !== false ? "✅" : "—") },
+              ]}
+              rows={templates}
+              onEdit={t => setModal({ mode: "edit", data: t })}
+              onDelete={del}
+            />
+          </div>
+        )}
+      {modal && (
+        <Modal title={modal.mode === "create" ? "New form template" : "Edit template"} width={640} onClose={() => setModal(null)}>
+          <TemplateBuilder template={modal.data} onSave={save} onCancel={() => setModal(null)} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ── Certifications ────────────────────────────────────────────────────────── */
+function CertBadge({ cert }) {
+  const { state, days } = certState(cert);
+  if (state === "expired") return <Badge color="#FEF2F2" textColor="#DC2626">Expired {Math.abs(days)}d ago</Badge>;
+  if (state === "expiring") return <Badge color="#FEFCE8" textColor="#CA8A04">{days === 0 ? "Expires today" : days + "d left"}</Badge>;
+  if (state === "valid") return <Badge color="#F0FDF4" textColor="#16A34A">Valid</Badge>;
+  return <Badge>No expiry</Badge>;
+}
+
+function SafetyCertifications() {
+  useDataVersion();
+  const { user } = useAuth();
+  const isAdmin = user?.isOwner || user?.role === "Manager";
+  const employeeNames = useEmployeeOptions();
+  const [modal, setModal] = useState(null);
+
+  const all = getCol("certifications").sort((a, b) => String(a.expiryDate || "9999").localeCompare(String(b.expiryDate || "9999")));
+  const rows = isAdmin ? all : all.filter(c => c.workerName === user?.name);
+  const alerts = isAdmin ? certAlerts() : [];
+
+  const save = c => {
+    if (c._id && getCol("certifications").some(x => x._id === c._id)) db.update("certifications", c);
+    else db.create("certifications", c);
+    setModal(null);
+    notifyData();
+  };
+  const del = async c => {
+    if (await confirmDialog("Delete " + (c.certificationName || "this certification") + " for " + (c.workerName || "this worker") + "?")) { db.remove("certifications", c._id); notifyData(); }
+  };
+
+  const fields = [
+    { key: "workerName", label: "Worker", required: true, type: "datalist", options: employeeNames, placeholder: "Type or pick an employee" },
+    { key: "certificationName", label: "Certification", required: true, type: "datalist", options: ["First Aid / CPR", "WHMIS", "H2S Alive", "Fall Protection", "Confined Space", "Ground Disturbance", "Class 1 Licence", "Forklift", "Traffic Control"], placeholder: "First Aid / CPR" },
+    { key: "issuer", label: "Issued By", placeholder: "St. John Ambulance" },
+    { key: "issueDate", label: "Issue Date", type: "date" },
+    { key: "expiryDate", label: "Expiry Date", type: "date" },
+    { key: "notes", label: "Notes", type: "textarea", placeholder: "Certificate number, renewal notes…" },
+  ];
+
+  return (
+    <div>
+      {alerts.length > 0 && (
+        <div style={{ ...card, borderColor: "#FDE68A", background: "#FFFBEB" }}>
+          <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8, color: "#92400E" }}>
+            ⚠️ {alerts.length} certification{alerts.length === 1 ? "" : "s"} expired or expiring within {CERT_WARN_DAYS} days
+          </div>
+          {alerts.slice(0, 8).map(a => (
+            <div key={a.cert._id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "5px 0", fontSize: 13 }}>
+              <span><strong>{a.cert.workerName}</strong> — {a.cert.certificationName}</span>
+              <CertBadge cert={a.cert} />
+            </div>
+          ))}
+          {alerts.length > 8 && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 6 }}>+ {alerts.length - 8} more in the table below.</div>}
+        </div>
+      )}
+
+      {isAdmin && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 14 }}>
+          <button type="button" onClick={() => setModal({ data: { _id: uuid() } })} style={btnSecondary}>+ Add certification</button>
+        </div>
+      )}
+
+      {rows.length === 0
+        ? <EmptyState icon="🎓" title="No certifications recorded"
+            subtitle={isAdmin ? "Track tickets and cards so you know before one lapses." : "Nothing on file for you yet."}
+            action={isAdmin ? <button type="button" onClick={() => setModal({ data: { _id: uuid() } })} style={btnSecondary}>Add certification</button> : null} />
+        : (
+          <div style={card}>
+            <DataTable
+              columns={[
+                { key: "workerName", label: "Worker" },
+                { key: "certificationName", label: "Certification" },
+                { key: "issuer", label: "Issued By" },
+                { key: "issueDate", label: "Issued" },
+                { key: "expiryDate", label: "Expires" },
+                { key: "_state", label: "Status", render: (_v, row) => <CertBadge cert={row} /> },
+              ]}
+              rows={rows}
+              onEdit={isAdmin ? (c => setModal({ data: { ...c } })) : undefined}
+              onDelete={isAdmin ? del : undefined}
+            />
+          </div>
+        )}
+
+      {modal && (
+        <Modal title={getCol("certifications").some(x => x._id === modal.data._id) ? "Edit certification" : "Add certification"} onClose={() => setModal(null)}>
+          <CRUDForm fields={fields} data={modal.data} onSave={save} onCancel={() => setModal(null)} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ── The one Safety nav entry, tabbed ──────────────────────────────────────── */
 function SafetyPage() {
+  const { user } = useAuth();
+  const { params } = useRouter();
+  const isAdmin = user?.isOwner || user?.role === "Manager";
+  const TABS = [
+    { id: "fill", label: "Fill Out", node: () => <SafetyFillOut /> },
+    { id: "submissions", label: isAdmin ? "Submissions" : "My Submissions", node: () => <SafetySubmissions /> },
+    ...(isAdmin ? [{ id: "templates", label: "Templates", node: () => <SafetyTemplates /> }] : []),
+    { id: "certifications", label: "Certifications", node: () => <SafetyCertifications /> },
+    { id: "checks", label: "Equipment Checks", node: () => <SafetyChecksPage /> },
+  ];
+  const [tab, setTab] = useState(() => (TABS.some(t => t.id === params?.tab) ? params.tab : "fill"));
+  const active = TABS.find(t => t.id === tab) || TABS[0];
+
+  return (
+    <div>
+      <PageHeader title="Safety & Compliance" subtitle="Digital safety forms, submissions, and worker certifications" />
+      <div style={{ display: "flex", gap: 6, marginBottom: 18, flexWrap: "wrap", borderBottom: "1px solid " + C.border, paddingBottom: 10 }}>
+        {TABS.map(t => (
+          <button type="button" key={t.id} onClick={() => setTab(t.id)}
+            style={{ ...btnBase, background: tab === t.id ? C.secondary : "transparent", color: tab === t.id ? "#fff" : C.textMuted, border: "1px solid " + (tab === t.id ? C.secondary : C.border) }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {active.node()}
+    </div>
+  );
+}
+
+function SafetyChecksPage() {
   return <CRUDPage
-    title="Safety Checks" singular="Safety Check" subtitle="Manage safety check templates and submissions" collection="safetychecks" emptyIcon="🦺"
+    title="Equipment Safety Checks" singular="Safety Check" subtitle="Simple pass/fail equipment checklists — the digital forms above replace these for anything that needs signatures or photos" collection="safetychecks" emptyIcon="🦺"
     defaultValues={{ passFailStatus: true, checkDate: today() }}
     columns={[
       { key: "templateName", label: "Template" },
@@ -3875,10 +4850,30 @@ function Dashboard() {
     .filter(e => (e.entryDate || "").slice(0, 7) === today().slice(0, 7))
     .reduce((s, e) => s + num(e.hoursWorked), 0);
   const pendingShiftRequests = (user?.isOwner || user?.role === "Manager") ? db.getAll("shiftrequests", { status: "Pending" }).total : 0;
+  // The certification check runs every time the dashboard mounts — i.e. on every
+  // sign-in — so a ticket about to lapse is in front of the owner before someone
+  // shows up to a job without it.
+  const certFlags = (user?.isOwner || user?.role === "Manager") ? certAlerts() : [];
+  const expiredCerts = certFlags.filter(a => a.state === "expired").length;
 
   return (
     <div>
       <PageHeader title={"Welcome back, " + (user?.name || "there") + " 👋"} subtitle={company?.companyName} />
+
+      {certFlags.length > 0 && (
+        <div style={{ ...card, borderColor: expiredCerts ? "#FECACA" : "#FDE68A", background: expiredCerts ? "#FEF2F2" : "#FFFBEB", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ fontSize: 13, color: expiredCerts ? "#991B1B" : "#92400E" }}>
+            <strong>{expiredCerts > 0
+              ? "⛔ " + expiredCerts + " expired certification" + (expiredCerts === 1 ? "" : "s")
+              : "⚠️ " + certFlags.length + " certification" + (certFlags.length === 1 ? "" : "s") + " expiring soon"}</strong>
+            {expiredCerts > 0 && certFlags.length > expiredCerts && <span> · {certFlags.length - expiredCerts} more expiring within {CERT_WARN_DAYS} days</span>}
+            <div style={{ marginTop: 4 }}>
+              {certFlags.slice(0, 3).map(a => a.cert.workerName + " — " + a.cert.certificationName).join(" · ")}{certFlags.length > 3 ? " …" : ""}
+            </div>
+          </div>
+          <button type="button" onClick={() => navigate("safety", { tab: "certifications" })} style={btnOutline}>Review certifications</button>
+        </div>
+      )}
 
       <div className={pendingShiftRequests > 0 ? "grid-3" : "grid-2"} style={{ marginBottom: 20 }}>
         <StatCard label="Outstanding (quotes + invoices)" value={fmt(outstanding)} icon="💰" onClick={() => navigate("quotes")} />
@@ -3937,6 +4932,7 @@ function Dashboard() {
             { label: "Log Time", page: "time-entry", icon: "⏱️" },
             { label: "Add Client", page: "clients", icon: "👥" },
             { label: "Vehicle Check", page: "truck-logs", icon: "🚚" },
+            { label: "Safety Form", page: "safety", icon: "🦺" },
           ].map(a => (
             <button type="button" key={a.label} onClick={() => navigate(a.page)} style={{ ...btnOutline, display: "flex", alignItems: "center", gap: 6 }}>
               {a.icon} {a.label}
@@ -5054,7 +6050,7 @@ const NAV = [
   { id: "truck-logs", label: "Vehicle Logs", icon: "🚚" },
   { id: "haul-loads", label: "Haul Loads", icon: "⚖️" },
   { id: "local-sites", label: "Local Sites", icon: "🧭" },
-  { id: "safety", label: "Safety Checks", icon: "🦺" },
+  { id: "safety", label: "Safety & Compliance", icon: "🦺" },
   { id: "inventory", label: "Inventory", icon: "📦" },
   { id: "warehouses", label: "Warehouses", icon: "🏭" },
   { id: "schedule", label: "Schedule", icon: "📅" },
@@ -6217,6 +7213,12 @@ function MobilePhotos() {
   );
 }
 
+// The field app's safety tab — same fill-out flow as the desktop page, in the
+// phone-sized shell the crew actually carries.
+function MobileSafety() {
+  return <SafetyFillOut compact />;
+}
+
 function MobileMore() {
   const { user, logout } = useAuth();
   const { company } = useCompany();
@@ -6261,9 +7263,10 @@ function MobileShell() {
     { id: "log", label: "Daily Log", icon: "📝", nav: "daily-log" },
     { id: "schedule", label: "Schedule", icon: "📅", nav: "schedule" },
     { id: "photos", label: "Photos", icon: "📷", nav: "jobs" },
+    { id: "safety", label: "Safety", icon: "🦺", nav: "safety" },
     { id: "more", label: "More", icon: "⋯", nav: null },
   ].filter(t => !t.nav || can(t.nav) || t.id === "more");
-  const title = { track: "Time Clock", log: "Daily Log", schedule: "Schedule", photos: "Job Photos", more: "More" }[tab];
+  const title = { track: "Time Clock", log: "Daily Log", schedule: "Schedule", photos: "Job Photos", safety: "Safety Forms", more: "More" }[tab];
 
   return (
     <div className="mshell">
@@ -6283,6 +7286,7 @@ function MobileShell() {
         {tab === "log" && (can("daily-log") ? <MobileDailyLog /> : <MobileLocked />)}
         {tab === "schedule" && (can("schedule") ? <MobileSchedule /> : <MobileLocked />)}
         {tab === "photos" && (can("jobs") ? <MobilePhotos /> : <MobileLocked />)}
+        {tab === "safety" && (can("safety") ? <MobileSafety /> : <MobileLocked />)}
         {tab === "more" && <MobileMore />}
       </div>
       <div className="mtabbar">
@@ -6304,6 +7308,10 @@ function AppShell() {
   const isMobile = useIsMobile();
 
   useEffect(() => { setMenuOpen(false); }, [page]);
+  // Drain any safety forms that were filled out with no signal. Starts once the
+  // company is known (CURRENT_COMPANY_ID is set during bootstrap) and then keeps
+  // itself going for the life of the tab.
+  useEffect(() => { if (dataReady) startSafetySync(); }, [dataReady]);
 
   if (!ready) return <FullScreenLoader label="Starting BuildMyBill…" />;
   if (!isAuthenticated) return <LoginPage />;
