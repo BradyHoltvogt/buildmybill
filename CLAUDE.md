@@ -23,7 +23,9 @@ mobilization cost), team management (company join-code + owner approval + granul
 per-section permissions), **time tracking with clocked-vs-logged efficiency**, daily
 logs, work/manager logs, equipment (maintenance readings + general billable equipment
 usage, rolled into Billing & Reports + a per-item usage log), vehicle logs, safety
-checks, inventory, warehouses, scheduling, subcontractors, contracts, billing/reports,
+checks, inventory, **warehouses with a drag-and-drop floor-plan builder** (racks/zones
+placed on a grid, per-zone stock, capacity fill, reorder-threshold alerts),
+scheduling, subcontractors, contracts, billing/reports,
 a market-priced subscriptions page, and an **installable phone-first field app (PWA)**
 with clock-in/out geofence alerts (real phone notifications, foreground-only), live
 crew location + trail for owners/managers while clocked in, hauling-load tracking,
@@ -64,7 +66,7 @@ account changes. Sign in with the owner's normal credentials.
 - **Data model.** One generic `records` table in Postgres: every row is
   `{ company_id, collection, data(jsonb) }`. Collections are listed in the
   `COLLECTIONS` array in `index.html` (jobs, quotes, clients, employees,
-  timeentries, shifts, job_media, job_docs, quote_docs, equipment, …). An
+  timeentries, shifts, job_media, job_docs, quote_docs, equipment, inventory, zones, …). An
   in-memory `store` mirrors the current company's records; writes are optimistic
   (client generates a UUID, unshifts to the store, inserts in the background,
   rolls back + `notifyData()` on error).
@@ -156,6 +158,26 @@ subquery against `public.records` — Postgres throws `42P17 infinite recursion`
   onto the matching `equipment` record (running totals) — separate from general
   **equipment usage** (also loggable from the daily log), which bills hours at the
   equipment's rate and *adds* to its running total instead of overwriting it.
+- **Warehouse floor plans.** A warehouse's plan is a grid (`warehouse.layout =
+  {cols, rows}`); every rack/bin/pile is its own `zones` record holding its OWN
+  `x/y/w/h` in grid cells plus a `capacity`. The spec sketched the rectangles both
+  as a blob on the warehouse and as coordinates on the zone — storing them twice
+  guarantees drift, so the **zone record is the single source of truth for its own
+  rectangle** and the warehouse only owns the grid size. Don't "simplify" this by
+  moving coordinates back onto the warehouse.
+  - Inventory links to a zone by `zoneId`; `zoneLabel` + the warehouse *name* are
+    the text fallback (`itemInZone`) for rows that predate zones or came back from
+    an export where ids changed. `prepareEdit` on the Inventory page upgrades a
+    label-only row to a real id the first time it's edited.
+  - **Reorder-threshold alerts are derived, never stored.** `warehouseStats()`
+    recomputes capacity/used/low-stock from live inventory on every render — there
+    is no cron job and no cached rollup to go stale. `isLowStock` is the one rule.
+  - The builder edits a local draft and writes nothing until Save; it then deletes
+    removed zones (releasing, not deleting, their stock), upserts the rest, and
+    saves the grid size. Renaming a warehouse cascades to its zones, inventory and
+    equipment, since those match by name too.
+  - `zones` is just another collection in the generic `records` table — **no SQL
+    migration was needed** for any of this.
 - **Shifts have no direct edit UI.** Employees can't edit a clocked `shifts` record —
   they request a correction (My Hours → Request a correction), which lands in
   `shiftrequests` (`status: Pending/Approved/Rejected`) and emails the owner/managers.
