@@ -13,8 +13,10 @@ which Claude account is signed in. Read it first, then continue the work.
 
 ## What this is
 
-**BuildMyBill** — a construction/trades business-management SaaS for small-to-midsize
-contractors. Live at **https://www.buildmybill.com**. Owner/operator: **Brady Holtvogt**
+**BuildMyBill** — a business-management SaaS for small-to-midsize service businesses.
+It ships written for construction/trades, and a paid **workspace customization layer**
+reshapes it per company for any industry (lawn care, plumbing, cleaning, hauling, auto
+repair, a law office…). Live at **https://www.buildmybill.com**. Owner/operator: **Brady Holtvogt**
 (Holtvogt Sand and Gravel), contact holtvogtsandandgravel@gmail.com.
 
 Features built: quotes & invoices (line items, tax, PDF print), client CRM, jobs
@@ -24,7 +26,8 @@ per-section permissions), **time tracking with clocked-vs-logged efficiency**, d
 logs, work/manager logs, equipment (maintenance readings + general billable equipment
 usage, rolled into Billing & Reports + a per-item usage log), vehicle logs, safety
 checks, inventory, warehouses, scheduling, subcontractors, contracts, billing/reports,
-a market-priced subscriptions page, and an **installable phone-first field app (PWA)**
+a market-priced subscriptions page, a **guided 3-stage workspace setup** that re-labels
+and re-shapes the whole app per company, and an **installable phone-first field app (PWA)**
 with clock-in/out geofence alerts (real phone notifications, foreground-only), live
 crew location + trail for owners/managers while clocked in, hauling-load tracking,
 "Local Sites" GPS-matched recurring billable locations, and employee self-serve
@@ -135,6 +138,45 @@ subquery against `public.records` — Postgres throws `42P17 infinite recursion`
 
 ---
 
+## Workspace customization layer (per-company)
+
+A company answers three screens at signup — **Your business** (industry, name, logo,
+colours) → **How you work** (wording, workflow stages, which sections exist) → **Review
+& launch** — and the whole app reshapes itself. Owners only; everyone else in the company
+just gets the finished workspace. Reachable later from **Settings → Workspace setup** and
+from the add-on card on **Subscriptions** (route `#/setup`).
+
+- **Where it lives.** All of it is in `companies.settings` (jsonb) via the `BRANDING_KEYS`
+  whitelist: `industry`, `industryDetail`, `terms`, `stages`, `modules`, `setupComplete`,
+  `setupSkipped`, `setupCompletedAt`. **No migration needed** — `settings` already existed.
+- **`syncWorkspace(company)`** runs *during* `AuthProvider`'s render (not an effect):
+  plain helpers like `relabel()` are called mid-render, so the config has to be live before
+  the first paint.
+- **Wording — `relabel(str)`.** Rewrites app-authored copy ("Job" → "Work Order"). It is
+  wired into the shared primitives only — `PageHeader`, `EmptyState`, `Field`, `Modal`,
+  `DataTable` headers, `StatCard`, `Checkbox`, `TextInput` placeholders, `Toast`,
+  `ConfirmHost`, nav labels — so **records are never rewritten**, only UI text.
+  - It compiles **one combined regex, longest match first, single pass**. Do NOT refactor
+    it into a chain of `.replace()` calls: that lets one term's output be caught by the
+    next term's rule ("Job Site" → "Matter Site").
+  - **Never relabel a string twice.** Anything already passed through `relabel()` /
+    `relabelWith()` must not be handed to a primitive as a plain string — wrap it in a
+    `<span>` (non-strings pass through untouched), as the setup screen's section
+    checkboxes do.
+- **Stages — `workflowStages()`.** The job status list. Custom stages with no entry in
+  `STATUS_COLORS` get a colour from `STAGE_FALLBACK` by position.
+- **Sections — `moduleEnabled(id)`,** checked inside `canAccess()`, so switching a section
+  off hides it in the sidebar, the field app and the router for everyone, owner included.
+  `CORE_MODULES` can never be switched off. Turning one back on returns its records
+  untouched — nothing is ever deleted.
+- **Presets are starting points.** `INDUSTRY_PRESETS` prefills wording/stages/sections/
+  colours per trade; every one stays editable on stage 2.
+- **Payment isn't wired.** The Subscriptions add-on card prices the setup
+  (`SETUP_ADDON_PRICE`) the same way plan selection works today — a stated price, no card
+  charged. Real enforcement needs Stripe (still unbuilt).
+
+---
+
 ## Implementation notes — do NOT casually "simplify" these
 
 - **Time-tracking / efficiency model.** Clock in/out writes a `shifts` record (the paid
@@ -167,6 +209,11 @@ subquery against `public.records` — Postgres throws `42P17 infinite recursion`
 ---
 
 ## Current state
+
+The workspace customization layer is built and validated locally (not yet deployed at the
+time of writing). Note: an existing owner with no `setupComplete` flag — including the
+owner's own live company — lands on the guided setup once on their next sign-in, and can
+skip it to keep the stock construction wording.
 
 All planned work through this project's second build phase is **done, tested, and live**:
 market-priced subscriptions page, "Remember me", map locations, job photos/videos with

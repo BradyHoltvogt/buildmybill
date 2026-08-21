@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>BuildMyBill — Construction Business Management</title>
+<title>BuildMyBill — Business Management Built Around Your Trade</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2316A34A'/><text x='16' y='23' font-size='20' font-family='system-ui' font-weight='800' fill='white' text-anchor='middle'>B</text></svg>" />
 <!-- PWA / installable field app -->
 <link rel="manifest" href="manifest.webmanifest" />
@@ -616,6 +616,207 @@ const card = {
   padding: 20, marginBottom: 16,
 };
 
+/* ─── Workspace configuration (per-company customization) ──────────────────
+   BuildMyBill ships written for construction, but every company reshapes it to
+   their own trade in the guided setup (Settings → Workspace setup). Their
+   answers live in the company's `settings` row and are applied here, at the UI
+   layer only:
+     · relabel()        — rewrites app copy: "Job" → "Work Order", "Client" → "Customer"
+     · workflowStages() — the stage list a job moves through
+     · moduleEnabled()  — which sections this company has at all
+   Records are never rewritten, so a company can change its wording or turn a
+   section back on later without touching a single row of their data. */
+
+// The words the stock UI is written in — each one is replaceable per company.
+const BASE_TERMS = {
+  job:       { one: "Job",       many: "Jobs",       hint: "The main piece of work you take on" },
+  client:    { one: "Client",    many: "Clients",    hint: "The people who pay you" },
+  quote:     { one: "Quote",     many: "Quotes",     hint: "The price you send before the work" },
+  invoice:   { one: "Invoice",   many: "Invoices",   hint: "The bill you send after the work" },
+  employee:  { one: "Employee",  many: "Employees",  hint: "The people who work for you" },
+  crew:      { one: "Crew",      many: "Crews",      hint: "A group working together" },
+  equipment: { one: "Equipment", many: "Equipment",  hint: "Machines, tools and gear" },
+  material:  { one: "Material",  many: "Materials",  hint: "Stock you keep on hand" },
+  site:      { one: "Site",      many: "Sites",      hint: "Where the work happens" },
+};
+
+// Sections every company keeps — the app makes no sense without them.
+const CORE_MODULES = ["dashboard", "clients", "jobs", "quotes", "quote-editor", "billing", "schedule", "team", "settings", "subscriptions", "profile", "setup"];
+
+const DEFAULT_STAGES = ["Pending", "Active", "In Progress", "Completed", "On Hold"];
+
+/* Starting points, not straitjackets: picking a trade prefills the wording, the
+   stages, the sections and the colours, and every one of them stays editable in
+   the next step of setup. `off` lists the sections that trade has no use for. */
+const INDUSTRY_PRESETS = [
+  {
+    id: "construction", label: "Construction & trades", icon: "🏗️",
+    blurb: "Site work, excavation, concrete, general contracting",
+    colors: { primary: "#111827", secondary: "#16A34A" },
+    terms: {}, stages: DEFAULT_STAGES.slice(), off: [],
+  },
+  {
+    id: "landscaping", label: "Lawn care & landscaping", icon: "🌿",
+    blurb: "Mowing, snow removal, yard maintenance, planting",
+    colors: { primary: "#14532D", secondary: "#65A30D" },
+    terms: { client: { one: "Customer", many: "Customers" }, site: { one: "Property", many: "Properties" } },
+    stages: ["Scheduled", "In Progress", "Completed", "On Hold"],
+    off: ["haul-loads", "warehouses", "manager-logs", "contracts"],
+  },
+  {
+    id: "trades", label: "Plumbing, HVAC & electrical", icon: "🔧",
+    blurb: "Service calls, installs, maintenance contracts",
+    colors: { primary: "#111827", secondary: "#F97316" },
+    terms: {
+      job: { one: "Work Order", many: "Work Orders" }, client: { one: "Customer", many: "Customers" },
+      material: { one: "Part", many: "Parts" }, site: { one: "Job Site", many: "Job Sites" },
+    },
+    stages: ["Requested", "Scheduled", "In Progress", "Completed", "On Hold"],
+    off: ["haul-loads", "manager-logs"],
+  },
+  {
+    id: "cleaning", label: "Cleaning & janitorial", icon: "🧽",
+    blurb: "Recurring commercial or residential cleaning routes",
+    colors: { primary: "#0F172A", secondary: "#0EA5E9" },
+    terms: {
+      job: { one: "Service Visit", many: "Service Visits" }, client: { one: "Customer", many: "Customers" },
+      material: { one: "Supply", many: "Supplies" }, site: { one: "Property", many: "Properties" },
+    },
+    stages: ["Scheduled", "In Progress", "Completed", "Cancelled"],
+    off: ["haul-loads", "truck-logs", "warehouses", "manager-logs", "subcontractors", "equipment"],
+  },
+  {
+    id: "trucking", label: "Trucking & hauling", icon: "🚛",
+    blurb: "Loads, gravel, freight, dispatch",
+    colors: { primary: "#111827", secondary: "#0284C7" },
+    terms: { client: { one: "Customer", many: "Customers" }, employee: { one: "Driver", many: "Drivers" } },
+    stages: ["Booked", "Dispatched", "Hauling", "Delivered", "On Hold"],
+    off: ["inventory", "warehouses", "manager-logs"],
+  },
+  {
+    id: "auto", label: "Auto & equipment repair", icon: "🚗",
+    blurb: "Shop work, repair orders, parts and labour",
+    colors: { primary: "#111827", secondary: "#DC2626" },
+    terms: {
+      job: { one: "Repair Order", many: "Repair Orders" }, client: { one: "Customer", many: "Customers" },
+      material: { one: "Part", many: "Parts" }, site: { one: "Location", many: "Locations" },
+    },
+    stages: ["Checked In", "Awaiting Parts", "In Progress", "Ready for Pickup", "Picked Up"],
+    off: ["haul-loads", "local-sites", "crew-locations", "shift-requests", "truck-logs", "subcontractors", "manager-logs"],
+  },
+  {
+    id: "legal", label: "Law office & professional services", icon: "⚖️",
+    blurb: "Matters, billable hours, retainers, engagements",
+    colors: { primary: "#1E293B", secondary: "#7C3AED" },
+    terms: {
+      job: { one: "Matter", many: "Matters" }, employee: { one: "Staff Member", many: "Staff" },
+      equipment: { one: "Asset", many: "Assets" }, material: { one: "Supply", many: "Supplies" },
+      site: { one: "Location", many: "Locations" }, crew: { one: "Team", many: "Teams" },
+    },
+    stages: ["Intake", "Open", "In Review", "Awaiting Client", "Closed"],
+    off: ["equipment", "truck-logs", "haul-loads", "local-sites", "safety", "inventory", "warehouses",
+          "crew-locations", "shift-requests", "subcontractors", "manager-logs", "employee-logs", "daily-log"],
+  },
+  {
+    id: "other", label: "Something else", icon: "✨",
+    blurb: "Start lean — pick your own wording and switch on only what you need",
+    colors: { primary: "#111827", secondary: "#16A34A" },
+    terms: {}, stages: ["Pending", "In Progress", "Completed", "On Hold"],
+    off: ["equipment", "truck-logs", "haul-loads", "local-sites", "safety", "inventory", "warehouses",
+          "crew-locations", "shift-requests", "subcontractors", "manager-logs", "employee-logs", "daily-log"],
+  },
+];
+
+const presetById = id => INDUSTRY_PRESETS.find(p => p.id === id) || INDUSTRY_PRESETS[0];
+
+// Every section a company may switch off (NAV minus the core ones).
+function optionalModules() {
+  return NAV.filter(n => CORE_MODULES.indexOf(n.id) === -1);
+}
+
+// A preset's `off` list → the {navId: bool} map the company actually stores.
+function modulesFromPreset(preset) {
+  const map = {};
+  optionalModules().forEach(m => { map[m.id] = (preset.off || []).indexOf(m.id) === -1; });
+  return map;
+}
+
+// Rough plural for the setup form, so nobody has to fill in both boxes.
+function pluralOf(word) {
+  const w = String(word || "").trim();
+  if (!w) return "";
+  if (/(s|x|z|ch|sh)$/i.test(w)) return w + "es";
+  if (/[^aeiou]y$/i.test(w)) return w.slice(0, -1) + "ies";
+  return w + "s";
+}
+
+/* The live config. Module-level (not React state) so plain helpers — relabel()
+   inside a table column, workflowStages() inside a form — can read it without
+   every caller needing a hook. syncWorkspace() runs from the auth provider
+   whenever the company record changes. */
+const WS = { terms: {}, stages: DEFAULT_STAGES.slice(), modules: null };
+let TERM_RE = null, TERM_MAP = null;
+
+const escapeRe = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/* One combined regex, longest match first, applied in a single pass — a chain
+   of individual .replace() calls would let one term's replacement get caught by
+   the next term's rule ("Job Site" → "Matter Site"). */
+function compileTerms(terms) {
+  const map = {};
+  Object.keys(BASE_TERMS).forEach(key => {
+    const def = BASE_TERMS[key];
+    const cur = (terms && terms[key]) || {};
+    ["many", "one"].forEach(form => {
+      const from = def[form];
+      const to = String(cur[form] || "").trim();
+      if (!to || to === from) return;
+      map[from] = to;
+      map[from.toLowerCase()] = to.toLowerCase();
+      map[from.toUpperCase()] = to.toUpperCase();
+    });
+  });
+  const keys = Object.keys(map).sort((a, b) => b.length - a.length);
+  TERM_MAP = map;
+  TERM_RE = keys.length ? new RegExp("\\b(" + keys.map(escapeRe).join("|") + ")\\b", "g") : null;
+}
+
+function syncWorkspace(company) {
+  const c = company || {};
+  compileTerms(c.terms || {});
+  WS.terms = c.terms || {};
+  WS.stages = Array.isArray(c.stages) && c.stages.length ? c.stages.slice() : DEFAULT_STAGES.slice();
+  WS.modules = c.modules || null;
+}
+
+// Rewrites app copy into the company's wording. Only ever called on strings the
+// app itself wrote (headings, labels, buttons) — never on a saved record.
+function relabel(text) {
+  if (!TERM_RE || typeof text !== "string" || !text) return text;
+  return text.replace(TERM_RE, m => (TERM_MAP[m] !== undefined ? TERM_MAP[m] : m));
+}
+
+// This company's word for something: term("job") → "Work Order".
+function term(key, form) {
+  const def = BASE_TERMS[key] || { one: key, many: key };
+  const cur = (WS.terms && WS.terms[key]) || {};
+  return form === "many" ? (cur.many || def.many) : (cur.one || def.one);
+}
+
+function workflowStages() { return WS.stages.slice(); }
+
+function moduleEnabled(id) {
+  if (!WS.modules || CORE_MODULES.indexOf(id) > -1) return true;
+  return WS.modules[id] !== false;
+}
+
+// Stages are company-defined, so an unknown one still needs a colour: fall back
+// to a fixed palette keyed by the stage's position in the company's list.
+const STAGE_FALLBACK = [
+  ["#FEFCE8", "#CA8A04"], ["#EFF6FF", "#2563EB"], ["#F0FDF4", "#16A34A"],
+  ["#F5F3FF", "#7C3AED"], ["#FFF7ED", "#EA580C"], ["#F3F4F6", "#4B5563"],
+];
+
 /* ─── Auth + company context (Supabase) ──────────────────────────────────── */
 const AuthCtx = createContext(null);
 const useAuth = () => useContext(AuthCtx);
@@ -624,7 +825,10 @@ const useCompany = () => useContext(CompanyCtx);
 
 const DEFAULT_PRIMARY = "#111827";
 const DEFAULT_SECONDARY = "#16A34A";
-const BRANDING_KEYS = ["primaryColor", "secondaryColor", "logoUrl", "address", "phone", "email", "website", "shopAddress", "shopLat", "shopLng", "geofenceRadiusM"];
+// Company settings persisted to companies.settings — branding plus everything
+// the guided workspace setup produces (wording, stages, sections).
+const BRANDING_KEYS = ["primaryColor", "secondaryColor", "logoUrl", "address", "phone", "email", "website", "shopAddress", "shopLat", "shopLng", "geofenceRadiusM",
+  "industry", "industryDetail", "terms", "stages", "modules", "setupComplete", "setupCompletedAt", "setupSkipped", "setupPackage"];
 
 function applyBranding(company) {
   const root = document.documentElement;
@@ -646,6 +850,10 @@ function AuthProvider({ children }) {
   const [dataReady, setDataReady] = useState(false); // records loaded for this session
   const companyRef = useRef(null);
   companyRef.current = company;
+  // The company's wording, stages and sections have to be live BEFORE anything
+  // renders — a plain helper like relabel() is called mid-render, so this can't
+  // wait for an effect the way the CSS colour variables can.
+  syncWorkspace(company);
   const sessionRef = useRef(null);
   sessionRef.current = session;
 
@@ -902,7 +1110,11 @@ const STATUS_COLORS = {
 };
 
 function StatusBadge({ status }) {
-  const [bg, tx] = STATUS_COLORS[status] || [C.surfaceAlt, C.textMuted];
+  // Stage names are company-defined; anything the stock palette doesn't know
+  // borrows a colour from its position in that company's stage list.
+  const idx = workflowStages().indexOf(status);
+  const [bg, tx] = STATUS_COLORS[status]
+    || (idx > -1 ? STAGE_FALLBACK[idx % STAGE_FALLBACK.length] : [C.surfaceAlt, C.textMuted]);
   return <Badge color={bg} textColor={tx}>{status || "Draft"}</Badge>;
 }
 
@@ -916,7 +1128,7 @@ function Field({ label, children, required, style }) {
   return (
     <div style={{ marginBottom: 12, ...style }}>
       <label style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.5px" }}>
-        {label}{required && <span style={{ color: C.destructive }}> *</span>}
+        {relabel(label)}{required && <span style={{ color: C.destructive }}> *</span>}
       </label>
       {children}
     </div>
@@ -926,9 +1138,10 @@ function Field({ label, children, required, style }) {
 function TextInput({ value, onChange, placeholder, type = "text", rows, style = {}, ...rest }) {
   const s = { ...inputCls, ...style };
   const val = value === undefined || value === null ? "" : value;
+  const ph = relabel(placeholder);
   return rows
-    ? <textarea value={val} onChange={e => onChange(e.target.value)} placeholder={placeholder} rows={rows} style={{ ...s, resize: "vertical" }} {...rest} />
-    : <input type={type} value={val} onChange={e => onChange(e.target.value)} placeholder={placeholder} style={s} {...rest} />;
+    ? <textarea value={val} onChange={e => onChange(e.target.value)} placeholder={ph} rows={rows} style={{ ...s, resize: "vertical" }} {...rest} />
+    : <input type={type} value={val} onChange={e => onChange(e.target.value)} placeholder={ph} style={s} {...rest} />;
 }
 
 function Select({ value, onChange, options, style = {}, placeholder }) {
@@ -946,7 +1159,7 @@ function Checkbox({ checked, onChange, label }) {
   return (
     <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", background: checked ? "#F0FDF4" : C.surfaceAlt, borderRadius: 8, cursor: "pointer", border: "1px solid " + (checked ? "#BBF7D0" : C.border) }}>
       <input type="checkbox" checked={!!checked} onChange={e => onChange(e.target.checked)} style={{ accentColor: C.green, width: 17, height: 17, cursor: "pointer" }} />
-      <span style={{ fontSize: 13, fontWeight: 500 }}>{label}</span>
+      <span style={{ fontSize: 13, fontWeight: 500 }}>{relabel(label)}</span>
     </label>
   );
 }
@@ -965,7 +1178,7 @@ function Modal({ title, onClose, children, width = 560 }) {
     >
       <div style={{ background: C.surface, borderRadius: 16, padding: 28, width: "100%", maxWidth: width }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-          <h3 style={{ fontSize: 18, fontWeight: 700 }}>{title}</h3>
+          <h3 style={{ fontSize: 18, fontWeight: 700 }}>{relabel(title)}</h3>
           <button type="button" onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: C.textMuted, lineHeight: 1 }}>×</button>
         </div>
         {children}
@@ -1003,7 +1216,7 @@ function ConfirmHost() {
   const finish = ok => { const resolve = state.resolve; confirmState = null; notifyConfirm(); resolve(ok); };
   return (
     <Modal title="Are you sure?" width={420} onClose={() => finish(false)}>
-      <p style={{ fontSize: 14, marginBottom: 20, lineHeight: 1.5 }}>{state.message}</p>
+      <p style={{ fontSize: 14, marginBottom: 20, lineHeight: 1.5 }}>{relabel(state.message)}</p>
       <div style={{ display: "flex", gap: 10 }}>
         <button type="button" onClick={() => finish(false)} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
         <button type="button" onClick={() => finish(true)} style={{ ...(state.tone === "danger" ? btnDanger : btnSecondary), flex: 1, padding: "10px" }}>{state.confirmLabel}</button>
@@ -1016,8 +1229,8 @@ function PageHeader({ title, subtitle, action }) {
   return (
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 24, flexWrap: "wrap", gap: 12 }}>
       <div>
-        <h1 style={{ fontSize: 28, fontWeight: 800, color: C.text, letterSpacing: "-0.5px" }}>{title}</h1>
-        {subtitle && <p style={{ color: C.textMuted, margin: "4px 0 0", fontSize: 14 }}>{subtitle}</p>}
+        <h1 style={{ fontSize: 28, fontWeight: 800, color: C.text, letterSpacing: "-0.5px" }}>{relabel(title)}</h1>
+        {subtitle && <p style={{ color: C.textMuted, margin: "4px 0 0", fontSize: 14 }}>{relabel(subtitle)}</p>}
       </div>
       {action}
     </div>
@@ -1028,8 +1241,8 @@ function EmptyState({ icon, title, subtitle, action }) {
   return (
     <div style={{ textAlign: "center", padding: "60px 20px", background: C.surface, borderRadius: 12, border: "1px solid " + C.border }}>
       <div style={{ fontSize: 48, marginBottom: 16 }}>{icon}</div>
-      <h3 style={{ fontSize: 20, fontWeight: 700, color: C.text, marginBottom: 8 }}>{title}</h3>
-      <p style={{ color: C.textMuted, marginBottom: 20 }}>{subtitle}</p>
+      <h3 style={{ fontSize: 20, fontWeight: 700, color: C.text, marginBottom: 8 }}>{relabel(title)}</h3>
+      <p style={{ color: C.textMuted, marginBottom: 20 }}>{relabel(subtitle)}</p>
       {action}
     </div>
   );
@@ -1043,7 +1256,7 @@ function StatCard({ label, value, icon, onClick }) {
     >
       {icon && <div style={{ fontSize: 26, marginBottom: 6 }}>{icon}</div>}
       <div style={{ fontSize: 26, fontWeight: 800, color: C.text }}>{value}</div>
-      <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 600 }}>{label}</div>
+      <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 600 }}>{relabel(label)}</div>
     </div>
   );
 }
@@ -1066,7 +1279,7 @@ function DataTable({ columns, rows, onEdit, onDelete, onView, emptyMessage = "No
           <tr style={{ background: C.surfaceAlt }}>
             {columns.map(c => (
               <th key={c.key} style={{ padding: "10px 12px", textAlign: "left", fontWeight: 700, fontSize: 11, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", borderBottom: "2px solid " + C.border, whiteSpace: "nowrap" }}>
-                {c.label}
+                {relabel(c.label)}
               </th>
             ))}
             {hasActions && <th style={{ width: 140, padding: "10px 12px", borderBottom: "2px solid " + C.border }} />}
@@ -1101,7 +1314,7 @@ function Toast({ message }) {
   if (!message) return null;
   return (
     <div style={{ background: "#F0FDF4", color: "#16A34A", padding: "12px 16px", borderRadius: 8, marginBottom: 16, fontWeight: 600, border: "1px solid #BBF7D0" }}>
-      ✓ {message}
+      ✓ {relabel(message)}
     </div>
   );
 }
@@ -1127,7 +1340,7 @@ function MapsField({ field: f, value, onChange, onLookup }) {
   return (
     <Field label={f.label} required={f.required}>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-        <input value={val} onChange={e => onChange(e.target.value)} placeholder={f.placeholder || "Address, lat/long, or look it up →"} style={{ ...inputCls, flex: "1 1 180px" }} />
+        <input value={val} onChange={e => onChange(e.target.value)} placeholder={relabel(f.placeholder || "Address, lat/long, or look it up →")} style={{ ...inputCls, flex: "1 1 180px" }} />
         <button type="button" onClick={useMyLocation} disabled={locating} style={{ ...btnSecondary, whiteSpace: "nowrap", opacity: locating ? 0.6 : 1 }}>{locating ? "📍 Locating…" : "📍 Use my location"}</button>
         <button type="button" onClick={onLookup} style={{ ...btnOutline, whiteSpace: "nowrap" }}>🔍 Look up</button>
         <a href={has ? mapsUrl(val) : undefined} target="_blank" rel="noopener noreferrer"
@@ -1183,7 +1396,7 @@ function CRUDForm({ fields, data, onSave, onCancel }) {
           const listId = f.key + "-options";
           return (
             <Field key={f.key} label={f.label} required={f.required}>
-              <input list={listId} value={form[f.key] || ""} onChange={e => set(f.key, e.target.value)} placeholder={f.placeholder} style={inputCls} />
+              <input list={listId} value={form[f.key] || ""} onChange={e => set(f.key, e.target.value)} placeholder={relabel(f.placeholder)} style={inputCls} />
               <datalist id={listId}>{(f.options || []).map(o => <option key={o} value={o} />)}</datalist>
             </Field>
           );
@@ -1267,7 +1480,7 @@ function CRUDPage({ title, singular, subtitle, collection, columns, formFields, 
       <PageHeader
         title={title}
         subtitle={subtitle}
-        action={<button type="button" onClick={openCreate} style={btnSecondary}>+ New {noun}</button>}
+        action={<button type="button" onClick={openCreate} style={btnSecondary}>{relabel("+ New " + noun)}</button>}
       />
       {extra}
       {items.length === 0
@@ -1275,7 +1488,7 @@ function CRUDPage({ title, singular, subtitle, collection, columns, formFields, 
             icon={emptyIcon || "📂"}
             title={"No " + title.toLowerCase() + " yet"}
             subtitle={"Add your first " + noun.toLowerCase() + " to get started."}
-            action={<button type="button" onClick={openCreate} style={btnSecondary}>Create {noun}</button>}
+            action={<button type="button" onClick={openCreate} style={btnSecondary}>{relabel("Create " + noun)}</button>}
           />
         : (
           <div style={card}>
@@ -1822,12 +2035,12 @@ function JobsPage() {
   const crew = v => (Array.isArray(v) && v.length ? v.join(", ") : "—");
 
   const formFields = [
-    { key: "jobTitle", label: "Job Title", required: true, placeholder: "Site Renovation" },
+    { key: "jobTitle", label: "Job Title", required: true, placeholder: "Short name for the work" },
     { key: "clientName", label: "Client", type: "datalist", options: clientNames, placeholder: "Type or pick a registered client" },
     { key: "jobAddress", label: "Job Location", type: "maps", placeholder: "Site address or pin (lat, lng)" },
     { key: "startDate", label: "Start Date", type: "date" },
     { key: "endDate", label: "End Date", type: "date" },
-    { key: "jobStatus", label: "Status", type: "select", options: ["Pending", "Active", "In Progress", "Completed", "On Hold"] },
+    { key: "jobStatus", label: "Status", type: "select", options: workflowStages() },
     { key: "assignedEmployees", label: "Assign Employees", type: "multiselect", options: employeeNames, emptyHint: "Add employees on the Employees page first." },
     ...(canPrivate ? [{
       key: "visibility", label: "Visibility", type: "select",
@@ -1891,8 +2104,8 @@ function JobsPage() {
   };
 
   return <CRUDPage
-    title="Jobs" singular="Job" subtitle="Manage construction projects and track progress" collection="jobs" emptyIcon="🏗️"
-    defaultValues={{ jobStatus: "Pending", visibility: canPrivate ? "private" : "all", assignedEmployees: [] }}
+    title="Jobs" singular="Job" subtitle="Manage your jobs and track progress" collection="jobs" emptyIcon="🏗️"
+    defaultValues={{ jobStatus: workflowStages()[0], visibility: canPrivate ? "private" : "all", assignedEmployees: [] }}
     columns={columns}
     formFields={formFields}
     detail={detail}
@@ -2058,7 +2271,7 @@ function EquipmentPage() {
   };
 
   return <CRUDPage
-    title="Equipment" singular="Equipment Item" subtitle="Track your fleet and machinery" collection="equipment" emptyIcon="🚛"
+    title="Equipment" singular="Equipment Item" subtitle="Track your equipment and machinery" collection="equipment" emptyIcon="🚛"
     columns={[
       { key: "equipmentName", label: "Name" },
       { key: "equipmentType", label: "Type" },
@@ -2223,7 +2436,7 @@ function InventoryPage() {
 
 function ContractsPage() {
   return <CRUDPage
-    title="Contracts" singular="Contract" subtitle="Manage construction contracts" collection="contracts" emptyIcon="📋"
+    title="Contracts" singular="Contract" subtitle="Manage your contracts and agreements" collection="contracts" emptyIcon="📋"
     defaultValues={{ status: "Active" }}
     columns={[
       { key: "contractName", label: "Contract Name" },
@@ -4476,6 +4689,7 @@ async function seedDemoData(company) {
 function SettingsPage() {
   const { company, updateCompany } = useCompany();
   const { user } = useAuth();
+  const { navigate } = useRouter();
   const importRef = useRef(null);
   const [form, setForm] = useState({
     companyName: company?.companyName || "",
@@ -4593,6 +4807,41 @@ function SettingsPage() {
       </div>
 
       <div style={{ ...card }}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Workspace setup</h3>
+        <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 16, lineHeight: 1.6 }}>
+          How this app is shaped for your business — the wording it uses, the stages your work moves through,
+          and which sections your team sees. Change any of it any time; your records are never rewritten.
+        </p>
+        <div className="grid-2">
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>Trade</div>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>
+              {presetById(company?.industry).icon} {presetById(company?.industry).label}
+              {company?.setupSkipped && <span style={{ fontSize: 12, color: C.textMuted, fontWeight: 400 }}> · standard setup</span>}
+            </div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>Sections switched on</div>
+            <div style={{ fontSize: 14, fontWeight: 600 }}>
+              {optionalModules().filter(m => moduleEnabled(m.id)).length} of {optionalModules().length}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 6 }}>Your workflow</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {workflowStages().map((st, i) => (
+                <span key={st + i} style={{
+                  fontSize: 11.5, fontWeight: 700, padding: "4px 10px", borderRadius: 20,
+                  background: STAGE_FALLBACK[i % STAGE_FALLBACK.length][0], color: STAGE_FALLBACK[i % STAGE_FALLBACK.length][1],
+                }}>{st}</span>
+              ))}
+            </div>
+          </div>
+        </div>
+        <button type="button" onClick={() => navigate("setup")} style={{ ...btnSecondary, marginTop: 16 }}>
+          {company?.setupComplete && !company?.setupSkipped ? "Change my setup" : "Set up my workspace"}
+        </button>
+      </div>
+
+      <div style={{ ...card }}>
         <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Shop location &amp; clock-in alert</h3>
         <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 16, lineHeight: 1.6 }}>
           Pin your shop's location and the field app will prompt crew to clock in when they open it near the shop.
@@ -4660,7 +4909,13 @@ const PLANS = [
     features: ["Everything in Crew", "Inventory & warehouses", "Contracts & subcontractors", "Manager logs & reports", "Multi-company & private jobs", "Up to 25 users"] },
 ];
 
+// One-time price for the guided setup. Waived on the plans that bundle it.
+const SETUP_ADDON_PRICE = 299;
+
 function SubscriptionsPage({ heading = true }) {
+  const { company } = useCompany();
+  const { user } = useAuth();
+  const { navigate } = useRouter();
   const [plan, setPlan] = useState(() => {
     const s = storage.get("bmb_plan");
     return PLANS.some(p => p.id === s) ? s : "crew";
@@ -4723,6 +4978,39 @@ function SubscriptionsPage({ heading = true }) {
         })}
       </div>
 
+      {/* One-time add-on: the guided setup that reshapes the app around a
+          specific business. Included on the bigger plans, sold on its own below. */}
+      <div style={{ ...card, marginTop: 26, marginBottom: 0, border: "1px solid " + C.border, display: "flex", gap: 18, flexWrap: "wrap", alignItems: "flex-start" }}>
+        <div style={{ fontSize: 34, lineHeight: 1 }}>🧩</div>
+        <div style={{ flex: "1 1 320px", minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+            <h3 style={{ fontSize: 18, fontWeight: 800 }}>Custom workspace setup</h3>
+            <span style={{ fontSize: 13, fontWeight: 700, color: C.accent }}>
+              {SETUP_ADDON_PRICE === 0 ? "Included" : "$" + SETUP_ADDON_PRICE + " one-time"}
+            </span>
+            {(plan === "crew" || plan === "business") && (
+              <Badge color="#F0FDF4" textColor="#16A34A">Included with {PLANS.find(p => p.id === plan).name}</Badge>
+            )}
+          </div>
+          <p style={{ fontSize: 13, color: C.textMuted, margin: "8px 0 0", lineHeight: 1.65, maxWidth: 640 }}>
+            Rather than a one-size-fits-all app, we shape BuildMyBill around how your business actually runs:
+            your industry and branding, your own words for the work you do, the stages a job moves through,
+            and only the sections you need. It applies to the web app and the field app, for everyone on your team.
+          </p>
+          {company?.setupComplete && !company?.setupSkipped && (
+            <p style={{ fontSize: 12.5, color: C.green, fontWeight: 700, margin: "10px 0 0" }}>
+              ✓ Applied{company.setupCompletedAt ? " on " + new Date(company.setupCompletedAt).toLocaleDateString() : ""}
+              {company.industry ? " · " + presetById(company.industry).label : ""}
+            </p>
+          )}
+        </div>
+        {user?.isOwner && (
+          <button type="button" onClick={() => navigate("setup")} style={{ ...btnSecondary, whiteSpace: "nowrap" }}>
+            {company?.setupComplete && !company?.setupSkipped ? "Change my setup" : "Start setup"}
+          </button>
+        )}
+      </div>
+
       <div style={{ textAlign: "center", fontSize: 12, color: C.textMuted, marginTop: 18 }}>
         Selecting a plan sets your preference — online payment &amp; billing is coming soon, and no card is charged today.
       </div>
@@ -4735,7 +5023,7 @@ function PricingPage() {
     <div>
       <div style={{ textAlign: "center", padding: "40px 20px 32px", background: C.primary, color: "#fff", borderRadius: 16, marginBottom: 32 }}>
         <h1 style={{ fontSize: 34, fontWeight: 900, marginBottom: 12, letterSpacing: "-1px" }}>Simple, Transparent Pricing</h1>
-        <p style={{ fontSize: 16, opacity: 0.7, marginBottom: 20 }}>Choose the right plan for your construction business.</p>
+        <p style={{ fontSize: 16, opacity: 0.7, marginBottom: 20 }}>Choose the right plan for your business.</p>
         <div style={{ display: "inline-block", padding: "6px 16px", background: C.secondary, borderRadius: 20, fontSize: 13, fontWeight: 700 }}>All plans include a 14-day free trial</div>
       </div>
       <SubscriptionsPage heading={false} />
@@ -4891,15 +5179,15 @@ function LoginPage() {
       </nav>
 
       <section style={s.hero}>
-        <div style={s.heroTag}>Construction Business Management</div>
+        <div style={s.heroTag}>Business Management, Shaped To Your Trade</div>
         <h1 style={s.heroH1}>Build My Bill.<br />Run Your Business.</h1>
-        <p style={s.heroSub}>Quotes, invoices, time tracking, jobs, equipment, inventory, and safety checks — all in one platform built for the trades.</p>
+        <p style={s.heroSub}>Quotes, invoices, time tracking, jobs, equipment, inventory and safety checks — one platform, set up around the way your business actually works.</p>
         <div style={{ display: "flex", gap: 14, justifyContent: "center", flexWrap: "wrap" }}>
           <button type="button" onClick={() => open(true)} style={s.btnGreen}>Get Started Free →</button>
           <button type="button" onClick={() => open(false)} style={s.btnGhost}>Sign In</button>
         </div>
         <div style={{ display: "flex", justifyContent: "center", gap: "clamp(24px, 5vw, 64px)", marginTop: 64, flexWrap: "wrap" }}>
-          {[["20+", "Built-in modules"], ["∞", "Quotes & invoices"], ["$0", "Setup cost"], ["100%", "Your data"]].map(([n, l]) => (
+          {[["20+", "Built-in modules"], ["∞", "Quotes & invoices"], ["3", "Steps to set up"], ["100%", "Your data"]].map(([n, l]) => (
             <div key={l} style={{ textAlign: "center" }}>
               <div style={{ fontSize: "clamp(28px, 4vw, 40px)", fontWeight: 900, color: C.secondary }}>{n}</div>
               <div style={{ fontSize: 13, opacity: 0.6, marginTop: 4 }}>{l}</div>
@@ -4918,6 +5206,28 @@ function LoginPage() {
               <div style={{ fontSize: 32, marginBottom: 14 }}>{ft.icon}</div>
               <div style={{ fontSize: 16, fontWeight: 700, color: C.primary, marginBottom: 8 }}>{ft.title}</div>
               <div style={{ fontSize: 14, color: "#6B7280", lineHeight: 1.7 }}>{ft.desc}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section style={s.sectionAlt}>
+        <div style={s.sectionTag}>Made yours</div>
+        <h2 style={s.sectionH2}>Not a one-size-fits-all app</h2>
+        <p style={s.sectionSub}>
+          Construction, lawn care, plumbing, cleaning, hauling, a law office — same platform, set up
+          differently for each. Three questions at signup and it reshapes itself around your business.
+        </p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 24 }}>
+          {[
+            ["1", "Your business", "Pick your trade, add your name, logo and colours. They show up everywhere — the app, the field app, your printed quotes and invoices."],
+            ["2", "How you work", "Call things what you call them — work orders, matters, service visits, customers. Set the stages your work moves through, and switch off the sections you'll never use."],
+            ["3", "Review & launch", "Check it over and go. Your whole team opens an app that already speaks your language, and you can change any of it later."],
+          ].map(([n, title, desc]) => (
+            <div key={n} style={s.featCard}>
+              <div style={{ width: 34, height: 34, borderRadius: "50%", background: C.secondary, color: "#fff", fontWeight: 900, fontSize: 15, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 14 }}>{n}</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: C.primary, marginBottom: 8 }}>{title}</div>
+              <div style={{ fontSize: 14, color: "#6B7280", lineHeight: 1.7 }}>{desc}</div>
             </div>
           ))}
         </div>
@@ -5035,12 +5345,487 @@ function LoginPage() {
   );
 }
 
+/* ─── Guided workspace setup ───────────────────────────────────────────────
+   Three stages — the business, the way it works, then review — and on launch
+   the answers are written to the company record, where syncWorkspace() picks
+   them up and the whole app re-labels itself. Owners only; everyone else in the
+   company just gets the finished workspace. */
+
+const SETUP_STEPS = [
+  { key: "business", label: "Your business", hint: "Trade, name and branding" },
+  { key: "workflow", label: "How you work", hint: "Wording, stages and sections" },
+  { key: "review", label: "Review & launch", hint: "Check it over, then go" },
+];
+
+function setupFormFromCompany(company) {
+  const preset = presetById(company?.industry || "construction");
+  const terms = {};
+  Object.keys(BASE_TERMS).forEach(k => {
+    const saved = (company?.terms || {})[k] || {};
+    const fromPreset = (preset.terms || {})[k] || {};
+    terms[k] = {
+      one: saved.one || fromPreset.one || BASE_TERMS[k].one,
+      many: saved.many || fromPreset.many || BASE_TERMS[k].many,
+    };
+  });
+  return {
+    industry: company?.industry || "construction",
+    industryDetail: company?.industryDetail || "",
+    companyName: company?.companyName || "",
+    logoUrl: company?.logoUrl || "",
+    primaryColor: company?.primaryColor || preset.colors.primary,
+    secondaryColor: company?.secondaryColor || preset.colors.secondary,
+    terms,
+    stages: (Array.isArray(company?.stages) && company.stages.length ? company.stages : preset.stages).slice(),
+    modules: { ...modulesFromPreset(preset), ...(company?.modules || {}) },
+  };
+}
+
+// Everything a trade suggests, dropped into the form. Called when the trade
+// changes, so the next two stages start from something sensible.
+function applyPresetToForm(form, presetId) {
+  const preset = presetById(presetId);
+  const terms = {};
+  Object.keys(BASE_TERMS).forEach(k => {
+    const p = (preset.terms || {})[k] || {};
+    terms[k] = { one: p.one || BASE_TERMS[k].one, many: p.many || BASE_TERMS[k].many };
+  });
+  return {
+    ...form,
+    industry: presetId,
+    terms,
+    stages: preset.stages.slice(),
+    modules: modulesFromPreset(preset),
+    primaryColor: preset.colors.primary,
+    secondaryColor: preset.colors.secondary,
+  };
+}
+
+function SetupStepper({ step }) {
+  return (
+    <div style={{ display: "flex", gap: 8, marginBottom: 26, flexWrap: "wrap" }}>
+      {SETUP_STEPS.map((s, i) => {
+        const done = i < step, now = i === step;
+        return (
+          <div key={s.key} style={{
+            flex: "1 1 180px", padding: "10px 14px", borderRadius: 10,
+            background: now ? C.surface : "transparent",
+            border: "1px solid " + (now ? C.secondary : C.border),
+            opacity: done || now ? 1 : 0.55,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{
+                width: 20, height: 20, borderRadius: "50%", fontSize: 11, fontWeight: 800,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                background: done ? C.green : now ? C.secondary : C.border,
+                color: done || now ? "#fff" : C.textMuted,
+              }}>{done ? "✓" : i + 1}</span>
+              <span style={{ fontSize: 13, fontWeight: 700 }}>{s.label}</span>
+            </div>
+            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 3, marginLeft: 28 }}>{s.hint}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function IndustryPicker({ value, onPick }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(215px, 1fr))", gap: 10 }}>
+      {INDUSTRY_PRESETS.map(p => {
+        const on = value === p.id;
+        return (
+          <button key={p.id} type="button" onClick={() => onPick(p.id)} style={{
+            textAlign: "left", padding: "12px 14px", borderRadius: 10, cursor: "pointer",
+            background: on ? "#F0FDF4" : C.surface,
+            border: "1.5px solid " + (on ? C.green : C.border),
+          }}>
+            <div style={{ fontSize: 20, marginBottom: 4 }}>{p.icon}</div>
+            <div style={{ fontSize: 13.5, fontWeight: 700, marginBottom: 2 }}>{p.label}</div>
+            <div style={{ fontSize: 11.5, color: C.textMuted, lineHeight: 1.4 }}>{p.blurb}</div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function StageEditor({ stages, onChange, noun = "job" }) {
+  const set = (i, v) => { const next = stages.slice(); next[i] = v; onChange(next); };
+  const move = (i, d) => {
+    const j = i + d;
+    if (j < 0 || j >= stages.length) return;
+    const next = stages.slice();
+    next.splice(j, 0, next.splice(i, 1)[0]);
+    onChange(next);
+  };
+  const remove = i => onChange(stages.filter((_, k) => k !== i));
+
+  return (
+    <div>
+      {stages.map((st, i) => (
+        <div key={i} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
+          <span style={{ fontSize: 11, fontWeight: 800, color: C.textMuted, width: 18 }}>{i + 1}</span>
+          <input value={st} onChange={e => set(i, e.target.value)} style={{ ...inputCls, flex: 1 }} placeholder="Stage name" />
+          <button type="button" onClick={() => move(i, -1)} disabled={i === 0} aria-label="Move up"
+            style={{ ...btnOutline, padding: "6px 9px", opacity: i === 0 ? 0.4 : 1 }}>↑</button>
+          <button type="button" onClick={() => move(i, 1)} disabled={i === stages.length - 1} aria-label="Move down"
+            style={{ ...btnOutline, padding: "6px 9px", opacity: i === stages.length - 1 ? 0.4 : 1 }}>↓</button>
+          <button type="button" onClick={() => remove(i)} disabled={stages.length <= 2} aria-label="Remove stage"
+            style={{ ...btnDanger, padding: "6px 9px", opacity: stages.length <= 2 ? 0.4 : 1 }}>×</button>
+        </div>
+      ))}
+      <button type="button" onClick={() => onChange(stages.concat("New stage"))} style={{ ...btnOutline, marginTop: 6 }}>+ Add stage</button>
+      <p style={{ fontSize: 12, color: C.textMuted, marginTop: 10, lineHeight: 1.6 }}>
+        These are the stages a {noun.toLowerCase()} moves through, in order. Existing records keep whatever stage they
+        were saved with, so nothing breaks if you rename one later.
+      </p>
+    </div>
+  );
+}
+
+function WorkspaceSetup({ mode = "onboarding", onDone }) {
+  const { company, updateCompany } = useCompany();
+  const [step, setStep] = useState(0);
+  const [form, setForm] = useState(() => setupFormFromCompany(company));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const set = patch => setForm(f => ({ ...f, ...patch }));
+
+  const pickIndustry = id => {
+    setForm(f => applyPresetToForm(f, id));
+    setError("");
+  };
+
+  const setTerm = (key, part, value) => setForm(f => {
+    const t = { ...f.terms, [key]: { ...f.terms[key] } };
+    t[key][part] = value;
+    // Typing the singular fills the plural in for you, unless you've written
+    // your own plural already.
+    if (part === "one") {
+      const wasAuto = !t[key].many || t[key].many === pluralOf(f.terms[key].one) || t[key].many === BASE_TERMS[key].many;
+      if (wasAuto) t[key].many = BASE_TERMS[key].one === BASE_TERMS[key].many ? value : pluralOf(value);
+    }
+    return { ...f, terms: t };
+  });
+
+  const toggleModule = id => setForm(f => ({ ...f, modules: { ...f.modules, [id]: f.modules[id] === false } }));
+
+  const next = () => {
+    if (step === 0 && !form.companyName.trim()) { setError("Add your business name so it shows on your quotes and invoices."); return; }
+    setError("");
+    setStep(s => Math.min(s + 1, SETUP_STEPS.length - 1));
+  };
+  const back = () => { setError(""); setStep(s => Math.max(s - 1, 0)); };
+
+  const launch = async () => {
+    const stages = form.stages.map(s => s.trim()).filter(Boolean);
+    if (stages.length < 2) { setError("Keep at least two stages — a job needs somewhere to start and somewhere to finish."); setStep(1); return; }
+    const terms = {};
+    Object.keys(BASE_TERMS).forEach(k => {
+      const one = (form.terms[k].one || "").trim() || BASE_TERMS[k].one;
+      const many = (form.terms[k].many || "").trim() || pluralOf(one);
+      terms[k] = { one, many };
+    });
+    setSaving(true);
+    await updateCompany({
+      companyName: form.companyName.trim(),
+      logoUrl: form.logoUrl.trim(),
+      primaryColor: form.primaryColor,
+      secondaryColor: form.secondaryColor,
+      industry: form.industry,
+      industryDetail: form.industryDetail.trim(),
+      terms, stages,
+      modules: form.modules,
+      setupComplete: true,
+      setupSkipped: false,
+      setupCompletedAt: new Date().toISOString(),
+    });
+    setSaving(false);
+    if (onDone) onDone();
+  };
+
+  const skip = async () => {
+    setSaving(true);
+    await updateCompany({ setupComplete: true, setupSkipped: true });
+    setSaving(false);
+    if (onDone) onDone();
+  };
+
+  const preset = presetById(form.industry);
+  const changedTerms = Object.keys(BASE_TERMS).filter(k => (form.terms[k].one || "") !== BASE_TERMS[k].one);
+  const onModules = optionalModules().filter(m => form.modules[m.id] !== false);
+  const offModules = optionalModules().filter(m => form.modules[m.id] === false);
+
+  return (
+    <div style={{ maxWidth: 880, margin: "0 auto" }}>
+      <div style={{ marginBottom: 22 }}>
+        <h1 style={{ fontSize: 27, fontWeight: 800, letterSpacing: "-0.5px", marginBottom: 6 }}>
+          {mode === "onboarding" ? "Let's set up your workspace" : "Workspace setup"}
+        </h1>
+        <p style={{ color: C.textMuted, fontSize: 14, lineHeight: 1.6 }}>
+          A few questions and the app reshapes itself around your business — your wording, your stages,
+          your branding, and only the sections you actually use. Everything here can be changed later in Settings.
+        </p>
+      </div>
+
+      <SetupStepper step={step} />
+
+      {error && (
+        <div style={{ background: "#FEF2F2", color: "#991B1B", border: "1px solid #FECACA", borderRadius: 8, padding: "10px 14px", fontSize: 13, fontWeight: 600, marginBottom: 14 }}>
+          {error}
+        </div>
+      )}
+
+      {/* ── Stage 1: the business ── */}
+      {step === 0 && (
+        <div>
+          <div style={card}>
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>What kind of work do you do?</h3>
+            <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 14 }}>
+              This sets your starting point — you can change every part of it on the next screen.
+            </p>
+            <IndustryPicker value={form.industry} onPick={pickIndustry} />
+            <div style={{ marginTop: 16 }}>
+              <Field label="In your own words, what does the business do?">
+                <TextInput value={form.industryDetail} onChange={v => set({ industryDetail: v })} rows={2}
+                  placeholder="e.g. residential snow removal and summer lawn care for about 60 regular customers" />
+              </Field>
+            </div>
+          </div>
+
+          <div className="grid-2">
+            <div style={card}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>Business name</h3>
+              <Field label="Business Name" required>
+                <TextInput value={form.companyName} onChange={v => set({ companyName: v })} placeholder="Acme Services Ltd." />
+              </Field>
+              <Field label="Logo URL">
+                <TextInput value={form.logoUrl} onChange={v => set({ logoUrl: v })} placeholder="https://…/logo.png" />
+              </Field>
+              {form.logoUrl
+                ? <img src={form.logoUrl} alt="Logo preview" style={{ maxHeight: 56, maxWidth: 200, objectFit: "contain", borderRadius: 6, border: "1px solid " + C.border }} />
+                : <p style={{ fontSize: 12, color: C.textMuted, lineHeight: 1.6 }}>Paste a link to your logo and it'll show in the sidebar, the field app, and on your printed quotes and invoices.</p>}
+            </div>
+
+            <div style={card}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>Your colours</h3>
+              {[["Primary Colour", "primaryColor"], ["Secondary Colour", "secondaryColor"]].map(([label, key]) => (
+                <Field key={key} label={label}>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input type="color" value={form[key]} onChange={e => set({ [key]: e.target.value })}
+                      style={{ width: 48, height: 38, borderRadius: 6, cursor: "pointer", border: "1px solid " + C.border, padding: 2 }} />
+                    <TextInput value={form[key]} onChange={v => set({ [key]: v })} style={{ fontFamily: "monospace" }} />
+                  </div>
+                </Field>
+              ))}
+              <div style={{ borderRadius: 10, overflow: "hidden", border: "1px solid " + C.border }}>
+                <div style={{ background: form.primaryColor, color: "#fff", padding: "12px 14px", fontWeight: 800, fontSize: 13 }}>
+                  {form.companyName || "Your business"}
+                </div>
+                <div style={{ padding: 12, background: C.surfaceAlt, display: "flex", gap: 8, alignItems: "center" }}>
+                  <span style={{ background: form.secondaryColor, color: "#fff", padding: "6px 12px", borderRadius: 7, fontSize: 12, fontWeight: 700 }}>
+                    + New {form.terms.job.one}
+                  </span>
+                  <span style={{ fontSize: 12, color: C.textMuted }}>is what your buttons will look like</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Stage 2: how the work runs ── */}
+      {step === 1 && (
+        <div>
+          <div style={card}>
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>What do you call things?</h3>
+            <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 16 }}>
+              Whatever you type here is what the app says — menus, buttons, forms and reports all follow along.
+              {preset.id !== "construction" && " We've filled in the usual wording for " + preset.label.toLowerCase() + "."}
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14 }}>
+              {Object.keys(BASE_TERMS).map(key => (
+                <div key={key} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 12 }}>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                    {BASE_TERMS[key].many}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: C.textMuted, margin: "2px 0 8px" }}>{BASE_TERMS[key].hint}</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input value={form.terms[key].one} onChange={e => setTerm(key, "one", e.target.value)}
+                      placeholder="One of them" style={{ ...inputCls, flex: 1 }} />
+                    <input value={form.terms[key].many} onChange={e => setTerm(key, "many", e.target.value)}
+                      placeholder="Many of them" style={{ ...inputCls, flex: 1 }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style={card}>
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Your workflow</h3>
+            <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 14 }}>
+              How a {(form.terms.job.one || "job").toLowerCase()} moves from booked to finished.
+            </p>
+            <StageEditor stages={form.stages} onChange={v => set({ stages: v })} noun={form.terms.job.one} />
+          </div>
+
+          <div style={card}>
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Which sections do you need?</h3>
+            <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 14 }}>
+              Switch off what doesn't apply and it disappears from the menu — for you and your whole team.
+              Turning one back on later brings its records back exactly as they were.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(215px, 1fr))", gap: 8 }}>
+              {optionalModules().map(m => (
+                <Checkbox key={m.id} checked={form.modules[m.id] !== false} onChange={() => toggleModule(m.id)}
+                  label={<span>{m.icon + "  " + relabelWith(form.terms, m.label)}</span>} />
+              ))}
+            </div>
+            <p style={{ fontSize: 12, color: C.textMuted, marginTop: 12 }}>
+              Dashboard, {(form.terms.client.many || "Clients").toLowerCase()}, {(form.terms.job.many || "jobs").toLowerCase()},
+              {" "}{(form.terms.quote.many || "quotes").toLowerCase()}, schedule, billing, team and settings always stay on.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Stage 3: review, then launch ── */}
+      {step === 2 && (
+        <div>
+          <div className="grid-2">
+            <div style={card}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Your business</h3>
+              {[["Trade", preset.icon + " " + preset.label], ["Name", form.companyName || "—"],
+                ["In your words", form.industryDetail || "—"]].map(([l, v]) => (
+                <div key={l} style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{l}</div>
+                  <div style={{ fontSize: 13.5, fontWeight: 600, lineHeight: 1.5 }}>{v}</div>
+                </div>
+              ))}
+              <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12 }}>
+                {form.logoUrl && <img src={form.logoUrl} alt="" style={{ height: 34, maxWidth: 90, objectFit: "contain" }} />}
+                <span style={{ background: form.primaryColor, color: "#fff", padding: "4px 12px", borderRadius: 5, fontSize: 12, fontWeight: 700 }}>Primary</span>
+                <span style={{ background: form.secondaryColor, color: "#fff", padding: "4px 12px", borderRadius: 5, fontSize: 12, fontWeight: 700 }}>Secondary</span>
+              </div>
+            </div>
+
+            <div style={card}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Your wording</h3>
+              {changedTerms.length === 0
+                ? <p style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.6 }}>You're keeping the standard wording — jobs, clients, quotes and so on.</p>
+                : changedTerms.map(k => (
+                  <div key={k} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 6 }}>
+                    <span style={{ color: C.textMuted, textDecoration: "line-through" }}>{BASE_TERMS[k].many}</span>
+                    <span style={{ color: C.textMuted }}>→</span>
+                    <span style={{ fontWeight: 700 }}>{form.terms[k].many}</span>
+                  </div>
+                ))}
+            </div>
+          </div>
+
+          <div style={card}>
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Your workflow</h3>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              {form.stages.filter(s => s.trim()).map((st, i, arr) => (
+                <React.Fragment key={i}>
+                  <span style={{
+                    fontSize: 12, fontWeight: 700, padding: "5px 12px", borderRadius: 20,
+                    background: STAGE_FALLBACK[i % STAGE_FALLBACK.length][0],
+                    color: STAGE_FALLBACK[i % STAGE_FALLBACK.length][1],
+                  }}>{st}</span>
+                  {i < arr.length - 1 && <span style={{ color: C.textMuted, fontSize: 12 }}>→</span>}
+                </React.Fragment>
+              ))}
+            </div>
+          </div>
+
+          <div style={card}>
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Your sections</h3>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 6 }}>Switched on</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+              {onModules.map(m => (
+                <span key={m.id} style={{ fontSize: 12, fontWeight: 600, padding: "5px 10px", borderRadius: 7, background: "#F0FDF4", color: "#166534", border: "1px solid #BBF7D0" }}>
+                  {m.icon} {relabelWith(form.terms, m.label)}
+                </span>
+              ))}
+            </div>
+            {offModules.length > 0 && (
+              <>
+                <div style={{ fontSize: 12, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 6 }}>Switched off</div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {offModules.map(m => (
+                    <span key={m.id} style={{ fontSize: 12, padding: "5px 10px", borderRadius: 7, background: C.surfaceAlt, color: C.textMuted, textDecoration: "line-through" }}>
+                      {relabelWith(form.terms, m.label)}
+                    </span>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+
+          <div style={{ ...card, background: "#F0FDF4", border: "1px solid #BBF7D0" }}>
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>Ready when you are</h3>
+            <p style={{ fontSize: 13, color: "#166534", lineHeight: 1.6 }}>
+              Launching applies all of this to your company right away — every person on your team sees the new
+              workspace next time they open the app. Your records aren't touched, and you can come back to
+              Settings → Workspace setup and change any of it whenever you like.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", margin: "4px 0 30px" }}>
+        {step > 0 && <button type="button" onClick={back} disabled={saving} style={btnOutline}>‹ Back</button>}
+        {step < SETUP_STEPS.length - 1 && <button type="button" onClick={next} style={btnSecondary}>Continue ›</button>}
+        {step === SETUP_STEPS.length - 1 && (
+          <button type="button" onClick={launch} disabled={saving} style={btnSecondary}>
+            {saving ? "Applying…" : mode === "onboarding" ? "Launch my workspace" : "Save & apply"}
+          </button>
+        )}
+        {mode === "onboarding"
+          ? <button type="button" onClick={skip} disabled={saving} style={{ ...btnOutline, marginLeft: "auto" }}>Skip — use the standard setup</button>
+          : <button type="button" onClick={onDone} disabled={saving} style={{ ...btnOutline, marginLeft: "auto" }}>Cancel</button>}
+      </div>
+    </div>
+  );
+}
+
+// The review screen previews wording that hasn't been saved yet, so it can't go
+// through relabel() (which reads the live company config).
+function relabelWith(terms, text) {
+  const before = { terms: WS.terms, re: TERM_RE, map: TERM_MAP };
+  compileTerms(terms);
+  const out = relabel(text);
+  compileTerms(before.terms);
+  return out;
+}
+
+// The full-screen version a new owner lands on straight after signing up.
+function SetupGate({ onDone }) {
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, padding: "34px 18px calc(34px + env(safe-area-inset-bottom, 0px))", overflowY: "auto" }}>
+      <div style={{ maxWidth: 880, margin: "0 auto 18px", display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ width: 30, height: 30, borderRadius: 8, background: C.secondary, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 15 }}>B</div>
+        <span style={{ fontWeight: 800, fontSize: 14, letterSpacing: "-0.3px" }}>BuildMyBill</span>
+      </div>
+      <WorkspaceSetup mode="onboarding" onDone={onDone} />
+    </div>
+  );
+}
+
+function SetupPage() {
+  const { navigate } = useRouter();
+  return <WorkspaceSetup mode="page" onDone={() => navigate("settings")} />;
+}
+
 /* ─── Sidebar & shell ────────────────────────────────────────────────────── */
 const NAV = [
   { id: "dashboard", label: "Dashboard", icon: "⊞" },
   { id: "quotes", label: "Quotes & Invoices", icon: "📄" },
   { id: "clients", label: "Clients", icon: "👥" },
-  { id: "jobs", label: "Jobs / Projects", icon: "🏗️" },
+  { id: "jobs", label: "Jobs", icon: "🏗️" },
   { id: "contracts", label: "Contracts", icon: "📋" },
   { id: "employees", label: "Employees", icon: "👤" },
   { id: "subcontractors", label: "Subcontractors", icon: "🔧" },
@@ -5076,6 +5861,7 @@ const GRANTABLE = NAV.map(n => n.id).filter(id => !ALWAYS_VISIBLE.includes(id) &
 
 function canAccess(navId, user) {
   if (!user) return false;
+  if (!moduleEnabled(navId)) return false;          // switched off for this company
   if (user.isOwner) return true;                    // owner sees everything
   if (ALWAYS_VISIBLE.includes(navId)) return true;
   if (OWNER_ONLY.includes(navId)) return false;
@@ -5093,7 +5879,9 @@ function Sidebar({ open, onClose }) {
       <div className={"sidebar-backdrop" + (open ? " open" : "")} onClick={onClose} />
       <aside className={"sidebar" + (open ? " open" : "")}>
         <div style={{ padding: "18px 16px", borderBottom: "1px solid rgba(255,255,255,0.1)", display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 32, height: 32, borderRadius: 8, background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 800, flexShrink: 0 }}>B</div>
+          {company?.logoUrl
+            ? <img src={company.logoUrl} alt="" style={{ width: 32, height: 32, borderRadius: 8, objectFit: "cover", background: "#fff", flexShrink: 0 }} />
+            : <div style={{ width: 32, height: 32, borderRadius: 8, background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 800, flexShrink: 0 }}>{(company?.companyName || "B").slice(0, 1).toUpperCase()}</div>}
           <div style={{ minWidth: 0 }}>
             <div style={{ fontWeight: 800, fontSize: 14, letterSpacing: "-0.3px", lineHeight: 1.2 }}>BuildMyBill</div>
             <div style={{ fontSize: 10, opacity: 0.55, lineHeight: 1.3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -5120,7 +5908,7 @@ function Sidebar({ open, onClose }) {
                 }}
               >
                 <span style={{ fontSize: 13, flexShrink: 0 }}>{item.icon}</span>
-                {item.label}
+                {relabel(item.label)}
               </button>
             );
           })}
@@ -5167,6 +5955,7 @@ const PAGES = {
   pricing: () => <PricingPage />,
   team: () => <TeamPage />,
   settings: () => <SettingsPage />,
+  setup: () => <SetupPage />,
   profile: () => <ProfilePage />,
 };
 
@@ -6263,13 +7052,15 @@ function MobileShell() {
     { id: "photos", label: "Photos", icon: "📷", nav: "jobs" },
     { id: "more", label: "More", icon: "⋯", nav: null },
   ].filter(t => !t.nav || can(t.nav) || t.id === "more");
-  const title = { track: "Time Clock", log: "Daily Log", schedule: "Schedule", photos: "Job Photos", more: "More" }[tab];
+  const title = relabel({ track: "Time Clock", log: "Daily Log", schedule: "Schedule", photos: "Job Photos", more: "More" }[tab]);
 
   return (
     <div className="mshell">
       <div className="mtopbar">
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 30, height: 30, borderRadius: 8, background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 15 }}>B</div>
+          {company?.logoUrl
+            ? <img src={company.logoUrl} alt="" style={{ width: 30, height: 30, borderRadius: 8, objectFit: "cover", background: "#fff" }} />
+            : <div style={{ width: 30, height: 30, borderRadius: 8, background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 15 }}>{(company?.companyName || "B").slice(0, 1).toUpperCase()}</div>}
           <div>
             <div style={{ fontSize: 15, fontWeight: 800, lineHeight: 1.1 }}>{title}</div>
             <div style={{ fontSize: 11, opacity: .6 }}>{company?.companyName || "BuildMyBill"}</div>
@@ -6288,7 +7079,7 @@ function MobileShell() {
       <div className="mtabbar">
         {TABS.map(t => (
           <button key={t.id} type="button" className={"mtab" + (tab === t.id ? " active" : "")} onClick={() => setTab(t.id)}>
-            <span className="ico">{t.icon}</span>{t.label}
+            <span className="ico">{t.icon}</span>{relabel(t.label)}
           </button>
         ))}
       </div>
@@ -6299,6 +7090,7 @@ function MobileShell() {
 function AppShell() {
   const { page, navigate } = useRouter();
   const { user, isAuthenticated, pending, noAccess, ready, dataReady } = useAuth();
+  const { company } = useCompany();
   const [menuOpen, setMenuOpen] = useState(false);
   const dataVersion = useDataVersion();
   const isMobile = useIsMobile();
@@ -6311,12 +7103,20 @@ function AppShell() {
   if (pending) return <PendingScreen />;
   if (!dataReady) return <FullScreenLoader label="Loading your company data…" />;
 
+  // A brand-new company gets the guided setup before anything else. Only the
+  // owner ever sees it — everyone else joins a workspace that's already shaped.
+  if (user?.isOwner && company && !company.setupComplete) return <SetupGate onDone={() => navigate("dashboard")} />;
+
   // Phone-first field experience (unless the user chose the full desktop app).
   if (isMobile) return <MobileShell />;
 
   const allowed = page === "pricing" ? true
+    : page === "setup" ? !!user?.isOwner
     : page === "quote-editor" ? canAccess("quotes", user)
     : canAccess(page, user);
+  // Two different reasons a page can be closed off: the owner switched the
+  // whole section off for the company, or this person wasn't granted it.
+  const sectionOff = !allowed && !moduleEnabled(page);
   const render = allowed ? (PAGES[page] || PAGES.dashboard) : null;
   const label = (NAV.find(n => n.id === page) || {}).label || "Dashboard";
 
@@ -6326,7 +7126,7 @@ function AppShell() {
       <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
         <div className="topbar">
           <button type="button" onClick={() => setMenuOpen(o => !o)} aria-label="Menu" style={{ background: "rgba(255,255,255,0.12)", border: "none", color: "#fff", fontSize: 18, borderRadius: 8, width: 36, height: 36, cursor: "pointer" }}>☰</button>
-          <span style={{ fontWeight: 700, fontSize: 15 }}>{label}</span>
+          <span style={{ fontWeight: 700, fontSize: 15 }}>{relabel(label)}</span>
           <button type="button" onClick={() => { storage.remove(FORCE_DESKTOP_KEY); storage.set(FORCE_MOBILE_KEY, "1"); window.location.reload(); }}
             style={{ marginLeft: "auto", background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>📱 Field view</button>
         </div>
@@ -6335,14 +7135,27 @@ function AppShell() {
           {isIOS() && !isStandalone() && <MobileInstallBanner />}
           {render
             ? render()
-            : (
-              <EmptyState
-                icon="🔒"
-                title="You don't have access to this section"
-                subtitle="Your company owner controls which areas you can see. Ask them if you need access."
-                action={<button type="button" onClick={() => navigate("dashboard")} style={btnSecondary}>Back to Dashboard</button>}
-              />
-            )}
+            : sectionOff
+              ? (
+                <EmptyState
+                  icon="🧩"
+                  title="This section isn't switched on"
+                  subtitle={user?.isOwner
+                    ? "You turned this section off during setup. Switch it back on and its records return exactly as they were."
+                    : "Your company doesn't use this section. Ask your owner if you need it."}
+                  action={<button type="button" onClick={() => navigate(user?.isOwner ? "setup" : "dashboard")} style={btnSecondary}>
+                    {user?.isOwner ? "Open workspace setup" : "Back to Dashboard"}
+                  </button>}
+                />
+              )
+              : (
+                <EmptyState
+                  icon="🔒"
+                  title="You don't have access to this section"
+                  subtitle="Your company owner controls which areas you can see. Ask them if you need access."
+                  action={<button type="button" onClick={() => navigate("dashboard")} style={btnSecondary}>Back to Dashboard</button>}
+                />
+              )}
         </main>
       </div>
     </div>
