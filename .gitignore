@@ -10,3 +10,6 @@ screenshots/
 
 # Per-machine Claude Code permission state (not shared config)
 .claude/settings.local.json
+
+# Feature worktrees live here; they are checkouts, never repo content
+.claude/worktrees/
