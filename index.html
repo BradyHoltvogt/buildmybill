@@ -653,8 +653,15 @@ async function flushSafetyQueue() {
         notifyData();
       } catch (e) {
         // Still offline, or the upload failed — leave everything queued and stop;
-        // the next online event or timer tick picks up where this left off.
-        console.warn("Safety form still pending sync:", e && (e.message || e));
+        // the next online event or timer tick picks up where this left off. The
+        // reason is kept on the item: retrying forever in silence is fine when
+        // it's just no signal, but a server that keeps REFUSING the row has to
+        // be visible to somebody rather than looking like a slow upload.
+        const why = (e && (e.message || e.error_description)) || String(e);
+        console.warn("Safety form still pending sync:", why);
+        writeSafetyQueue(readSafetyQueue().map(x => (x.id === item.id
+          ? { ...x, attempts: (x.attempts || 0) + 1, lastError: why, lastTriedAt: new Date().toISOString() }
+          : x)));
         break;
       }
     }
@@ -2852,12 +2859,19 @@ function useOnline() {
   return on;
 }
 
+const STUCK_AFTER_ATTEMPTS = 4; // a few failures is a bad signal; many is a real problem
+
 function SyncStatusBar({ pending }) {
   const online = useOnline();
   if (!pending.length) return null;
+  const stuck = online ? pending.find(p => (p.attempts || 0) >= STUCK_AFTER_ATTEMPTS && p.lastError) : null;
   return (
-    <div style={{ background: "#FEFCE8", border: "1px solid #FDE68A", color: "#92400E", borderRadius: 10, padding: "10px 14px", marginBottom: 14, fontSize: 13, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-        <span>⏳ {pending.length} form{pending.length > 1 ? "s" : ""} saved on this device, waiting to sync{online ? "" : " — you're offline"}.</span>
+    <div style={{ background: stuck ? "#FEF2F2" : "#FEFCE8", border: "1px solid " + (stuck ? "#FECACA" : "#FDE68A"), color: stuck ? "#991B1B" : "#92400E", borderRadius: 10, padding: "10px 14px", marginBottom: 14, fontSize: 13, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+      <span style={{ minWidth: 0 }}>
+        {stuck ? "⚠️ " : "⏳ "}
+        {pending.length} form{pending.length > 1 ? "s" : ""} saved on this device, waiting to sync{online ? "" : " — you're offline"}.
+        {stuck && <div style={{ marginTop: 4, fontSize: 12 }}>The server keeps refusing the oldest one: {stuck.lastError}. Nothing is lost — show this to your office.</div>}
+      </span>
       <button type="button" onClick={() => flushSafetyQueue()} style={{ ...btnOutline, padding: "5px 12px", fontSize: 12 }}>Try now</button>
     </div>
   );
