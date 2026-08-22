@@ -248,6 +248,7 @@ const COLLECTIONS = [
   "warehouses", "managerlogs", "doctemplates", "job_media", "shifts", "job_docs", "quote_docs",
   "sites", "loads", "activeclocks", "locationpings", "equipmentlogs", "shiftrequests",
   "inventorylogs", "zones", "formtemplates", "formsubmissions", "certifications",
+  "materiallogs",
 ];
 
 /* ─── Secure data layer (Supabase-backed) ────────────────────────────────────
@@ -464,6 +465,133 @@ function logEquipmentUsage({ equipmentName, hours, employeeName, entryDate, jobI
     source: source || "",
   });
   if (eq) db.update("equipment", { ...eq, totalHours: num(eq.totalHours) + h });
+}
+
+// Materials used on a job, billed the way equipment hours already are. A trade
+// that fits parts (an electrician, a plumber) puts most of its invoice here, so
+// this has to survive the trip from a phone in a basement to the customer's bill.
+//
+// Two things happen, deliberately in this order:
+//   1. A `materiallogs` row is always written — that is the billable line, and it
+//      stands on its own even for something the shop doesn't stock as inventory
+//      ("40 ft of tracer wire off the truck").
+//   2. Only if the name matches a real inventory item does the stock come off,
+//      and it comes off through logInventoryMovement, the one path that also
+//      writes the audit trail. Nothing here touches currentStock directly.
+// The price is copied onto the log at the time of use, never read back off the
+// inventory item later: what a spool cost in August is not what the invoice
+// printed in November should quietly change to.
+function logMaterialUse({ materialName, quantity, unit, unitPrice, employeeName, entryDate, jobId, jobName, source }) {
+  const name = String(materialName || "").trim();
+  const q = num(quantity);
+  if (!name || q <= 0) return null;
+  const item = getCol("inventory").find(i => (i.materialName || "").trim().toLowerCase() === name.toLowerCase());
+  const typed = unitPrice !== "" && unitPrice !== null && unitPrice !== undefined;
+  const price = typed ? num(unitPrice) : (item ? num(item.unitPrice) : 0);
+  const uom = String(unit || "").trim() || (item ? item.unitOfMeasure || "" : "");
+  const date = entryDate || today();
+  const rec = db.create("materiallogs", {
+    employeeName: employeeName || "", entryDate: date, jobId: jobId || "", jobName: jobName || "",
+    inventoryId: item ? item._id : "", materialName: item ? item.materialName : name,
+    quantity: q, unitOfMeasure: uom, unitPrice: price, cost: Math.round(q * price * 100) / 100,
+    source: source || "",
+  });
+  if (item) {
+    logInventoryMovement({
+      inventoryId: item._id, type: "Used", quantity: q,
+      note: jobName ? "Used on " + jobName : "", entryDate: date, loggedBy: employeeName || "",
+    });
+  }
+  return rec;
+}
+
+// Correcting a material line already logged. Both of these exist because a
+// billable line that can only ever be written once is a line the office has to
+// work around, and working around it means the stock count and the invoice drift
+// apart. The rule is the same as everywhere else in this app: stock only ever
+// moves through logInventoryMovement, so every correction leaves an audit row
+// saying what happened instead of a number quietly changing.
+//
+// Only the difference is moved. Editing 6 breakers down to 4 puts 2 back on the
+// shelf; it does not re-run the original 6.
+function reconcileMaterialStock(oldLog, next, who) {
+  const date = next.entryDate || oldLog.entryDate || today();
+  const oldId = oldLog.inventoryId || "";
+  const newId = next.inventoryId || "";
+  const oldQty = num(oldLog.quantity);
+  const newQty = num(next.quantity);
+  const where = next.jobName || oldLog.jobName || "";
+
+  if (oldId && oldId === newId) {
+    const delta = Math.round((newQty - oldQty) * 1000) / 1000;
+    if (delta === 0) return;
+    logInventoryMovement({
+      inventoryId: oldId, type: delta > 0 ? "Used" : "Received", quantity: Math.abs(delta),
+      note: "Correction on " + (where || "a job") + " (" + oldQty + " → " + newQty + ")",
+      entryDate: date, loggedBy: who || "",
+    });
+    return;
+  }
+  // The line was pointed at a different item (or at none). Put the old one back
+  // whole, then take the new one whole.
+  if (oldId) {
+    logInventoryMovement({
+      inventoryId: oldId, type: "Received", quantity: oldQty,
+      note: "Corrected off " + (where || "a job"), entryDate: date, loggedBy: who || "",
+    });
+  }
+  if (newId) {
+    logInventoryMovement({
+      inventoryId: newId, type: "Used", quantity: newQty,
+      note: "Corrected onto " + (where || "a job"), entryDate: date, loggedBy: who || "",
+    });
+  }
+}
+
+// Edit a logged material line. `patch` carries whatever the office changed:
+// materialName, quantity, unitOfMeasure, unitPrice. Cost is always recomputed —
+// never trusted from the form — and the item is re-resolved by name so pointing
+// a line at a different material moves the stock with it.
+function updateMaterialLog(log, patch, who) {
+  const name = String(patch.materialName !== undefined ? patch.materialName : log.materialName || "").trim();
+  if (!name) return null;
+  const q = num(patch.quantity !== undefined ? patch.quantity : log.quantity);
+  if (!(q > 0)) return null;
+  const item = getCol("inventory").find(i => (i.materialName || "").trim().toLowerCase() === name.toLowerCase());
+  // Repointing a line at a different material carries that material's own price
+  // and unit across, unless the caller passed one. Keeping the old material's
+  // price on a new material is how a line ends up billing wire at breaker money.
+  const swapped = (item ? item._id : "") !== (log.inventoryId || "");
+  const price = patch.unitPrice !== undefined ? num(patch.unitPrice)
+    : swapped && item ? num(item.unitPrice)
+    : num(log.unitPrice);
+  const unit = patch.unitOfMeasure !== undefined ? String(patch.unitOfMeasure).trim()
+    : swapped && item ? String(item.unitOfMeasure || "").trim()
+    : String(log.unitOfMeasure || "").trim();
+  const next = {
+    ...log,
+    materialName: item ? item.materialName : name,
+    inventoryId: item ? item._id : "",
+    quantity: q,
+    unitOfMeasure: unit || (item ? item.unitOfMeasure || "" : ""),
+    unitPrice: price,
+    cost: Math.round(q * price * 100) / 100,
+  };
+  reconcileMaterialStock(log, next, who);
+  db.update("materiallogs", next);
+  return next;
+}
+
+// Remove a logged material line and put its stock back where it came from.
+function deleteMaterialLog(log, who) {
+  if (log.inventoryId) {
+    logInventoryMovement({
+      inventoryId: log.inventoryId, type: "Received", quantity: num(log.quantity),
+      note: "Line removed from " + (log.jobName || "a job"),
+      entryDate: log.entryDate || today(), loggedBy: who || "",
+    });
+  }
+  db.remove("materiallogs", log._id);
 }
 
 // Records a stock movement (received or used) against an inventory item and
@@ -1228,7 +1356,8 @@ const DEFAULT_SECONDARY = "#16A34A";
 // Company settings persisted to companies.settings — branding plus everything
 // the guided workspace setup produces (wording, stages, sections).
 const BRANDING_KEYS = ["primaryColor", "secondaryColor", "logoUrl", "address", "phone", "email", "website", "shopAddress", "shopLat", "shopLng", "geofenceRadiusM",
-  "industry", "industryDetail", "terms", "stages", "modules", "setupComplete", "setupCompletedAt", "setupSkipped", "setupPackage"];
+  "industry", "industryDetail", "terms", "stages", "modules", "setupComplete", "setupCompletedAt", "setupSkipped", "setupPackage",
+  "payPeriod", "payAnchor"];
 
 function applyBranding(company) {
   const root = document.documentElement;
@@ -5634,8 +5763,36 @@ function tsFriendly(iso) {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
+// Day arithmetic on YYYY-MM-DD, done at local noon so a daylight-saving jump
+// can never move a date across a midnight. Same reason the rest of this app
+// compares dates as strings instead of going near toISOString().
+const dayIndex = iso => {
+  const [y, m, d] = String(iso || "").split("-").map(Number);
+  if (!y || !m || !d) return NaN;
+  return Math.round(new Date(y, m - 1, d, 12).getTime() / 86400000);
+};
+const addDays = (iso, n) => {
+  const [y, m, d] = String(iso || "").split("-").map(Number);
+  return dateStr(new Date(y, m - 1, d + n, 12));
+};
+
+// The pay period that contains `on`, for a cycle `len` days long that started on
+// `anchor`. This is the difference between a real pay period and a rolling
+// window: "the last 14 days" always ends today, which is almost never what
+// payroll is actually paying. Anchoring to a date the office nominates means the
+// button lands on the same Sunday-to-Saturday-fortnight their cheques do.
+function periodAround(anchor, len, on) {
+  const a = dayIndex(anchor), t = dayIndex(on);
+  if (isNaN(a) || isNaN(t) || !(len > 0)) return null;
+  const n = Math.floor((t - a) / len);
+  const start = addDays(anchor, n * len);
+  return [start, addDays(start, len - 1)];
+}
+
 // Pay periods people actually run. Each returns [start, end] as YYYY-MM-DD.
-function tsPresets() {
+// With no pay cycle set on the company this returns exactly what it always did,
+// so nobody's existing habit changes until they choose one.
+function tsPresets(company) {
   const now = new Date();
   const y = now.getFullYear(), m = now.getMonth();
   const mk = (a, b) => [dateStr(a), dateStr(b)];
@@ -5643,13 +5800,53 @@ function tsPresets() {
   const lastSun = new Date(sunday); lastSun.setDate(lastSun.getDate() - 7);
   const lastSat = new Date(sunday); lastSat.setDate(lastSat.getDate() - 1);
   const twoWeeks = new Date(now); twoWeeks.setDate(twoWeeks.getDate() - 13);
-  return [
+  const generic = [
     { id: "this-month", label: "This month", range: () => mk(new Date(y, m, 1), new Date(y, m + 1, 0)) },
     { id: "last-month", label: "Last month", range: () => mk(new Date(y, m - 1, 1), new Date(y, m, 0)) },
     { id: "this-week", label: "This week", range: () => mk(sunday, now) },
     { id: "last-week", label: "Last week", range: () => mk(lastSun, lastSat) },
     { id: "last-14", label: "Last 14 days", range: () => mk(twoWeeks, now) },
   ];
+
+  const cycle = (company && company.payPeriod) || "";
+  const anchor = (company && company.payAnchor) || "";
+  const t = today();
+
+  if ((cycle === "weekly" || cycle === "biweekly") && anchor) {
+    const len = cycle === "weekly" ? 7 : 14;
+    const cur = periodAround(anchor, len, t);
+    if (cur) {
+      const prevStart = addDays(cur[0], -len);
+      return [
+        { id: "pay-this", label: "This pay period", range: () => cur },
+        { id: "pay-last", label: "Last pay period", range: () => [prevStart, addDays(prevStart, len - 1)] },
+        ...generic.filter(g => g.id !== "last-14"),
+      ];
+    }
+  }
+
+  if (cycle === "semimonthly") {
+    const half = (yy, mm, second) => second
+      ? [dateStr(new Date(yy, mm, 16)), dateStr(new Date(yy, mm + 1, 0))]
+      : [dateStr(new Date(yy, mm, 1)), dateStr(new Date(yy, mm, 15))];
+    const inSecond = now.getDate() > 15;
+    const prev = inSecond ? half(y, m, false) : half(y, m - 1, true);
+    return [
+      { id: "pay-this", label: "This pay period", range: () => half(y, m, inSecond) },
+      { id: "pay-last", label: "Last pay period", range: () => prev },
+      ...generic.filter(g => g.id !== "last-14"),
+    ];
+  }
+
+  if (cycle === "monthly") {
+    return [
+      { id: "this-month", label: "This pay period", range: () => mk(new Date(y, m, 1), new Date(y, m + 1, 0)) },
+      { id: "last-month", label: "Last pay period", range: () => mk(new Date(y, m - 1, 1), new Date(y, m, 0)) },
+      ...generic.filter(g => g.id !== "this-month" && g.id !== "last-month" && g.id !== "last-14"),
+    ];
+  }
+
+  return generic;
 }
 
 // One flat list of "a person worked these hours on this day", from whichever
@@ -5666,12 +5863,28 @@ function tsRows(basis, start, end) {
         hours: num(e.hoursWorked), note: e.jobName || "",
       }));
   }
+  // What happened on a clocked day is described by that person's own job time on
+  // the same date. The hours still come from the shift -- payroll pays the
+  // clocked envelope -- but the accountant reads a day instead of a number.
+  // Nothing is summed across the two: the descriptions are text, not arithmetic.
+  const work = getCol("timeentries").filter(e => e.source !== "mobile-clock" && inRange(e.entryDate));
+  const dayWork = {};
+  work.forEach(e => {
+    const k = (e.employeeName || "Unknown") + "|" + (e.entryDate || "");
+    const what = String(e.jobName || "").trim() || String(e.workDescription || "").trim();
+    if (!what) return;
+    (dayWork[k] = dayWork[k] || []).push(what);
+  });
   return getCol("shifts")
     .filter(s => inRange(s.entryDate))
     .map(s => ({
       date: s.entryDate || "", name: s.employeeName || "Unknown",
       start: s.startTime || "", end: s.endTime || "",
-      hours: num(s.hours), note: "",
+      // hours is already net of the unpaid break. The minutes ride along so the
+      // sheet can show why in and out don't add up to the hours beside them --
+      // an unexplained gap on a payroll sheet is an argument waiting to happen.
+      hours: num(s.hours), brk: num(s.breakMinutes),
+      note: [...new Set(dayWork[(s.employeeName || "Unknown") + "|" + (s.entryDate || "")] || [])].join(", "),
     }));
 }
 
@@ -5702,8 +5915,12 @@ const tsNum = { ...tsTd, textAlign: "right", fontVariantNumeric: "tabular-nums" 
 
 function TimesheetsView({ onClose }) {
   useDataVersion();
-  const { company } = useCompany();
-  const presets = useMemo(() => tsPresets(), []);
+  const { company, updateCompany } = useCompany();
+  const { user } = useAuth();
+  const canSetCycle = !!(user && (user.isOwner || user.role === "Manager"));
+  // Rebuilt when the company's pay cycle changes, so switching to "every two
+  // weeks" re-labels and re-dates the buttons on the spot.
+  const presets = useMemo(() => tsPresets(company), [company && company.payPeriod, company && company.payAnchor]);
   const [range, setRange] = useState(() => presets[0].range());
   const [basis, setBasis] = useState("clocked");
   const [who, setWho] = useState("");
@@ -5738,20 +5955,38 @@ function TimesheetsView({ onClose }) {
       ["Pay period", tsFriendly(start) + " to " + tsFriendly(end)],
       ["Hours basis", basisLabel],
       [],
-      ["Employee", "Date", "Day", "In", "Out", "Hours", "Rate", "Pay"],
+      ["Employee", "Date", "Day", "In", "Out", "Lunch (min)", "Work", "Hours", "Rate", "Pay"],
     ];
     people.forEach(p => {
       p.rows.forEach(r => rows.push([
         p.name, r.date, TS_DOW[new Date(r.date + "T00:00:00").getDay()] || "",
-        r.start, r.end, r.hours.toFixed(2),
+        r.start, r.end, r.brk ? String(r.brk) : "", r.note || "", r.hours.toFixed(2),
         rateFor(p.name) ? rateFor(p.name).toFixed(2) : "",
         rateFor(p.name) ? (r.hours * rateFor(p.name)).toFixed(2) : "",
       ]));
-      rows.push([p.name, "", "", "", "TOTAL", p.hours.toFixed(2), "", rateFor(p.name) ? (p.hours * rateFor(p.name)).toFixed(2) : ""]);
+      rows.push([p.name, "", "", "", "", "", "TOTAL", p.hours.toFixed(2), "", rateFor(p.name) ? (p.hours * rateFor(p.name)).toFixed(2) : ""]);
       rows.push([]);
     });
-    rows.push(["", "", "", "", "GRAND TOTAL", grandHours.toFixed(2), "", grandPay.toFixed(2)]);
+    rows.push(["", "", "", "", "", "", "GRAND TOTAL", grandHours.toFixed(2), "", grandPay.toFixed(2)]);
     downloadFile("timesheets_" + start + "_to_" + end + ".csv", toCSV(rows), "text/csv;charset=utf-8");
+  };
+
+  const needsAnchor = (company && company.payPeriod) === "weekly" || (company && company.payPeriod) === "biweekly";
+  const cycleHint = (() => {
+    const c = company || {};
+    if (c.payPeriod === "biweekly" && c.payAnchor) return "Periods run 14 days from " + tsFriendly(c.payAnchor) + ".";
+    if (c.payPeriod === "weekly" && c.payAnchor) return "Weeks run from " + (TS_DOW[new Date(c.payAnchor + "T00:00:00").getDay()] || "") + "s.";
+    if (c.payPeriod === "semimonthly") return "The 1st to the 15th, then the 16th to month end.";
+    if (c.payPeriod === "monthly") return "Calendar months.";
+    return "Set this and the buttons above become your real pay periods.";
+  })();
+
+  // Saving the cycle re-picks the first button, so the sheet on screen is
+  // immediately the period it now claims to be showing.
+  const applyCycle = async (payPeriod, payAnchor) => {
+    await updateCompany({ payPeriod, payAnchor });
+    const next = tsPresets({ ...(company || {}), payPeriod, payAnchor });
+    setRange(next[0].range());
   };
 
   const ctrlLabel = { fontSize: 10.5, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: 4 };
@@ -5783,6 +6018,36 @@ function TimesheetsView({ onClose }) {
               );
             })}
           </div>
+
+          {/* What the company's pay cycle actually is. Until this is set the
+              buttons stay as they were, including "Last 14 days" — which is a
+              rolling window, not a pay period, and is exactly the thing this
+              fixes for anyone paying biweekly. */}
+          {canSetCycle && (
+            <div className="row-wrap" style={{ gap: 12, alignItems: "flex-end", marginBottom: 14, paddingBottom: 14, borderBottom: "1px solid " + C.border }}>
+              <div style={{ minWidth: 190 }}>
+                <label style={ctrlLabel}>Pay cycle</label>
+                <select value={(company && company.payPeriod) || ""} onChange={e => applyCycle(e.target.value, (company && company.payAnchor) || "")} style={inputCls}>
+                  <option value="">Not set</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="biweekly">Every 2 weeks</option>
+                  <option value="semimonthly">Twice a month (1st &amp; 16th)</option>
+                  <option value="monthly">Monthly</option>
+                </select>
+              </div>
+              {needsAnchor && (
+                <div>
+                  <label style={ctrlLabel}>A pay period started on</label>
+                  <input type="date" value={(company && company.payAnchor) || ""} onChange={e => applyCycle((company && company.payPeriod) || "", e.target.value)} style={inputCls} />
+                </div>
+              )}
+              <div style={{ fontSize: 11.5, color: C.textMuted, maxWidth: 320, paddingBottom: 8 }}>
+                {needsAnchor && !(company && company.payAnchor)
+                  ? "Pick any past date a pay period began on. Every period is counted from there."
+                  : cycleHint}
+              </div>
+            </div>
+          )}
 
           <div className="row-wrap" style={{ gap: 12 }}>
             <div><label style={ctrlLabel}>From</label><input type="date" value={start} onChange={e => setRange([e.target.value, end])} style={inputCls} /></div>
@@ -5886,6 +6151,8 @@ function TimesheetsView({ onClose }) {
                       <th style={tsTh}>In</th>
                       <th style={tsTh}>Out</th>
                       {basis === "logged" && <th style={tsTh}>Job</th>}
+                      {basis === "clocked" && <th style={tsTh}>Lunch</th>}
+                      {basis === "clocked" && <th style={{ ...tsTh, whiteSpace: "normal" }}>Work</th>}
                       <th style={{ ...tsTh, textAlign: "right" }}>Hours</th>
                     </tr></thead>
                     <tbody>
@@ -5898,12 +6165,14 @@ function TimesheetsView({ onClose }) {
                               <td style={tsTd}>{r.start || "—"}</td>
                               <td style={tsTd}>{r.end || "—"}</td>
                               {basis === "logged" && <td style={{ ...tsTd, color: tsMuted }}>{r.note || "—"}</td>}
+                              {basis === "clocked" && <td style={{ ...tsTd, color: tsMuted }}>{r.brk ? "−" + r.brk + " min" : "—"}</td>}
+                              {basis === "clocked" && <td style={{ ...tsTd, color: tsMuted, fontSize: 11 }}>{r.note || "—"}</td>}
                               <td style={tsNum}>{r.hours.toFixed(2)}</td>
                             </tr>
                           ))}
                           {p.weeks.length > 1 && (
                             <tr>
-                              <td colSpan={basis === "logged" ? 5 : 4} style={{ ...tsTd, background: tsWash, fontSize: 11, color: tsMuted, fontWeight: 700 }}>
+                              <td colSpan={basis === "clocked" ? 6 : 5} style={{ ...tsTd, background: tsWash, fontSize: 11, color: tsMuted, fontWeight: 700 }}>
                                 Week of {tsFriendly(w.start)}
                               </td>
                               <td style={{ ...tsNum, background: tsWash, fontWeight: 700, fontSize: 11.5 }}>{w.hours.toFixed(2)}</td>
@@ -5912,14 +6181,14 @@ function TimesheetsView({ onClose }) {
                         </React.Fragment>
                       ))}
                       <tr>
-                        <td colSpan={basis === "logged" ? 5 : 4} style={{ ...tsTd, fontWeight: 800, borderBottom: "none", paddingTop: 10 }}>
+                        <td colSpan={basis === "clocked" ? 6 : 5} style={{ ...tsTd, fontWeight: 800, borderBottom: "none", paddingTop: 10 }}>
                           Total hours{rateFor(p.name) ? " · " + fmt(rateFor(p.name)) + "/hr" : ""}
                         </td>
                         <td style={{ ...tsNum, fontWeight: 800, borderBottom: "none", paddingTop: 10 }}>{p.hours.toFixed(2)}</td>
                       </tr>
                       {rateFor(p.name) > 0 && (
                         <tr>
-                          <td colSpan={basis === "logged" ? 5 : 4} style={{ ...tsTd, fontWeight: 800, borderBottom: "none" }}>Gross pay</td>
+                          <td colSpan={basis === "clocked" ? 6 : 5} style={{ ...tsTd, fontWeight: 800, borderBottom: "none" }}>Gross pay</td>
                           <td style={{ ...tsNum, fontWeight: 800, borderBottom: "none" }}>{fmt(p.hours * rateFor(p.name))}</td>
                         </tr>
                       )}
@@ -6362,11 +6631,106 @@ function Dashboard() {
 }
 
 /* ─── Billing & reports ──────────────────────────────────────────────────── */
+// Fixing a material line after the fact. Deliberately not a free-form record
+// editor: it edits the four things that can be wrong on a parts line, and every
+// save goes back through updateMaterialLog so the stock correction and its audit
+// row happen together. Owners and managers only — a crew phone logs materials,
+// the office corrects them.
+function MaterialLogEditor({ log, onClose }) {
+  const { user } = useAuth();
+  const inventory = getCol("inventory");
+  const [form, setForm] = useState({
+    materialName: log.materialName || "",
+    quantity: String(log.quantity == null ? "" : log.quantity),
+    unitOfMeasure: log.unitOfMeasure || "",
+    unitPrice: String(log.unitPrice == null ? "" : log.unitPrice),
+  });
+  const [err, setErr] = useState("");
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  // Same behaviour as the field app's material row: pick something we stock and
+  // its unit and price come with it, both still editable afterwards.
+  const setMaterial = v => setForm(f => {
+    const hit = inventory.find(i => (i.materialName || "").trim().toLowerCase() === String(v || "").trim().toLowerCase());
+    if (!hit || (hit.materialName || "").trim().toLowerCase() === String(f.materialName || "").trim().toLowerCase()) return { ...f, materialName: v };
+    return { ...f, materialName: v, unitOfMeasure: hit.unitOfMeasure || "", unitPrice: hit.unitPrice != null && hit.unitPrice !== "" ? String(hit.unitPrice) : "" };
+  });
+
+  const item = inventory.find(i => (i.materialName || "").trim().toLowerCase() === form.materialName.trim().toLowerCase());
+  const q = num(form.quantity);
+  const lineTotal = q * num(form.unitPrice);
+  const wasItem = log.inventoryId ? inventory.find(i => i._id === log.inventoryId) : null;
+  const delta = item && wasItem && item._id === wasItem._id ? Math.round((q - num(log.quantity)) * 1000) / 1000 : null;
+
+  const save = () => {
+    if (!form.materialName.trim()) { setErr("Name the material."); return; }
+    if (!(q > 0)) { setErr("Quantity has to be more than zero. To remove the line, delete it."); return; }
+    updateMaterialLog(log, form, user && user.name);
+    notifyData();
+    onClose();
+  };
+
+  const remove = async () => {
+    if (!(await confirmDialog("Delete this material line? " + (log.inventoryId ? num(log.quantity) + " " + (log.unitOfMeasure || "units") + " goes back on the shelf." : "It bills nothing after this.")))) return;
+    deleteMaterialLog(log, user && user.name);
+    notifyData();
+    onClose();
+  };
+
+  return (
+    <Modal title="Edit material line" onClose={onClose} width={520}>
+      <div style={{ fontSize: 12.5, color: C.textMuted, marginBottom: 16 }}>
+        {log.entryDate} · {log.employeeName || "Unknown"}{log.jobName ? " · " + log.jobName : ""}
+      </div>
+
+      <Field label="Material">
+        <input list="ml-inventory" value={form.materialName} onChange={e => setMaterial(e.target.value)} style={inputCls} />
+        <datalist id="ml-inventory">{inventory.map(i => <option key={i._id} value={i.materialName} />)}</datalist>
+      </Field>
+      <div className="row-wrap">
+        <Field label="Quantity"><input type="number" inputMode="decimal" value={form.quantity} onChange={e => set("quantity", e.target.value)} style={inputCls} /></Field>
+        <Field label="Unit"><TextInput value={form.unitOfMeasure} onChange={v => set("unitOfMeasure", v)} placeholder="ft, ea, box" /></Field>
+        <Field label="Price each"><input type="number" inputMode="decimal" value={form.unitPrice} onChange={e => set("unitPrice", e.target.value)} style={inputCls} /></Field>
+      </div>
+
+      <div style={{ background: C.surfaceAlt, border: "1px solid " + C.border, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 800 }}>
+          <span>Line total</span><span>{money(lineTotal)}</span>
+        </div>
+        <div style={{ fontSize: 12, color: C.textMuted, marginTop: 6 }}>
+          {!item && "Not a stocked item — this bills, but moves no inventory."}
+          {item && delta === 0 && "Stock unchanged."}
+          {item && delta !== null && delta > 0 && ("Saving takes another " + delta + " " + (item.unitOfMeasure || "units") + " off " + item.materialName + ".")}
+          {item && delta !== null && delta < 0 && ("Saving puts " + Math.abs(delta) + " " + (item.unitOfMeasure || "units") + " back on " + item.materialName + ".")}
+          {item && delta === null && ("Saving returns the old quantity and takes " + (q || 0) + " " + (item.unitOfMeasure || "units") + " off " + item.materialName + ".")}
+        </div>
+      </div>
+
+      {err && <div style={{ color: "#DC2626", fontSize: 13, fontWeight: 700, marginBottom: 12 }}>{err}</div>}
+
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <button type="button" onClick={remove} style={{ ...btnOutline, color: "#DC2626", borderColor: "#FCA5A5" }}>Delete line</button>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button type="button" onClick={onClose} style={btnOutline}>Cancel</button>
+          <button type="button" onClick={save} style={btnSecondary}>Save</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function BillingPage() {
-  const entries = useMemo(() => db.getAll("timeentries", {}, { limit: 1000 }).items, []);
-  const equipmentLogs = useMemo(() => db.getAll("equipmentlogs", {}, { limit: 1000 }).items, []);
-  const employees = useMemo(() => db.getAll("employees").items, []);
+  // Keyed to the data version, not []: correcting a material line has to show up
+  // in the table and the totals it was corrected from, and this page doesn't
+  // remount when the store changes.
+  const dataVersion = useDataVersion();
+  const entries = useMemo(() => db.getAll("timeentries", {}, { limit: 1000 }).items, [dataVersion]);
+  const equipmentLogs = useMemo(() => db.getAll("equipmentlogs", {}, { limit: 1000 }).items, [dataVersion]);
+  const materialLogs = useMemo(() => db.getAll("materiallogs", {}, { limit: 1000 }).items, [dataVersion]);
+  const employees = useMemo(() => db.getAll("employees").items, [dataVersion]);
   const [filters, setFilters] = useState({ startDate: "", endDate: "", employee: "", job: "" });
+  const { user } = useAuth();
+  const canFixMaterials = !!(user && (user.isOwner || user.role === "Manager"));
+  const [editingMaterial, setEditingMaterial] = useState(null);
 
   const rateFor = name => {
     const emp = employees.find(x => sameName(x.fullName, name));
@@ -6398,6 +6762,18 @@ function BillingPage() {
   const totalEquipmentHours = filteredEquipment.reduce((s, l) => s + num(l.hoursUsed), 0);
   const totalEquipmentCost = filteredEquipment.reduce((s, l) => s + num(l.cost), 0);
 
+  // Materials fitted on the job — for a trade that installs parts this is most
+  // of the invoice, so it filters and totals exactly like equipment does.
+  const filteredMaterials = materialLogs.filter(l => {
+    if (filters.startDate && (l.entryDate || "") < filters.startDate) return false;
+    if (filters.endDate && (l.entryDate || "") > filters.endDate) return false;
+    if (filters.employee && l.employeeName !== filters.employee) return false;
+    if (filters.job && !String(l.jobName || "").toLowerCase().includes(filters.job.toLowerCase())) return false;
+    return true;
+  });
+  const totalMaterialsCost = filteredMaterials.reduce((s, l) => s + num(l.cost), 0);
+  const grandTotal = totalLabourCost + totalEquipmentCost + totalMaterialsCost;
+
   const exportCSV = () => {
     const rows = [
       ["Date", "Employee", "Job", "Hours", "Rate", "Labour Cost", "Miles", "Equipment", "Description"],
@@ -6415,7 +6791,13 @@ function BillingPage() {
       [],
       ["", "", "", "TOTAL", totalEquipmentHours.toFixed(2), "", totalEquipmentCost.toFixed(2)],
       [],
-      ["", "", "", "", "", "GRAND TOTAL", (totalLabourCost + totalEquipmentCost).toFixed(2)],
+      ["MATERIALS USED"],
+      ["Date", "Material", "Employee", "Job", "Quantity", "Unit", "Price Each", "Billed"],
+      ...filteredMaterials.map(l => [l.entryDate, l.materialName, l.employeeName, l.jobName, num(l.quantity), l.unitOfMeasure || "", num(l.unitPrice).toFixed(2), num(l.cost).toFixed(2)]),
+      [],
+      ["", "", "", "", "", "", "TOTAL", totalMaterialsCost.toFixed(2)],
+      [],
+      ["", "", "", "", "", "", "GRAND TOTAL", grandTotal.toFixed(2)],
     ];
     downloadFile("billing_report_" + today() + ".csv", toCSV(rows), "text/csv;charset=utf-8");
   };
@@ -6454,8 +6836,40 @@ function BillingPage() {
       <div className="grid-3" style={{ marginBottom: 20 }}>
         <StatCard label="Equipment Hours" value={totalEquipmentHours.toFixed(2)} />
         <StatCard label="Equipment Cost" value={fmt(totalEquipmentCost)} />
-        <StatCard label="Total Billed" value={fmt(totalLabourCost + totalEquipmentCost)} />
+        <StatCard label="Materials Cost" value={fmt(totalMaterialsCost)} />
       </div>
+
+      <div style={{ ...card, marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 800, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>Total Billed</div>
+          <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>Labour {fmt(totalLabourCost)} · Equipment {fmt(totalEquipmentCost)} · Materials {fmt(totalMaterialsCost)}</div>
+        </div>
+        <div style={{ fontSize: 28, fontWeight: 900 }}>{fmt(grandTotal)}</div>
+      </div>
+
+      {editingMaterial && <MaterialLogEditor log={editingMaterial} onClose={() => setEditingMaterial(null)} />}
+
+      {filteredMaterials.length > 0 && (
+        <div style={{ ...card, marginBottom: 20 }}>
+          <h3 style={{ fontSize: 15, fontWeight: 800, marginBottom: 12 }}>Materials Used</h3>
+          <DataTable
+            columns={[
+              { key: "entryDate", label: "Date" },
+              { key: "materialName", label: "Material" },
+              { key: "employeeName", label: "Employee" },
+              { key: "jobName", label: "Job" },
+              { key: "quantity", label: "Qty", render: (v, row) => num(v).toLocaleString() + (row.unitOfMeasure ? " " + row.unitOfMeasure : "") },
+              { key: "unitPrice", label: "Price Each", render: v => money(v) },
+              { key: "cost", label: "Billed", render: v => money(v) },
+              ...(canFixMaterials ? [{ key: "_fix", label: "", render: (_v, row) => (
+                <button type="button" onClick={() => setEditingMaterial(row)}
+                  style={{ background: "none", border: "none", color: C.accent, fontWeight: 700, fontSize: 12.5, cursor: "pointer", padding: 0 }}>Edit</button>
+              ) }] : []),
+            ]}
+            rows={filteredMaterials}
+          />
+        </div>
+      )}
 
       <div style={{ ...card, marginBottom: 20 }}>
         <DataTable
@@ -10470,6 +10884,65 @@ function useNotifyPermission() {
   return [perm, request];
 }
 
+// Lunch, asked once at clock-out. The clocked shift is what payroll pays, so an
+// unpaid half hour spent sitting in a truck has to come off the total or
+// everybody gets paid for time they weren't working. Asked, never assumed: some
+// days there is no break, and a shift that guesses is worse than one that asks.
+const BREAK_PRESETS = [0, 30, 45, 60];
+
+function MobileLunchSheet({ grossMs, busy, onConfirm, onClose }) {
+  const [mins, setMins] = useState(0);
+  const [custom, setCustom] = useState("");
+  const grossMins = Math.max(0, Math.round(grossMs / 60000));
+  const picked = custom.trim() !== "" ? Math.max(0, Math.round(num(custom))) : mins;
+  // A break can never be longer than the shift it came out of - that would pay
+  // somebody negative hours. Clamped, and said out loud rather than silently.
+  const tooLong = picked > grossMins;
+  const paidMins = Math.max(0, grossMins - Math.min(picked, grossMins));
+
+  const chip = (label, on, onClick) => (
+    <button key={label} type="button" onClick={onClick}
+      style={{ flex: "1 1 0", minWidth: 74, minHeight: 46, borderRadius: 12, cursor: "pointer", fontSize: 14, fontWeight: 800,
+        border: "1px solid " + (on ? C.secondary : C.border), background: on ? C.secondary : C.surface, color: on ? "#fff" : C.text }}>
+      {label}
+    </button>
+  );
+
+  return (
+    <MobileSheet title="Did you take lunch?" onClose={busy ? () => {} : onClose}>
+      <div style={{ padding: 16 }}>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 12 }}>
+          On the clock for {fmtDur(grossMs)}. Anything you took off comes out of that.
+        </div>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {BREAK_PRESETS.map(m => chip(m === 0 ? "No lunch" : m + " min", custom.trim() === "" && mins === m, () => { setMins(m); setCustom(""); }))}
+        </div>
+
+        <label style={mLbl}>Or type the minutes</label>
+        <input type="number" inputMode="numeric" min="0" value={custom} placeholder="e.g. 20"
+          onChange={e => setCustom(e.target.value)} style={mInput} />
+
+        <div style={{ marginTop: 16, padding: "12px 14px", borderRadius: 12, background: C.surfaceAlt, border: "1px solid " + C.border }}>
+          <div style={{ fontSize: 11, fontWeight: 800, color: C.textMuted, textTransform: "uppercase", letterSpacing: .5 }}>Hours this shift</div>
+          <div style={{ fontSize: 24, fontWeight: 900, marginTop: 2 }}>{hmm(paidMins / 60)}</div>
+          {picked > 0 && !tooLong && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>{fmtDur(grossMs)} less {Math.min(picked, grossMins)} min lunch</div>}
+          {tooLong && <div style={{ fontSize: 12.5, color: "#B45309", marginTop: 4, fontWeight: 700 }}>That's longer than the shift. It'll be capped at {grossMins} min.</div>}
+        </div>
+
+        <button type="button" disabled={busy} onClick={() => onConfirm(Math.min(picked, grossMins))}
+          style={{ ...mBtn, background: "#DC2626", color: "#fff", marginTop: 16, opacity: busy ? .7 : 1 }}>
+          {busy ? "Saving..." : "■  Clock Out"}
+        </button>
+        <button type="button" disabled={busy} onClick={onClose}
+          style={{ ...mBtn, background: C.surface, color: C.text, border: "1px solid " + C.border, marginTop: 8, fontSize: 15 }}>
+          Stay on the clock
+        </button>
+      </div>
+    </MobileSheet>
+  );
+}
+
 function MobileTimeClock({ onLogWork }) {
   const { user } = useAuth();
   const { company } = useCompany();
@@ -10482,6 +10955,7 @@ function MobileTimeClock({ onLogWork }) {
   const [active, setActive] = useState(() => { try { return JSON.parse(storage.get(ACTIVE_CLOCK_KEY) || "null"); } catch (e) { return null; } });
   const [nowTs, setNowTs] = useState(Date.now());
   const [busy, setBusy] = useState(false);
+  const [askLunch, setAskLunch] = useState(false);
   const [alertDismissed, setAlertDismissed] = useState(false);
   const [checkOutDismissed, setCheckOutDismissed] = useState(false);
   const [notifyPerm, requestNotify] = useNotifyPermission();
@@ -10543,17 +11017,22 @@ function MobileTimeClock({ onLogWork }) {
     }
   };
 
-  const clockOut = async () => {
+  const clockOut = async breakMinutes => {
     if (!active) return;
     setBusy(true);
     const start = new Date(active.startISO);
     const end = new Date();
     const geoOut = await getGeo();
+    // grossHours is what the clock saw; hours is what payroll pays. Both are
+    // kept, so a shift can still be explained to whoever asks about it later.
+    const grossHours = Math.round((end - start) / 3600000 * 100) / 100;
+    const brk = Math.min(Math.max(0, Math.round(num(breakMinutes))), Math.floor(grossHours * 60));
     db.create("shifts", {
       employeeName: active.employee, entryDate: dateStr(start),
       clockInAt: active.startISO, clockOutAt: end.toISOString(),
       startTime: timeHM(start), endTime: timeHM(end),
-      hours: Math.round((end - start) / 3600000 * 100) / 100,
+      hours: Math.max(0, Math.round((grossHours - brk / 60) * 100) / 100),
+      grossHours, breakMinutes: brk,
       clockInLocation: active.geoIn || "", clockOutLocation: geoOut || "",
       // Keeps the link to this shift's location pings so the route can still be
       // viewed on Crew Locations after clock-out (only the "currently active"
@@ -10564,6 +11043,7 @@ function MobileTimeClock({ onLogWork }) {
     notifyData();
     persist(null);
     setBusy(false);
+    setAskLunch(false);
   };
 
   const t = today();
@@ -10612,7 +11092,7 @@ function MobileTimeClock({ onLogWork }) {
             <div style={{ fontWeight: 800, fontSize: 14 }}>Leaving the shop</div>
             <div style={{ fontSize: 12, opacity: .65 }}>Clock out now?</div>
           </div>
-          <button type="button" disabled={busy} onClick={clockOut} style={{ background: "#DC2626", color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", fontWeight: 700, fontSize: 13, cursor: "pointer", opacity: busy ? .7 : 1 }}>Clock Out</button>
+          <button type="button" disabled={busy} onClick={() => setAskLunch(true)} style={{ background: "#DC2626", color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", fontWeight: 700, fontSize: 13, cursor: "pointer", opacity: busy ? .7 : 1 }}>Clock Out</button>
           <button type="button" onClick={() => setCheckOutDismissed(true)} aria-label="Dismiss" style={{ background: "none", border: "none", color: "#fff", opacity: .5, fontSize: 20, cursor: "pointer", lineHeight: 1 }}>×</button>
         </div>
       )}
@@ -10623,7 +11103,7 @@ function MobileTimeClock({ onLogWork }) {
             <div style={{ fontSize: 11, letterSpacing: 1.5, textTransform: "uppercase", opacity: .55 }}>● On the clock</div>
             <div style={{ fontSize: 46, fontWeight: 900, fontVariantNumeric: "tabular-nums", margin: "6px 0 2px" }}>{fmtDur(runningMs)}</div>
             <div style={{ fontSize: 12, opacity: .55, marginTop: 3 }}>Since {timeHM(new Date(active.startISO))}{active.geoIn ? " · 📍 location saved" : ""}</div>
-            <button type="button" disabled={busy} onClick={clockOut} style={{ ...mBtn, background: "#DC2626", color: "#fff", marginTop: 20, opacity: busy ? .7 : 1 }}>{busy ? "Saving…" : "■  Clock Out"}</button>
+            <button type="button" disabled={busy} onClick={() => setAskLunch(true)} style={{ ...mBtn, background: "#DC2626", color: "#fff", marginTop: 20, opacity: busy ? .7 : 1 }}>{busy ? "Saving…" : "■  Clock Out"}</button>
           </>
         ) : (
           <>
@@ -10671,6 +11151,10 @@ function MobileTimeClock({ onLogWork }) {
       )}
 
       {canManage && <MobileTeamEfficiency />}
+
+      {askLunch && active && (
+        <MobileLunchSheet grossMs={runningMs} busy={busy} onConfirm={clockOut} onClose={() => setAskLunch(false)} />
+      )}
     </div>
   );
 }
@@ -10683,9 +11167,11 @@ const emptyDraft = {
   job: "", jobId: "", work: "", start: "", end: "", notes: "", maintenance: false, maintUnit: "", maintMileage: "", maintHours: "",
   hauling: false, loads: [], siteId: "", siteName: "", siteClient: "",
   equipmentUse: false, equipRows: [],
+  materialsUse: false, materialRows: [],
 };
 const emptyLoadRow = () => ({ id: genId(), truck: "", yards: "", ticketNumber: "" });
 const emptyEquipRow = () => ({ id: genId(), equipment: "", hours: "" });
+const emptyMaterialRow = () => ({ id: genId(), item: "", qty: "", unit: "", price: "" });
 // How far (m) a dropped pin can be from a saved local site and still count as a match.
 const SITE_RADIUS_M = 800;
 // Edit (or delete) an already-logged "timeentries" record from the "Logged
@@ -10729,6 +11215,7 @@ function MobileDailyLog() {
   useDataVersion();
   const jobs = getCol("jobs");
   const equipment = getCol("equipment");
+  const inventory = getCol("inventory");
   const employee = user?.name || "Me";
   const [draft, setDraft] = useState(() => {
     try { const d = JSON.parse(storage.get(DL_DRAFT_KEY) || "null"); return d && typeof d === "object" ? { ...emptyDraft, ...d } : { ...emptyDraft }; }
@@ -10749,6 +11236,11 @@ function MobileDailyLog() {
   };
 
   const hrs = hoursBetween(draft.start, draft.end);
+  const materialsTotal = draft.materialRows.reduce((t, r) => t + num(r.qty) * num(r.price), 0);
+  // The job being logged against, so the same checklist can sit on this screen.
+  // It reads saved records, so a tick appears when something is actually saved,
+  // not while it's being typed.
+  const draftJob = draft.jobId ? jobs.find(j => j._id === draft.jobId) : jobs.find(j => (j.jobTitle || "") === draft.job);
 
   const setLoadRow = (id, k, v) => setDraft(d => ({ ...d, loads: d.loads.map(r => (r.id === id ? { ...r, [k]: v } : r)) }));
   const addLoadRow = () => setDraft(d => ({ ...d, loads: [...d.loads, emptyLoadRow()] }));
@@ -10757,6 +11249,20 @@ function MobileDailyLog() {
   const setEquipRow = (id, k, v) => setDraft(d => ({ ...d, equipRows: d.equipRows.map(r => (r.id === id ? { ...r, [k]: v } : r)) }));
   const addEquipRow = () => setDraft(d => ({ ...d, equipRows: [...d.equipRows, emptyEquipRow()] }));
   const removeEquipRow = id => setDraft(d => ({ ...d, equipRows: d.equipRows.filter(r => r.id !== id) }));
+
+  const setMatRow = (id, k, v) => setDraft(d => ({ ...d, materialRows: d.materialRows.map(r => (r.id === id ? { ...r, [k]: v } : r)) }));
+  const addMatRow = () => setDraft(d => ({ ...d, materialRows: [...d.materialRows, emptyMaterialRow()] }));
+  const removeMatRow = id => setDraft(d => ({ ...d, materialRows: d.materialRows.filter(r => r.id !== id) }));
+  // Picking a stocked item fills in its unit and price. Both stay editable —
+  // the price on the shelf isn't always the price that goes on this bill.
+  const pickMaterial = (id, name) => setDraft(d => ({
+    ...d,
+    materialRows: d.materialRows.map(r => {
+      if (r.id !== id) return r;
+      const hit = inventory.find(i => (i.materialName || "").trim().toLowerCase() === String(name || "").trim().toLowerCase());
+      return hit ? { ...r, item: name, unit: hit.unitOfMeasure || "", price: hit.unitPrice != null && hit.unitPrice !== "" ? String(hit.unitPrice) : "" } : { ...r, item: name };
+    }),
+  }));
 
   const findNearbySites = async () => {
     setSiteSearching(true);
@@ -10780,7 +11286,8 @@ function MobileDailyLog() {
     if (draft.maintenance && !draft.maintUnit.trim()) { setMsg("Pick or enter the equipment unit for the maintenance."); return; }
     const validLoads = draft.hauling ? draft.loads.filter(r => r.truck && (r.yards || r.ticketNumber)) : [];
     const validEquip = draft.equipmentUse ? draft.equipRows.filter(r => r.equipment && num(r.hours) > 0) : [];
-    if (!draft.job && !draft.work.trim() && !draft.maintenance && validLoads.length === 0 && validEquip.length === 0) { setMsg("Pick a job or describe the work first."); return; }
+    const validMaterials = draft.materialsUse ? draft.materialRows.filter(r => String(r.item || "").trim() && num(r.qty) > 0) : [];
+    if (!draft.job && !draft.work.trim() && !draft.maintenance && validLoads.length === 0 && validEquip.length === 0 && validMaterials.length === 0) { setMsg("Pick a job or describe the work first."); return; }
     db.create("timeentries", {
       employeeName: employee, jobName: draft.job, entryDate: today(),
       startTime: draft.start, endTime: draft.end, hoursWorked: hrs,
@@ -10812,6 +11319,11 @@ function MobileDailyLog() {
     // Bills each piece of equipment at its rate and rolls the hours onto its total.
     validEquip.forEach(r => {
       logEquipmentUsage({ equipmentName: r.equipment, hours: r.hours, employeeName: employee, entryDate: today(), jobId: draft.jobId, jobName: draft.job, source: "mobile-log" });
+    });
+    // Parts fitted today: one billable line each, and stock off for the ones the
+    // shop actually stocks (see logMaterialUse).
+    validMaterials.forEach(r => {
+      logMaterialUse({ materialName: r.item, quantity: r.qty, unit: r.unit, unitPrice: r.price, employeeName: employee, entryDate: today(), jobId: draft.jobId, jobName: draft.job, source: "mobile-log" });
     });
     notifyData();
     setDraft({ ...emptyDraft }); storage.remove(DL_DRAFT_KEY);
@@ -10912,6 +11424,46 @@ function MobileDailyLog() {
           </div>
         )}
 
+        {/* Materials used — the parts half of the bill. One row per item, priced
+            at the point of use, so what leaves the van gets invoiced. */}
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+          <input type="checkbox" checked={draft.materialsUse}
+            onChange={e => { set("materialsUse", e.target.checked); if (e.target.checked && draft.materialRows.length === 0) addMatRow(); }}
+            style={{ accentColor: C.secondary, width: 18, height: 18 }} />
+          📦 I used materials
+        </label>
+        {draft.materialsUse && (
+          <div style={{ background: C.surfaceAlt, borderRadius: 10, padding: 12, marginTop: 8 }}>
+            {draft.materialRows.map((r, i) => {
+              const line = num(r.qty) * num(r.price);
+              return (
+                <div key={r.id} style={{ background: C.surface, border: "1px solid " + C.border, borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase" }}>Material {i + 1}</span>
+                    {draft.materialRows.length > 1 && <button type="button" onClick={() => removeMatRow(r.id)} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 16, cursor: "pointer", lineHeight: 1 }}>×</button>}
+                  </div>
+                  <label style={{ ...mLbl, marginTop: 4 }}>What was used</label>
+                  <input list="dl-materials" value={r.item} onChange={e => pickMaterial(r.id, e.target.value)} placeholder="Pick from stock, or type anything" style={mInput} />
+                  <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
+                    <div style={{ flex: 1 }}><label style={mLbl}>How many</label><input type="number" inputMode="decimal" value={r.qty} onChange={e => setMatRow(r.id, "qty", e.target.value)} placeholder="0" style={mInput} /></div>
+                    <div style={{ flex: 1 }}><label style={mLbl}>Unit</label><input value={r.unit} onChange={e => setMatRow(r.id, "unit", e.target.value)} placeholder="ft, ea, box" style={mInput} /></div>
+                    <div style={{ flex: 1 }}><label style={mLbl}>Price each</label><input type="number" inputMode="decimal" value={r.price} onChange={e => setMatRow(r.id, "price", e.target.value)} placeholder="0.00" style={mInput} /></div>
+                  </div>
+                  {line > 0 && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 6, textAlign: "right" }}>Line: <strong style={{ color: C.text }}>{money(line)}</strong></div>}
+                </div>
+              );
+            })}
+            <datalist id="dl-materials">{inventory.map(i => <option key={i._id} value={i.materialName} />)}</datalist>
+            <button type="button" onClick={addMatRow} style={{ ...btnOutline, width: "100%" }}>+ Add another</button>
+            {materialsTotal > 0 && (
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10, paddingTop: 10, borderTop: "1px solid " + C.border, fontSize: 14, fontWeight: 800 }}>
+                <span>Materials on this entry</span><span>{money(materialsTotal)}</span>
+              </div>
+            )}
+            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>Billed on the report. Anything that matches a stocked item also comes off inventory.</div>
+          </div>
+        )}
+
         {/* Equipment maintenance — prompts for unit, mileage & hours. */}
         <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
           <input type="checkbox" checked={draft.maintenance} onChange={e => set("maintenance", e.target.checked)} style={{ accentColor: C.secondary, width: 18, height: 18 }} />
@@ -10968,6 +11520,15 @@ function MobileDailyLog() {
         {msg && <div style={{ textAlign: "center", color: msg.includes("✓") ? C.green : "#DC2626", fontSize: 13, marginTop: 12, fontWeight: 600 }}>{msg}</div>}
         <button type="button" onClick={save} style={{ ...mBtn, background: C.secondary, color: "#fff", marginTop: 14 }}>Save log</button>
       </div>
+
+      {/* The same checklist as the job screen, on the screen where it gets
+          filled in. Ticks appear as things are saved, so the blank box stops
+          being a memory test. */}
+      {draftJob && (
+        <div style={mCard}>
+          <JobChecklist job={draftJob} employeeName={employee} title={"Today on " + (draftJob.jobTitle || "this job")} />
+        </div>
+      )}
 
       {mine.length > 0 && (
         <div>
@@ -11030,11 +11591,187 @@ function MobileDailyLog() {
 // 📅 Schedule — the same month calendar as the desktop page, sized for a thumb.
 // Seven columns of ~46px can't hold a job title, so a square carries the date
 // and a count; tapping it lists that day in full underneath.
-function MobileSchedule() {
+// What a day on a job still needs written down, worked out from what has
+// actually been recorded rather than from a form somebody has to remember to
+// fill. The complaint this answers is a real one: the log is a blank box, and a
+// blank box assumes the person holding the phone already knows what the office
+// wants. A seventy year old man on a crew is not going to guess, and neither is
+// somebody's first week.
+//
+// Who each check looks at is deliberate. Work and hours are personal — they are
+// what THIS person owes for the day. A photo or a material is the job's, not
+// any one person's: on a two-man crew whoever has clean hands takes the photo,
+// and the day should not nag the other one for it.
+//
+// Nothing here is stored. It is recomputed from the records every render, the
+// same way the warehouse alerts are, so it can never go stale or disagree with
+// what is actually saved.
+function jobDayChecks(job, employeeName, dateStr) {
+  const d = dateStr || today();
+  const title = String(job.jobTitle || "").trim().toLowerCase();
+  const onThisJob = v => String(v || "").trim().toLowerCase() === title && !!title;
+
+  const mine = getCol("timeentries").filter(e =>
+    e.source !== "mobile-clock" && (e.entryDate || "") === d &&
+    onThisJob(e.jobName) && sameName(e.employeeName, employeeName));
+  const photos = getCol("job_media").filter(m => m.jobId === job._id && String(m._createdDate || "").slice(0, 10) === d);
+  const materials = getCol("materiallogs").filter(l =>
+    (l.entryDate || "") === d && (l.jobId === job._id || onThisJob(l.jobName)));
+
+  return [
+    { id: "work", label: "What the work was", done: mine.some(e => String(e.workDescription || "").trim()), hint: "Describe it in the daily log." },
+    { id: "hours", label: "How long you were on it", done: mine.some(e => num(e.hoursWorked) > 0), hint: "Start and end time on the log." },
+    { id: "photo", label: "A photo of the work", done: photos.length > 0, hint: "Add one from this screen." },
+    { id: "materials", label: "Materials you used", done: materials.length > 0, hint: "On the log, under \u201cI used materials\u201d. Skip it if you used none." },
+  ];
+}
+
+// The checklist itself. Ticks fill themselves in as the day gets recorded.
+function JobChecklist({ job, employeeName, onFix, title }) {
+  const checks = jobDayChecks(job, employeeName);
+  const left = checks.filter(c => !c.done).length;
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
+        <div style={mJobLbl}>{title || "Before you leave"}</div>
+        <div style={{ fontSize: 11, fontWeight: 800, color: left ? "#B45309" : "#15803D" }}>
+          {left ? left + " left" : "all recorded"}
+        </div>
+      </div>
+      <div style={{ marginTop: 8 }}>
+        {checks.map(c => (
+          <div key={c.id} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "7px 0", borderTop: "1px solid " + C.border }}>
+            <div style={{ fontSize: 15, lineHeight: 1.3, color: c.done ? "#15803D" : C.textMuted }}>{c.done ? "\u2713" : "\u25cb"}</div>
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontSize: 14, fontWeight: c.done ? 600 : 700, color: c.done ? C.textMuted : C.text, textDecoration: c.done ? "line-through" : "none" }}>{c.label}</div>
+              {!c.done && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 1 }}>{c.hint}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+      {onFix && left > 0 && (
+        <button type="button" onClick={() => onFix(job)} style={{ ...mJobAction, marginTop: 12 }}>✎  Log it now</button>
+      )}
+    </div>
+  );
+}
+
+// Tap-to-call. Strips whatever a dialer can't take but keeps a leading "+" so
+// international numbers still work. Returns null when there aren't enough digits
+// left to be a real number, so the caller renders plain text instead of a dead
+// link — a button that opens the dialer on nothing is worse than no button.
+function telHref(v) {
+  const raw = String(v || "").trim();
+  if (!raw) return null;
+  // Drop an extension before anything else. "306-555-0142 ext 4" would otherwise
+  // clean down to an eleven-digit number that dials a stranger.
+  const base = raw.split(/#|\b(?:ext|extn|extension|x)\.?\s*(?=\d)/i)[0];
+  const cleaned = base.replace(/[^\d+]/g, "").replace(/(?!^)\+/g, "");
+  return cleaned.replace(/\D/g, "").length >= 7 ? "tel:" + cleaned : null;
+}
+
+const mJobAction = {
+  display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+  width: "100%", minHeight: 48, padding: "12px 14px", borderRadius: 12,
+  fontSize: 15, fontWeight: 800, textDecoration: "none", cursor: "pointer",
+  border: "1px solid " + C.border, background: C.surface, color: C.text,
+};
+const mJobActionPrimary = { ...mJobAction, background: C.accent, borderColor: C.accent, color: "#fff" };
+const mJobLbl = { fontSize: 10, fontWeight: 800, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" };
+
+// The driveway screen. Somebody taps a job on the schedule and gets what they
+// need before they get out of the truck: what the work is, who to call, where
+// it is, and the photos and documents already on it. All of this existed —
+// it was reachable only on a desktop, which is no use to a crew.
+function MobileJob({ job, onClose, onLogJob }) {
+  const { user } = useAuth();
+  useDataVersion();
+  const employeeName = (user && user.name) || "Me";
+  const key = (job.clientName || "").trim().toLowerCase();
+  const client = key ? getCol("clients").find(c => (c.clientName || "").trim().toLowerCase() === key) : null;
+  const phone = (client && client.phoneNumber) || "";
+  const tel = telHref(phone);
+  const crew = Array.isArray(job.assignedEmployees) ? job.assignedEmployees.filter(Boolean) : [];
+
+  const bit = (label, value) => value ? (
+    <div>
+      <div style={mJobLbl}>{label}</div>
+      <div style={{ fontSize: 14, marginTop: 2 }}>{value}</div>
+    </div>
+  ) : null;
+
+  return (
+    <div>
+      <button type="button" onClick={onClose}
+        style={{ background: "none", border: "none", color: C.accent, fontWeight: 700, fontSize: 14, cursor: "pointer", marginBottom: 8, padding: "4px 0" }}>
+        ‹ {relabel("Schedule")}
+      </button>
+
+      <div style={{ ...mCard, paddingBottom: 12 }}>
+        <div style={{ fontWeight: 800, fontSize: 18, lineHeight: 1.25 }}>{job.jobTitle}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+          <StatusBadge status={job.jobStatus} />
+          {job.visibility === "private" && <Badge color="#FEF2F2" textColor="#DC2626">Private</Badge>}
+        </div>
+        {job.clientName && <div style={{ fontSize: 14, color: C.textMuted, marginTop: 8 }}>{job.clientName}</div>}
+      </div>
+
+      <div style={mCard}>
+        <div style={mJobLbl}>{relabel("What the job is")}</div>
+        <div style={{ fontSize: 15, whiteSpace: "pre-line", marginTop: 6, color: job.jobDescription ? C.text : C.textMuted }}>
+          {job.jobDescription || relabel("Nothing written on this job yet. The office adds it on the Jobs page.")}
+        </div>
+      </div>
+
+      {job.jobAddress && (
+        <div style={mCard}>
+          <div style={mJobLbl}>Where</div>
+          <div style={{ fontSize: 15, marginTop: 6, marginBottom: 12, whiteSpace: "pre-line" }}>{job.jobAddress}</div>
+          <a href={mapsUrl(job.jobAddress)} target="_blank" rel="noopener noreferrer" style={mJobActionPrimary}>🗺️ Directions</a>
+        </div>
+      )}
+
+      {(client || job.clientName) && (
+        <div style={mCard}>
+          <div style={mJobLbl}>Who to call</div>
+          <div style={{ fontSize: 15, marginTop: 6 }}>{(client && client.contactPerson) || job.clientName}</div>
+          {phone && <div style={{ fontSize: 14, color: C.textMuted, marginTop: 2 }}>{phone}</div>}
+          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+            {tel
+              ? <a href={tel} style={mJobActionPrimary}>📞 Call</a>
+              : <div style={{ fontSize: 13, color: C.textMuted }}>No phone number on this client yet.</div>}
+            {client && client.emailAddress && <a href={"mailto:" + client.emailAddress} style={mJobAction}>✉️ Email</a>}
+          </div>
+        </div>
+      )}
+
+      <div style={mCard}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
+          {bit("Start", job.startDate)}
+          {bit("End", job.endDate)}
+          {bit("Crew", crew.length ? crew.join(", ") : null)}
+          {job.mobilization ? bit("Mobilization", num(job.mobilizationCost) > 0 ? money(job.mobilizationCost) : "Yes") : null}
+        </div>
+      </div>
+
+      <div style={mCard}>
+        <JobChecklist job={job} employeeName={employeeName} onFix={onLogJob} />
+      </div>
+
+      <div style={mCard}><JobMediaGallery job={job} /></div>
+      <div style={mCard}><JobDocsList job={job} /></div>
+    </div>
+  );
+}
+
+function MobileSchedule({ onLogJob }) {
   useDataVersion();
   const t = today();
   const [cursor, setCursor] = useState(() => new Date());
   const [sel, setSel] = useState(t);
+  // Hold the id, not the record: the open job re-reads from the store on every
+  // render, so a photo added on this screen doesn't leave a stale copy behind.
+  const [openId, setOpenId] = useState(null);
 
   const dated = getCol("jobs").filter(j => j.startDate);
   const jobs = jobsByClient(dated.filter(j => !jobIsDone(j)));
@@ -11055,6 +11792,9 @@ function MobileSchedule() {
   };
 
   const navBtn = { background: C.surface, border: "1px solid " + C.border, borderRadius: 10, width: 38, height: 38, fontSize: 17, fontWeight: 800, color: C.text, cursor: "pointer" };
+
+  const open = openId ? getCol("jobs").find(j => j._id === openId) : null;
+  if (open) return <MobileJob job={open} onClose={() => setOpenId(null)} onLogJob={onLogJob} />;
 
   return (
     <div>
@@ -11107,7 +11847,7 @@ function MobileSchedule() {
       <div style={{ fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, color: sel === t ? C.secondary : C.textMuted, margin: "10px 2px 8px" }}>
         {sel === t ? "Today · " : ""}{longDay(sel)}
       </div>
-      <ScheduleDayList dayStr={sel} jobs={jobsOnDay(jobs, spans, sel)} spans={spans} />
+      <ScheduleDayList dayStr={sel} jobs={jobsOnDay(jobs, spans, sel)} spans={spans} onOpenJob={j => setOpenId(j._id)} />
 
       {dated.length === 0
         ? <div style={{ ...mCard, textAlign: "center", padding: "20px 18px", color: C.textMuted, fontSize: 13 }}>No scheduled jobs yet. Jobs with a start date show up here.</div>
@@ -11119,12 +11859,28 @@ function MobileSchedule() {
 // 📷 Photos — pick a job, then view / capture photos (reuses the gallery).
 function MobilePhotos() {
   useDataVersion();
-  const jobs = jobsByClient(getCol("jobs"));
+  const { user } = useAuth();
+  const allJobs = jobsByClient(getCol("jobs"));
   // Persist the open job: if iOS reloads the app while the camera is open
   // (memory pressure on big landscape shots), we return to the same job.
   const [jobId, setJobIdState] = useState(() => storage.get("bmb_photos_job") || null);
   const setJobId = v => { setJobIdState(v); if (v) storage.set("bmb_photos_job", v); else storage.remove("bmb_photos_job"); };
-  const job = jobs.find(j => j._id === jobId);
+  const [showDone, setShowDone] = useState(false);
+  const [q, setQ] = useState("");
+  const job = allJobs.find(j => j._id === jobId);
+
+  // The job somebody wants is nearly always one they're on today, and the list
+  // only ever grows. So: their own jobs first, then everyone else's open ones,
+  // and finished work out of the way behind a toggle rather than deleted from
+  // view — the office still goes looking for last month's photos.
+  const mine = j => Array.isArray(j.assignedEmployees) && j.assignedEmployees.some(n => sameName(n, user && user.name));
+  const rank = j => (jobIsDone(j) ? 2 : mine(j) ? 0 : 1);
+  const needle = q.trim().toLowerCase();
+  const jobs = allJobs
+    .filter(j => (showDone || !jobIsDone(j)) &&
+      (!needle || ((j.jobTitle || "") + " " + (j.clientName || "")).toLowerCase().indexOf(needle) > -1))
+    .sort((a, b) => rank(a) - rank(b) || (b.startDate || "").localeCompare(a.startDate || ""));
+  const doneCount = allJobs.filter(jobIsDone).length;
 
   if (job) {
     return (
@@ -11137,18 +11893,39 @@ function MobilePhotos() {
     );
   }
 
-  if (jobs.length === 0) return <div style={{ ...mCard, textAlign: "center", padding: "30px 18px", color: C.textMuted }}>No jobs yet — create one to add photos.</div>;
+  if (allJobs.length === 0) return <div style={{ ...mCard, textAlign: "center", padding: "30px 18px", color: C.textMuted }}>No jobs yet — create one to add photos.</div>;
 
   return (
     <div>
-      <div style={{ fontSize: 13, color: C.textMuted, margin: "2px 2px 10px" }}>Pick a job to view or add photos & videos.</div>
+      {allJobs.length > 6 && (
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search jobs or clients"
+          style={{ ...mInput, marginBottom: 10 }} />
+      )}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, margin: "2px 2px 10px" }}>
+        <div style={{ fontSize: 13, color: C.textMuted }}>Pick a job to view or add photos & videos.</div>
+        {doneCount > 0 && (
+          <button type="button" onClick={() => setShowDone(v => !v)}
+            style={{ background: "none", border: "none", color: C.accent, fontWeight: 700, fontSize: 12.5, cursor: "pointer", whiteSpace: "nowrap", padding: 0 }}>
+            {showDone ? "Hide finished" : "Show finished (" + doneCount + ")"}
+          </button>
+        )}
+      </div>
+      {jobs.length === 0 && (
+        <div style={{ ...mCard, textAlign: "center", padding: "24px 18px", color: C.textMuted, fontSize: 13 }}>
+          {needle ? "No job matches \u201c" + q.trim() + "\u201d." : "No open jobs. Finished ones are hidden."}
+        </div>
+      )}
       {jobs.map(j => {
         const count = getCol("job_media").filter(m => m.jobId === j._id).length;
         return (
           <button key={j._id} type="button" onClick={() => setJobId(j._id)} style={{ ...mCard, width: "100%", textAlign: "left", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
             <div style={{ minWidth: 0 }}>
-              <div style={{ fontWeight: 700, fontSize: 14, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{j.jobTitle}</div>
-              {j.clientName && <div style={{ fontSize: 12, color: C.textMuted }}>{j.clientName}</div>}
+              <div style={{ fontWeight: 700, fontSize: 14, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                {mine(j) ? "\u2022 " : ""}{j.jobTitle}
+              </div>
+              <div style={{ fontSize: 12, color: C.textMuted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                {[j.clientName, jobIsDone(j) ? j.jobStatus : ""].filter(Boolean).join(" \u00b7 ")}
+              </div>
             </div>
             <div style={{ fontSize: 13, color: C.textMuted, whiteSpace: "nowrap" }}>{count ? "📷 " + count : "＋"}</div>
           </button>
@@ -11208,6 +11985,19 @@ function MobileShell() {
   const [tab, setTabState] = useState(() => storage.get("bmb_mtab") || "track");
   const setTab = v => { setTabState(v); storage.set("bmb_mtab", v); };
   const can = id => canAccess(id, user);
+
+  // "Log it now" from a job screen: drop the job into the daily log's draft and
+  // switch tabs. The draft is merged, never replaced — somebody halfway through
+  // an entry keeps what they typed and just gets the job filled in.
+  const logForJob = job => {
+    let draft = {};
+    try { draft = JSON.parse(storage.get(DL_DRAFT_KEY) || "null") || {}; } catch (e) { draft = {}; }
+    storage.set(DL_DRAFT_KEY, JSON.stringify({
+      ...emptyDraft, ...draft,
+      job: job.jobTitle || "", jobId: job._id, siteId: "", siteName: "", siteClient: "",
+    }));
+    setTab("log");
+  };
   const TABS = [
     { id: "track", label: "Track", icon: "⏱️", nav: "time-entry" },
     { id: "log", label: "Daily Log", icon: "📝", nav: "daily-log" },
@@ -11240,7 +12030,7 @@ function MobileShell() {
         <MobileInstallBanner />
         {tab === "track" && (can("time-entry") ? <MobileTimeClock onLogWork={() => setTab("log")} /> : <MobileLocked />)}
         {tab === "log" && (can("daily-log") ? <MobileDailyLog /> : <MobileLocked />)}
-        {tab === "schedule" && (can("schedule") ? <MobileSchedule /> : <MobileLocked />)}
+        {tab === "schedule" && (can("schedule") ? <MobileSchedule onLogJob={can("daily-log") ? logForJob : null} /> : <MobileLocked />)}
         {tab === "photos" && (can("jobs") ? <MobilePhotos /> : <MobileLocked />)}
         {tab === "safety" && (can("safety") ? <MobileSafety /> : <MobileLocked />)}
         {tab === "more" && <MobileMore onQuickCommand={() => setCmdOpen(true)} />}

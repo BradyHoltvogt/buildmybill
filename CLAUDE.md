@@ -287,6 +287,95 @@ from the add-on card on **Subscriptions** (route `#/setup`).
   - Printing reuses the app-wide mechanism: one `id="print-area"` element is the
     only thing visible under `@media print`, `.no-print` hides the controls, and
     `.page-break` starts each person on a fresh page. Same as the quote preview.
+- **Materials used on a job are billed like equipment hours, in `materiallogs`.**
+  A trade that fits parts puts most of its invoice here, so `logMaterialUse()`
+  always writes the billable line first, and only then takes stock off — and it
+  takes it off through `logInventoryMovement()`, the one path that also writes
+  the audit row. Nothing touches `currentStock` directly. A material that isn't
+  a stocked item ("40 ft of tracer wire off the truck") still bills; it just
+  moves no stock. **The unit price is copied onto the log at the time of use**,
+  never read back off the inventory item later — what a spool cost in August is
+  not what a November invoice should quietly change to. Logged from the field
+  app's daily log (📦 I used materials), rolled into Billing & Reports beside
+  labour and equipment, and in the CSV under MATERIALS USED. **No SQL
+  migration** — `materiallogs` is another collection in the generic `records`
+  table.
+  - **Corrections move only the difference.** Owners/managers fix a line from
+    Billing & Reports (`MaterialLogEditor` → `updateMaterialLog` /
+    `deleteMaterialLog`). Editing 6 breakers down to 4 puts 2 back; it does not
+    re-run the original 6. Repointing a line at a different material returns the
+    old quantity whole and takes the new one whole, and carries the new
+    material's price and unit across unless the caller passed one — keeping the
+    old price is how a line ends up billing wire at breaker money. Deleting
+    returns the full quantity. Every one of those goes through
+    `logInventoryMovement`, so a correction leaves an audit row rather than a
+    number quietly changing, and the modal says in plain words what saving will
+    do to stock before it does it.
+  - `BillingPage`'s memos are keyed to `useDataVersion()`, not `[]`. The page
+    doesn't remount when the store changes, so a correction has to be able to
+    show up in the very totals it was corrected from.
+- **Pay periods are anchored, not rolling.** A company sets its cycle on the
+  Timesheets screen (owner/manager): weekly, every 2 weeks, twice a month, or
+  monthly, stored in `companies.settings` as `payPeriod` + `payAnchor` (both
+  added to `BRANDING_KEYS`; **no SQL migration** — `settings` already existed).
+  For weekly/biweekly the office nominates any past date a period began on, and
+  `periodAround()` counts periods from there, forwards or backwards. That is the
+  whole point: "last 14 days" always ends today, which is almost never what
+  payroll is paying, so once a real cycle is set that button is removed rather
+  than left sitting there being wrong. With no cycle set the buttons are exactly
+  what they always were — nobody's habit changes until they choose one.
+  - `dayIndex`/`addDays` do the arithmetic at **local noon**, so a daylight
+    saving jump can't move a date across midnight. (Saskatchewan has no DST, but
+    a customer in Alberta does.) Same reason the schedule compares date strings
+    instead of going near `toISOString()`.
+- **The payroll sheet's "Work" column is derived, never summed.** On the clocked
+  basis the hours come from `shifts` and the day's description comes from that
+  person's `timeentries` for the same date, deduped and joined as text (see
+  `tsRows`). The two are deliberately never added together — that is the same
+  rule the rest of the timesheet runs on. Somebody who clocked in and logged no
+  job time still prints, with a dash where the work would be.
+- **The field app's Photos tab is ordered, not alphabetical.** Their own jobs
+  first, then everyone else's open ones newest-first, finished work behind a
+  "Show finished" toggle rather than deleted from view (the office still goes
+  looking for last month's photos), and a search box once there are more than
+  six jobs. A crew member should never scroll a company-wide list to find the
+  job they are standing on.
+- **A shift stores gross clock time AND paid hours.** Clock-out asks how long
+  lunch was (`MobileLunchSheet`, presets 0/30/45/60 plus a typed number) and
+  writes three fields: `grossHours` (what the clock saw), `breakMinutes`, and
+  `hours` — already net of the break, because `hours` is what payroll pays and
+  what every existing report already sums. The break is clamped to the length of
+  the shift, so `hours` can never go negative. Nothing is assumed: some days
+  there is no lunch, and a shift that guesses is worse than one that asks.
+  Old shifts have no `breakMinutes` and read as 0. Because in/out and hours no
+  longer reconcile on their own, the printed timesheet and its CSV carry a
+  **Lunch** column on the clocked basis — an unexplained gap on a payroll sheet
+  is an argument waiting to happen. **No SQL migration** — more jsonb keys.
+- **The job tells you what still needs recording** (`jobDayChecks` /
+  `JobChecklist`, on the phone's job screen and again on the daily log once a job
+  is picked). Four checks — what the work was, how long, a photo, materials —
+  and they are **derived from the records on every render, never stored**, so a
+  tick can't disagree with what actually saved. Who each check looks at is
+  deliberate: work and hours are scoped to the person looking (`sameName`),
+  since those are what they personally owe for the day; a photo or a material
+  ticks for the whole job, because on a two-man crew whoever has clean hands
+  takes the photo and the other one shouldn't be nagged for it. Legacy
+  `mobile-clock` entries are excluded, same as everywhere else "logged" is
+  counted. "Log it now" merges the job into the daily log's saved draft
+  (`DL_DRAFT_KEY`) and switches tabs — **merged, not replaced**, so a half-typed
+  entry survives being sent to a job.
+  - Known soft spot: "Materials you used" has no way to be answered "none", so
+    on a labour-only day it stays open. The hint says to skip it. Giving it a
+    real "nothing used" answer means storing that answer somewhere, which is a
+    decision, not an oversight.
+- **The field app has a job screen** (`MobileJob`, opened from the schedule's day
+  list). It's the driveway screen: the description, address with Directions, the
+  client's number as a real `tel:` Call button, dates, crew, photos and docs. All
+  of it existed before and was desktop-only, which is no use to a crew. `telHref`
+  cuts an extension ("ext 4", "x204", "#12") before dialing and returns null when
+  there aren't 7 digits left, so the caller renders plain text instead of a
+  button that dials a stranger. `MobileSchedule` holds the open job's **id**, not
+  the record, so adding a photo on that screen doesn't leave a stale copy behind.
 - **Shifts have no direct edit UI.** Employees can't edit a clocked `shifts` record —
   they request a correction (My Hours → Request a correction), which lands in
   `shiftrequests` (`status: Pending/Approved/Rejected`) and emails the owner/managers.
