@@ -2613,10 +2613,11 @@ function EmployeesPage() {
     defaultValues={{ isActive: true, role: "Employee" }}
     extra={roster.length === 0 ? null : (
       <div style={{ ...card, fontSize: 12, color: C.textMuted, lineHeight: 1.6 }}>
-        👤 <strong style={{ color: C.text }}>{linked}</strong> of these {linked === 1 ? "person has" : "people have"} a login on your team, so their
-        clocked shifts and logged hours attach to the row here — set their pay rate and the timesheets fill in.
-        Rows without a login still work for anyone you track by hand. If someone shows up twice (once typed by
-        you, once from their login), delete the typed one — the login row is the one their hours are filed under.
+        👤 <strong style={{ color: C.text }}>{linked}</strong> of {roster.length} {roster.length === 1 ? "person" : "people"} here {linked === 1 ? "has" : "have"} a
+        login on your team, so their clocked shifts and logged hours land on this row — give them a pay rate and
+        the timesheets fill themselves in. Rows without a login still work for anyone you track by hand. If
+        somebody shows up twice (once typed in by you, once from their login), delete the typed one — hours are
+        filed under the name on their account.
       </div>
     )}
     columns={[

@@ -290,10 +290,31 @@ from the add-on card on **Subscriptions** (route `#/setup`).
 - **Shifts have no direct edit UI.** Employees can't edit a clocked `shifts` record —
   they request a correction (My Hours → Request a correction), which lands in
   `shiftrequests` (`status: Pending/Approved/Rejected`) and emails the owner/managers.
-  Approving on the Shift Requests page patches the `shifts` record directly; the
-  `employees` collection is purely informational and NOT linked to login accounts —
-  matching to "whose shift is this" is done by plain-text name (`employeeName ===
-  user.name`), same as everywhere else time gets attributed to a person.
+  Approving on the Shift Requests page patches the `shifts` record directly.
+  Matching to "whose shift is this" is done by plain-text name (`employeeName ===
+  user.name`), same as everywhere else time gets attributed to a person — which is
+  why the roster has to carry the account's spelling of that name (next bullet).
+- **Team accounts are synced onto the `employees` roster — don't unlink them.**
+  Two lists describe the same people: `profiles` (sign-in accounts, approved on the
+  Team page) and the `employees` collection (the roster with the pay rate that fills
+  every crew picker, work-log filter, and printed timesheet). They used to be
+  unconnected, so anyone who joined by code and clocked in never appeared on the
+  roster: their hours had no rate, timesheets printed them as a stranger, and the
+  Employees count only ever showed hand-typed rows. `syncTeamRoster(members)` now
+  gives every active member exactly one roster row.
+  - It runs at sign-in (`bootstrap`, after `loadAllRecords` — an owner/manager syncs
+    the whole team, anyone else only their own row, so a crew phone never writes
+    rows for the rest of the shop) and again whenever the Team page loads.
+  - Matching order is deliberate: `userId` (exact), then email (survives a name
+    change), then normalized name (`sameName` — case/spacing-insensitive) so a
+    hand-typed "john doe" is *adopted* rather than duplicated.
+  - A linked row **adopts the account's spelling of the name**, because that is the
+    string every shift and time entry is filed under. Don't "fix" this to preserve
+    the office's spelling — the hours would stop matching the person.
+  - It only ever creates and links. Nothing is deleted or deactivated: the roster
+    also holds people who will never have a login (a casual hand, a seasonal hire),
+    and `userId` is simply absent on those rows. **No SQL migration** — `userId` is
+    another key in the record's jsonb.
 - **The Schedule is one month calendar on both devices**, off one set of helpers
   (`jobIsDone` / `jobSpan` / `spanMap` / `jobsOnDay` / `isCarryDay` / `monthGrid`)
   that sit above `SchedulePage`; the field app's `MobileSchedule` imports the same
