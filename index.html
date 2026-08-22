@@ -114,6 +114,10 @@
       padding: 24px !important;
     }
     .no-print { display: none !important; }
+    #print-area .page-break { break-before: page; page-break-before: always; }
+    #print-area table { page-break-inside: auto; }
+    #print-area tr { page-break-inside: avoid; break-inside: avoid; }
+    #print-area thead { display: table-header-group; }
   }
 
   /* ── Boot screen ── */
@@ -5478,6 +5482,348 @@ function TruckLogBooksPage() {
   );
 }
 
+/* ─── Printable timesheets (payroll) ─────────────────────────────────────────
+   A hand-off document for the accountant: a summary page of everyone's hours
+   for a pay period, then one signed sheet per person behind it.
+
+   The hours come from `shifts` — the clocked in/out envelope, which is what
+   actually gets paid — NOT from `timeentries`, which is job time for billing
+   and efficiency and routinely doesn't add up to a paid day. Anyone who logs
+   job time but never clocks in would silently print as zero hours, so the sheet
+   says which basis it used, can be switched to logged time, and calls out by
+   name anyone who has hours on the other basis but none on this one.
+
+   Days are subtotalled by week rather than run together, because overtime rules
+   differ by province and by employment agreement — this gives the accountant the
+   weekly figure their own rule needs instead of encoding a guess about it here. */
+
+const TS_DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function tsWeekStart(iso) {
+  const d = new Date(iso + "T00:00:00");
+  if (isNaN(d)) return iso;
+  d.setDate(d.getDate() - d.getDay());
+  return dateStr(d);
+}
+
+function tsFriendly(iso) {
+  const d = new Date(iso + "T00:00:00");
+  if (isNaN(d)) return iso || "";
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+// Pay periods people actually run. Each returns [start, end] as YYYY-MM-DD.
+function tsPresets() {
+  const now = new Date();
+  const y = now.getFullYear(), m = now.getMonth();
+  const mk = (a, b) => [dateStr(a), dateStr(b)];
+  const sunday = new Date(now); sunday.setDate(sunday.getDate() - sunday.getDay());
+  const lastSun = new Date(sunday); lastSun.setDate(lastSun.getDate() - 7);
+  const lastSat = new Date(sunday); lastSat.setDate(lastSat.getDate() - 1);
+  const twoWeeks = new Date(now); twoWeeks.setDate(twoWeeks.getDate() - 13);
+  return [
+    { id: "this-month", label: "This month", range: () => mk(new Date(y, m, 1), new Date(y, m + 1, 0)) },
+    { id: "last-month", label: "Last month", range: () => mk(new Date(y, m - 1, 1), new Date(y, m, 0)) },
+    { id: "this-week", label: "This week", range: () => mk(sunday, now) },
+    { id: "last-week", label: "Last week", range: () => mk(lastSun, lastSat) },
+    { id: "last-14", label: "Last 14 days", range: () => mk(twoWeeks, now) },
+  ];
+}
+
+// One flat list of "a person worked these hours on this day", from whichever
+// basis is selected. Attribution is by plain-text name, same as everywhere else
+// time gets tied to a person in this app.
+function tsRows(basis, start, end) {
+  const inRange = d => (!start || (d || "") >= start) && (!end || (d || "") <= end);
+  if (basis === "logged") {
+    return getCol("timeentries")
+      .filter(e => e.source !== "mobile-clock" && inRange(e.entryDate))
+      .map(e => ({
+        date: e.entryDate || "", name: e.employeeName || "Unknown",
+        start: e.startTime || "", end: e.endTime || "",
+        hours: num(e.hoursWorked), note: e.jobName || "",
+      }));
+  }
+  return getCol("shifts")
+    .filter(s => inRange(s.entryDate))
+    .map(s => ({
+      date: s.entryDate || "", name: s.employeeName || "Unknown",
+      start: s.startTime || "", end: s.endTime || "",
+      hours: num(s.hours), note: "",
+    }));
+}
+
+function tsGroup(rows) {
+  const by = {};
+  rows.forEach(r => { (by[r.name] = by[r.name] || []).push(r); });
+  return Object.keys(by).sort((a, b) => a.localeCompare(b)).map(name => {
+    const list = by[name].slice().sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.start || "").localeCompare(b.start || ""));
+    const weeks = {};
+    list.forEach(r => { const k = tsWeekStart(r.date); (weeks[k] = weeks[k] || []).push(r); });
+    return {
+      name,
+      rows: list,
+      hours: list.reduce((s, r) => s + r.hours, 0),
+      days: new Set(list.map(r => r.date)).size,
+      weeks: Object.keys(weeks).sort().map(k => ({ start: k, rows: weeks[k], hours: weeks[k].reduce((s, r) => s + r.hours, 0) })),
+    };
+  });
+}
+
+/* Print-document styling. Deliberately literal hex rather than the app's theme
+   variables — this sheet is going through a printer, where a company's brand
+   colour may be unreadable and CSS variables don't always survive. */
+const tsInk = "#0F172A", tsMuted = "#64748B", tsLine = "#E2E8F0", tsWash = "#F8FAFC";
+const tsTh = { textAlign: "left", fontSize: 9.5, fontWeight: 700, color: tsMuted, textTransform: "uppercase", letterSpacing: "0.6px", padding: "7px 8px", borderBottom: "1.5px solid " + tsLine, whiteSpace: "nowrap" };
+const tsTd = { fontSize: 12, padding: "6px 8px", borderBottom: "1px solid " + tsLine, color: tsInk };
+const tsNum = { ...tsTd, textAlign: "right", fontVariantNumeric: "tabular-nums" };
+
+function TimesheetsView({ onClose }) {
+  useDataVersion();
+  const { company } = useCompany();
+  const presets = useMemo(() => tsPresets(), []);
+  const [range, setRange] = useState(() => presets[0].range());
+  const [basis, setBasis] = useState("clocked");
+  const [who, setWho] = useState("");
+  const [detail, setDetail] = useState(true);
+
+  const [start, end] = range;
+  const employees = getCol("employees");
+  const rateFor = name => {
+    const e = employees.find(x => (x.fullName || "") === name);
+    return e ? num(e.hourlyRate) : 0;
+  };
+
+  const all = tsGroup(tsRows(basis, start, end));
+  const people = who ? all.filter(p => p.name === who) : all;
+
+  // Anyone with hours on the OTHER basis but none here — the sheet must never
+  // quietly print a zero for someone who actually worked.
+  const otherBasis = basis === "clocked" ? "logged" : "clocked";
+  const otherNames = tsGroup(tsRows(otherBasis, start, end));
+  const missing = otherNames.filter(o => o.hours > 0 && !all.some(p => p.name === o.name && p.hours > 0));
+
+  const grandHours = people.reduce((s, p) => s + p.hours, 0);
+  const grandPay = people.reduce((s, p) => s + p.hours * rateFor(p.name), 0);
+  const anyRates = people.some(p => rateFor(p.name) > 0);
+  const basisLabel = basis === "clocked" ? "Clocked shifts" : "Logged job time";
+
+  const exportCSV = () => {
+    const rows = [
+      [(company && company.companyName) || "Timesheets"],
+      ["Pay period", tsFriendly(start) + " to " + tsFriendly(end)],
+      ["Hours basis", basisLabel],
+      [],
+      ["Employee", "Date", "Day", "In", "Out", "Hours", "Rate", "Pay"],
+    ];
+    people.forEach(p => {
+      p.rows.forEach(r => rows.push([
+        p.name, r.date, TS_DOW[new Date(r.date + "T00:00:00").getDay()] || "",
+        r.start, r.end, r.hours.toFixed(2),
+        rateFor(p.name) ? rateFor(p.name).toFixed(2) : "",
+        rateFor(p.name) ? (r.hours * rateFor(p.name)).toFixed(2) : "",
+      ]));
+      rows.push([p.name, "", "", "", "TOTAL", p.hours.toFixed(2), "", rateFor(p.name) ? (p.hours * rateFor(p.name)).toFixed(2) : ""]);
+      rows.push([]);
+    });
+    rows.push(["", "", "", "", "GRAND TOTAL", grandHours.toFixed(2), "", grandPay.toFixed(2)]);
+    downloadFile("timesheets_" + start + "_to_" + end + ".csv", toCSV(rows), "text/csv;charset=utf-8");
+  };
+
+  const ctrlLabel = { fontSize: 10.5, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: 4 };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.8)", zIndex: 1000, overflowY: "auto", padding: "28px 16px 60px" }}>
+      <div style={{ width: "100%", maxWidth: 860, margin: "0 auto" }}>
+
+        {/* Controls — never printed */}
+        <div className="no-print" style={{ background: C.surface, borderRadius: 12, padding: 18, marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+            <h3 style={{ fontSize: 17, fontWeight: 800 }}>🖨 Timesheets for payroll</h3>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button type="button" onClick={exportCSV} style={btnOutline}>⬇ CSV</button>
+              <button type="button" onClick={() => window.print()} style={btnSecondary}>🖨 Print / Save as PDF</button>
+              <button type="button" onClick={onClose} style={btnOutline}>Close</button>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+            {presets.map(p => {
+              const r = p.range();
+              const on = r[0] === start && r[1] === end;
+              return (
+                <button key={p.id} type="button" onClick={() => setRange(r)}
+                  style={{ padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 600, cursor: "pointer", border: "1px solid " + (on ? C.accent : C.border), background: on ? "#EEF2FF" : C.surface, color: on ? C.accent : C.text }}>
+                  {p.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="row-wrap" style={{ gap: 12 }}>
+            <div><label style={ctrlLabel}>From</label><input type="date" value={start} onChange={e => setRange([e.target.value, end])} style={inputCls} /></div>
+            <div><label style={ctrlLabel}>To</label><input type="date" value={end} onChange={e => setRange([start, e.target.value])} style={inputCls} /></div>
+            <div style={{ minWidth: 190 }}>
+              <label style={ctrlLabel}>Employee</label>
+              <select value={who} onChange={e => setWho(e.target.value)} style={inputCls}>
+                <option value="">Everyone ({all.length})</option>
+                {all.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
+              </select>
+            </div>
+            <div style={{ minWidth: 210 }}>
+              <label style={ctrlLabel}>Hours basis</label>
+              <select value={basis} onChange={e => setBasis(e.target.value)} style={inputCls}>
+                <option value="clocked">Clocked shifts — what's paid</option>
+                <option value="logged">Logged job time</option>
+              </select>
+            </div>
+            <div style={{ alignSelf: "flex-end", paddingBottom: 8 }}>
+              <Checkbox checked={detail} onChange={setDetail} label="Day-by-day sheet per person" />
+            </div>
+          </div>
+
+          {missing.length > 0 && (
+            <div style={{ marginTop: 12, padding: 12, background: "#FEFCE8", border: "1px solid #FDE68A", borderRadius: 8, fontSize: 12.5, color: "#92400E", lineHeight: 1.6 }}>
+              <strong>Not on this sheet:</strong> {missing.map(m => m.name + " (" + m.hours.toFixed(2) + " h)").join(", ")}.
+              {" "}They have {otherBasis === "logged" ? "logged job time" : "clocked shifts"} in this period but no {basis === "clocked" ? "clocked shifts" : "logged job time"}.
+              Switch the hours basis above if those should be paid.
+            </div>
+          )}
+        </div>
+
+        {/* The document itself */}
+        <div id="print-area" style={{ background: "#fff", borderRadius: 12, padding: "44px 48px", boxShadow: "0 20px 60px rgba(0,0,0,0.2)", color: tsInk }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 24, marginBottom: 28 }}>
+            <div>
+              {company && company.logoUrl && <img src={company.logoUrl} alt="" style={{ height: 52, maxWidth: 170, objectFit: "contain", marginBottom: 10 }} />}
+              <div style={{ fontWeight: 700, fontSize: 16 }}>{(company && company.companyName) || "My Company"}</div>
+              <div style={{ fontSize: 11.5, color: tsMuted, lineHeight: 1.7, whiteSpace: "pre-line" }}>
+                {[company && company.address, company && company.phone, company && company.email].filter(Boolean).join("\n")}
+              </div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 25, fontWeight: 900, letterSpacing: "-0.5px" }}>TIMESHEET</div>
+              <div style={{ fontSize: 12.5, color: tsMuted, marginTop: 4 }}>{tsFriendly(start)} — {tsFriendly(end)}</div>
+              <div style={{ fontSize: 10.5, color: tsMuted, marginTop: 6 }}>{basisLabel} · prepared {tsFriendly(today())}</div>
+            </div>
+          </div>
+
+          {people.length === 0 ? (
+            <p style={{ color: tsMuted, fontSize: 13, padding: "30px 0", textAlign: "center" }}>
+              No {basis === "clocked" ? "clocked shifts" : "logged time"} in this period.
+            </p>
+          ) : (
+            <>
+              <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "1px", color: tsMuted, marginBottom: 10 }}>SUMMARY</div>
+              <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 8 }}>
+                <thead><tr>
+                  <th style={tsTh}>Employee</th>
+                  <th style={{ ...tsTh, textAlign: "right" }}>Days</th>
+                  <th style={{ ...tsTh, textAlign: "right" }}>Hours</th>
+                  {anyRates && <th style={{ ...tsTh, textAlign: "right" }}>Rate</th>}
+                  {anyRates && <th style={{ ...tsTh, textAlign: "right" }}>Gross pay</th>}
+                </tr></thead>
+                <tbody>
+                  {people.map(p => (
+                    <tr key={p.name}>
+                      <td style={{ ...tsTd, fontWeight: 600 }}>{p.name}</td>
+                      <td style={tsNum}>{p.days}</td>
+                      <td style={{ ...tsNum, fontWeight: 700 }}>{p.hours.toFixed(2)}</td>
+                      {anyRates && <td style={tsNum}>{rateFor(p.name) ? fmt(rateFor(p.name)) : "—"}</td>}
+                      {anyRates && <td style={tsNum}>{rateFor(p.name) ? fmt(p.hours * rateFor(p.name)) : "—"}</td>}
+                    </tr>
+                  ))}
+                  <tr>
+                    <td style={{ ...tsTd, fontWeight: 800, borderBottom: "none", paddingTop: 10 }}>Total</td>
+                    <td style={{ ...tsNum, borderBottom: "none", paddingTop: 10 }} />
+                    <td style={{ ...tsNum, fontWeight: 800, borderBottom: "none", paddingTop: 10 }}>{grandHours.toFixed(2)}</td>
+                    {anyRates && <td style={{ ...tsNum, borderBottom: "none", paddingTop: 10 }} />}
+                    {anyRates && <td style={{ ...tsNum, fontWeight: 800, borderBottom: "none", paddingTop: 10 }}>{fmt(grandPay)}</td>}
+                  </tr>
+                </tbody>
+              </table>
+              {!anyRates && (
+                <p style={{ fontSize: 11, color: tsMuted, marginTop: 6 }}>
+                  No hourly rates are set on the Employees page, so pay is left off. Hours are complete.
+                </p>
+              )}
+
+              {detail && people.map(p => (
+                <div key={p.name} className="page-break" style={{ marginTop: 34, paddingTop: 4 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 16, marginBottom: 10, paddingBottom: 8, borderBottom: "2px solid " + tsInk }}>
+                    <div style={{ fontSize: 17, fontWeight: 800 }}>{p.name}</div>
+                    <div style={{ fontSize: 12, color: tsMuted }}>{tsFriendly(start)} — {tsFriendly(end)}</div>
+                  </div>
+
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead><tr>
+                      <th style={tsTh}>Date</th>
+                      <th style={tsTh}>Day</th>
+                      <th style={tsTh}>In</th>
+                      <th style={tsTh}>Out</th>
+                      {basis === "logged" && <th style={tsTh}>Job</th>}
+                      <th style={{ ...tsTh, textAlign: "right" }}>Hours</th>
+                    </tr></thead>
+                    <tbody>
+                      {p.weeks.map(w => (
+                        <React.Fragment key={w.start}>
+                          {w.rows.map((r, i) => (
+                            <tr key={r.date + i}>
+                              <td style={tsTd}>{r.date}</td>
+                              <td style={{ ...tsTd, color: tsMuted }}>{TS_DOW[new Date(r.date + "T00:00:00").getDay()] || ""}</td>
+                              <td style={tsTd}>{r.start || "—"}</td>
+                              <td style={tsTd}>{r.end || "—"}</td>
+                              {basis === "logged" && <td style={{ ...tsTd, color: tsMuted }}>{r.note || "—"}</td>}
+                              <td style={tsNum}>{r.hours.toFixed(2)}</td>
+                            </tr>
+                          ))}
+                          {p.weeks.length > 1 && (
+                            <tr>
+                              <td colSpan={basis === "logged" ? 5 : 4} style={{ ...tsTd, background: tsWash, fontSize: 11, color: tsMuted, fontWeight: 700 }}>
+                                Week of {tsFriendly(w.start)}
+                              </td>
+                              <td style={{ ...tsNum, background: tsWash, fontWeight: 700, fontSize: 11.5 }}>{w.hours.toFixed(2)}</td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      ))}
+                      <tr>
+                        <td colSpan={basis === "logged" ? 5 : 4} style={{ ...tsTd, fontWeight: 800, borderBottom: "none", paddingTop: 10 }}>
+                          Total hours{rateFor(p.name) ? " · " + fmt(rateFor(p.name)) + "/hr" : ""}
+                        </td>
+                        <td style={{ ...tsNum, fontWeight: 800, borderBottom: "none", paddingTop: 10 }}>{p.hours.toFixed(2)}</td>
+                      </tr>
+                      {rateFor(p.name) > 0 && (
+                        <tr>
+                          <td colSpan={basis === "logged" ? 5 : 4} style={{ ...tsTd, fontWeight: 800, borderBottom: "none" }}>Gross pay</td>
+                          <td style={{ ...tsNum, fontWeight: 800, borderBottom: "none" }}>{fmt(p.hours * rateFor(p.name))}</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+
+                  <div style={{ display: "flex", gap: 40, marginTop: 34 }}>
+                    {["Employee signature", "Approved by"].map(l => (
+                      <div key={l} style={{ flex: 1 }}>
+                        <div style={{ borderBottom: "1px solid " + tsInk, height: 30 }} />
+                        <div style={{ fontSize: 10, color: tsMuted, marginTop: 5 }}>{l}</div>
+                      </div>
+                    ))}
+                    <div style={{ width: 130 }}>
+                      <div style={{ borderBottom: "1px solid " + tsInk, height: 30 }} />
+                      <div style={{ fontSize: 10, color: tsMuted, marginTop: 5 }}>Date</div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function EmployeeLogsPage() {
   const { params } = useRouter();
   const employeeOptions = useEmployeeOptions();
@@ -5485,6 +5831,7 @@ function EmployeeLogsPage() {
   const employees = useMemo(() => db.getAll("employees").items, []);
   const [selected, setSelected] = useState(params.employee || "");
   const [editing, setEditing] = useState(null);
+  const [timesheets, setTimesheets] = useState(false);
 
   const refresh = () => setEntries(db.getAll("timeentries", {}, { limit: 1000 }).items);
   const saveEdit = record => { db.update("timeentries", record); setEditing(null); refresh(); };
@@ -5506,7 +5853,11 @@ function EmployeeLogsPage() {
 
   return (
     <div>
-      <PageHeader title="Work Logs" subtitle="Per-employee productivity and hours tracked" />
+      <PageHeader
+        title="Work Logs"
+        subtitle="Per-employee productivity and hours tracked"
+        action={<button type="button" onClick={() => setTimesheets(true)} style={btnSecondary}>🖨 Timesheets</button>}
+      />
       <div style={{ ...card, marginBottom: 20 }}>
         <Field label="Filter by Employee" style={{ marginBottom: 0 }}>
           <select value={selected} onChange={e => setSelected(e.target.value)} style={{ ...inputCls, maxWidth: 240 }}>
@@ -5552,6 +5903,8 @@ function EmployeeLogsPage() {
           onEdit={e => setEditing({ ...e })}
         />
       </div>
+
+      {timesheets && <TimesheetsView onClose={() => setTimesheets(false)} />}
 
       {editing && (
         <Modal title="Edit Time Entry" onClose={() => setEditing(null)}>

@@ -272,6 +272,21 @@ from the add-on card on **Subscriptions** (route `#/setup`).
   name in the Jobs crew picker (`⛔ expired cert`) and raises a dashboard banner on
   every sign-in, but assignment still goes through — only the office knows whether
   a given job actually needs that ticket, and a hard block would stall real work.
+- **Printable timesheets are built on `shifts`, not `timeentries`.** Work Logs →
+  🖨 Timesheets prints a payroll hand-off for the accountant: a summary page, then
+  a signed sheet per person. Payroll pays the **clocked envelope** (`shifts`), while
+  `timeentries` is job time for billing and efficiency and routinely doesn't add up
+  to a paid day — so the two must never be quietly summed. The sheet names its basis
+  on the page, can be switched to logged time, and **warns by name** about anyone who
+  has hours on the *other* basis but none on this one (someone who logs job time but
+  never clocks in would otherwise print as zero and get paid nothing).
+  - Days are subtotalled **by week**, deliberately, instead of one running total.
+    Overtime rules vary by province and by agreement, so the sheet hands the
+    accountant the weekly figure their own rule needs rather than encoding a guess.
+    Don't "help" by adding an OT calculation.
+  - Printing reuses the app-wide mechanism: one `id="print-area"` element is the
+    only thing visible under `@media print`, `.no-print` hides the controls, and
+    `.page-break` starts each person on a fresh page. Same as the quote preview.
 - **Shifts have no direct edit UI.** Employees can't edit a clocked `shifts` record —
   they request a correction (My Hours → Request a correction), which lands in
   `shiftrequests` (`status: Pending/Approved/Rejected`) and emails the owner/managers.
