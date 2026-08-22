@@ -35,7 +35,12 @@
   .app-main { flex: 1; padding: 28px 32px; min-width: 0; }
   .sidebar {
     width: 220px; min-width: 220px; background: var(--brand-primary); color: #fff;
-    display: flex; flex-direction: column; height: 100vh;
+    display: flex; flex-direction: column;
+    /* dvh, not vh: on a phone 100vh is the height with the browser's URL bar
+       retracted, so a 100vh sidebar hangs its own footer (Sign Out) off the
+       bottom of the screen — and being fixed, you can't scroll down to it.
+       vh stays first as the fallback for anything without dvh. */
+    height: 100vh; height: 100dvh;
     position: sticky; top: 0; flex-shrink: 0;
   }
   .sidebar-backdrop { display: none; }
@@ -45,6 +50,10 @@
     .sidebar {
       position: fixed; left: 0; top: 0; z-index: 150;
       transform: translateX(-100%); transition: transform .2s ease;
+      /* As an overlay it has to clear the notch and the home indicator on its
+         own — there's no .topbar above it to do that any more. */
+      padding-top: env(safe-area-inset-top, 0px);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
     }
     .sidebar.open { transform: translateX(0); }
     .sidebar-backdrop.open {
@@ -56,8 +65,25 @@
       padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 10px; background: var(--brand-primary); color: #fff;
       position: sticky; top: 0; z-index: 100;
     }
+    /* The bar carries a menu button, the page name and two actions. On a phone
+       that's more than the width holds, and anything that overflows here drags
+       the whole page sideways — so the title truncates and the buttons never
+       shrink below their own text. */
+    .topbar .tb-menu, .topbar .tb-btn { flex: 0 0 auto; }
+    .topbar .tb-title {
+      flex: 1 1 auto; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
     .app { flex-direction: column; }
     .app-main { padding: 16px; }
+  }
+
+  /* Narrow phones in the full app: the actions drop to their icons. The
+     keyboard hint goes too — there's no Ctrl key on a phone. */
+  @media (max-width: 600px) {
+    .topbar { gap: 8px; padding-left: 12px; padding-right: 12px; }
+    .topbar .tb-btn { padding: 7px 10px; }
+    .topbar .tb-btn-text, .topbar .tb-kbd { display: none; }
   }
 
   /* ── Responsive grids ── */
@@ -9665,6 +9691,17 @@ function Sidebar({ open, onClose }) {
   const { company } = useCompany();
   const { logout, user } = useAuth();
 
+  // While the menu is over the page, the page underneath must not scroll —
+  // otherwise a swipe aimed at the nav list drags the dashboard around behind
+  // the backdrop. Only matters in the overlay state; harmless on a wide screen
+  // where the sidebar is never "open".
+  useEffect(() => {
+    if (!open) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, [open]);
+
   return (
     <>
       <div className={"sidebar-backdrop" + (open ? " open" : "")} onClick={onClose} />
@@ -10939,15 +10976,16 @@ function AppShell() {
       <Sidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
       <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
         <div className="topbar">
-          <button type="button" onClick={() => setMenuOpen(o => !o)} aria-label="Menu" style={{ background: "rgba(255,255,255,0.12)", border: "none", color: "#fff", fontSize: 18, borderRadius: 8, width: 36, height: 36, cursor: "pointer" }}>☰</button>
-          <span style={{ fontWeight: 700, fontSize: 15 }}>{relabel(label)}</span>
-          <button type="button" onClick={() => setCmdOpen(true)} title="Type what you want to do (Ctrl+K)"
+          <button type="button" className="tb-menu" onClick={() => setMenuOpen(o => !o)} aria-label="Menu" style={{ background: "rgba(255,255,255,0.12)", border: "none", color: "#fff", fontSize: 18, borderRadius: 8, width: 36, height: 36, cursor: "pointer" }}>☰</button>
+          <span className="tb-title" style={{ fontWeight: 700, fontSize: 15 }}>{relabel(label)}</span>
+          <button type="button" className="tb-btn" onClick={() => setCmdOpen(true)} title="Type what you want to do (Ctrl+K)" aria-label="Quick Command"
             style={{ marginLeft: "auto", background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 8 }}>
-            ⚡ Quick Command
-            <span style={{ fontSize: 10.5, opacity: 0.7, border: "1px solid rgba(255,255,255,0.35)", borderRadius: 4, padding: "1px 5px" }}>Ctrl K</span>
+            ⚡<span className="tb-btn-text">&nbsp;Quick Command</span>
+            <span className="tb-kbd" style={{ fontSize: 10.5, opacity: 0.7, border: "1px solid rgba(255,255,255,0.35)", borderRadius: 4, padding: "1px 5px" }}>Ctrl K</span>
           </button>
-          <button type="button" onClick={() => { storage.remove(FORCE_DESKTOP_KEY); storage.set(FORCE_MOBILE_KEY, "1"); window.location.reload(); }}
-            style={{ background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>📱 Field view</button>
+          <button type="button" className="tb-btn" title="Switch to the field app" aria-label="Field view"
+            onClick={() => { storage.remove(FORCE_DESKTOP_KEY); storage.set(FORCE_MOBILE_KEY, "1"); window.location.reload(); }}
+            style={{ background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>📱<span className="tb-btn-text">&nbsp;Field view</span></button>
         </div>
         {/* key includes dataVersion so a rolled-back background write re-reads the store */}
         <main className="app-main" key={page + ":" + dataVersion}>
