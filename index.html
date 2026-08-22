@@ -378,6 +378,75 @@ const db = {
   },
 };
 
+/* ─── Team accounts ↔ the employee roster ────────────────────────────────────
+   Two separate lists describe the same people. `profiles` is the sign-in side:
+   someone enters the company join code, the owner approves them on the Team
+   page, and from then on everything they do — clocked shifts, logged job time,
+   daily logs, safety forms — is filed under their account name. The `employees`
+   collection is the office side: the roster that carries the pay rate and fills
+   every crew picker, work-log filter, and printed timesheet.
+
+   Nothing connected the two, so a person who joined and worked all week never
+   showed up on the roster (their hours had no rate, and the Employees count only
+   ever showed rows typed by hand), while a hand-typed row sat there matching
+   nobody. syncTeamRoster() closes the gap: every active member gets exactly one
+   roster row, matched to an existing one wherever possible instead of doubling
+   the person up.
+
+   It only ever creates and links. Nothing is deleted or deactivated here — the
+   roster also holds people who will never have a login (a casual hand, a
+   seasonal hire), and those rows must keep working exactly as they do today. */
+const normName = s => String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
+const sameName = (a, b) => !!normName(a) && normName(a) === normName(b);
+const normEmail = s => String(s || "").trim().toLowerCase();
+
+// The roster row belonging to a team member, or null. Match order matters: the
+// account id is exact, the email survives a name change, and the name is the
+// last resort (case- and spacing-insensitive) so a hand-typed "john doe" adopts
+// the account instead of becoming a second person on the payroll.
+function employeeForMember(member, roster) {
+  const rows = roster || getCol("employees");
+  return rows.find(e => e.userId && e.userId === member.id)
+    || rows.find(e => normEmail(e.email) && normEmail(e.email) === normEmail(member.email))
+    || rows.find(e => !e.userId && sameName(e.fullName, member.full_name))
+    || null;
+}
+
+// Give every active team member a roster row. Returns how many were created.
+function syncTeamRoster(members) {
+  let created = 0;
+  (members || []).forEach(m => {
+    if (!m || !m.id) return;
+    if (m.status && m.status !== "active") return;   // still waiting on approval
+    const name = String(m.full_name || "").trim() || String(m.email || "").split("@")[0];
+    if (!name) return;
+    // Re-read the roster each pass so a row created moments ago (the store is
+    // updated synchronously) is matched instead of created twice.
+    const row = employeeForMember(m, getCol("employees"));
+    if (!row) {
+      db.create("employees", {
+        fullName: name,
+        email: m.email || "",
+        role: m.role || "Employee",
+        userId: m.id,
+        isActive: true,
+        startDate: String(m.created_at || "").slice(0, 10),
+      });
+      created++;
+      return;
+    }
+    const patch = {};
+    if (row.userId !== m.id) patch.userId = m.id;
+    if (!row.email && m.email) patch.email = m.email;
+    // Adopt the account's spelling of the name. That spelling is what every
+    // shift and time entry is filed under, so the roster has to agree with it
+    // or the person's hours look like they belong to someone else.
+    if (row.fullName !== name && sameName(row.fullName, name)) patch.fullName = name;
+    if (Object.keys(patch).length) db.update("employees", { ...row, ...patch });
+  });
+  return created;
+}
+
 // Records a chunk of billable equipment usage (from any daily log / time entry
 // form) and rolls the hours onto the equipment's running total — the one place
 // "what equipment, how long" turns into both a billing record and an updated
@@ -1213,6 +1282,19 @@ function AuthProvider({ children }) {
       if (cErr) throw cErr;
       setCompany(comp ? companyRowToApp(comp) : { id: prof.company_id, companyName: "My Company" });
       await loadAllRecords();
+      // Everyone who can sign in belongs on the employee roster — otherwise the
+      // hours they clock have no one to attach to (see syncTeamRoster). An
+      // owner/manager syncs the whole team; anyone else only ensures their own
+      // row, so a crew phone never quietly writes rows for the rest of the shop.
+      try {
+        const canSyncTeam = prof.role === "Owner" || prof.role === "Manager";
+        let mates = [prof];
+        if (canSyncTeam) {
+          const { data: team } = await supa.from("profiles").select("*").eq("company_id", prof.company_id);
+          if (team && team.length) mates = team;
+        }
+        syncTeamRoster(mates);
+      } catch (e) { console.error("Roster sync skipped:", e); }
       setDataReady(true);
     };
 
@@ -2523,12 +2605,24 @@ function HaulLoadsPage() {
 }
 
 function EmployeesPage() {
+  useDataVersion();   // the roster grows on its own when team members are synced
+  const roster = getCol("employees");
+  const linked = roster.filter(e => e.userId).length;
   return <CRUDPage
-    title="Employees" singular="Employee" subtitle="Manage your team members" collection="employees" emptyIcon="👤"
+    title="Employees" singular="Employee" subtitle="Everyone on the payroll — people who sign in are added here automatically" collection="employees" emptyIcon="👤"
     defaultValues={{ isActive: true, role: "Employee" }}
+    extra={roster.length === 0 ? null : (
+      <div style={{ ...card, fontSize: 12, color: C.textMuted, lineHeight: 1.6 }}>
+        👤 <strong style={{ color: C.text }}>{linked}</strong> of these {linked === 1 ? "person has" : "people have"} a login on your team, so their
+        clocked shifts and logged hours attach to the row here — set their pay rate and the timesheets fill in.
+        Rows without a login still work for anyone you track by hand. If someone shows up twice (once typed by
+        you, once from their login), delete the typed one — the login row is the one their hours are filed under.
+      </div>
+    )}
     columns={[
       { key: "fullName", label: "Name" },
       { key: "role", label: "Role" },
+      { key: "userId", label: "Login", render: v => v ? "✅ Has account" : "—" },
       { key: "email", label: "Email" },
       { key: "phoneNumber", label: "Phone" },
       { key: "hourlyRate", label: "Rate/hr", render: money },
@@ -5130,10 +5224,11 @@ function TimeEntryEditForm({ entry, employeeOptions, onSave, onCancel }) {
 
 function useEmployeeOptions() {
   const { user } = useAuth();
-  const employees = useMemo(() => db.getAll("employees").items, []);
-  const names = employees.map(e => e.fullName).filter(Boolean);
+  useDataVersion();   // the roster can gain rows mid-session (see syncTeamRoster)
+  const employees = db.getAll("employees").items;
+  const names = employees.filter(e => e.isActive !== false).map(e => e.fullName).filter(Boolean);
   const me = user?.name || user?.email || "Unknown";
-  return names.includes(me) ? names : [me, ...names];
+  return names.some(n => sameName(n, me)) ? names : [me, ...names];
 }
 
 function TimeEntryPage() {
@@ -5616,7 +5711,9 @@ function TimesheetsView({ onClose }) {
   const [start, end] = range;
   const employees = getCol("employees");
   const rateFor = name => {
-    const e = employees.find(x => (x.fullName || "") === name);
+    // Matched loosely (see sameName) — hours are filed under whatever the person's
+    // account calls them, which needn't match the roster's capitalisation.
+    const e = employees.find(x => sameName(x.fullName, name));
     return e ? num(e.hourlyRate) : 0;
   };
 
@@ -5864,7 +5961,7 @@ function EmployeeLogsPage() {
 
   const filtered = entries.filter(e => !selected || e.employeeName === selected);
   const rateFor = name => {
-    const emp = employees.find(x => x.fullName === name);
+    const emp = employees.find(x => sameName(x.fullName, name));
     return emp ? num(emp.hourlyRate) : 0;
   };
 
@@ -6271,7 +6368,7 @@ function BillingPage() {
   const [filters, setFilters] = useState({ startDate: "", endDate: "", employee: "", job: "" });
 
   const rateFor = name => {
-    const emp = employees.find(x => x.fullName === name);
+    const emp = employees.find(x => sameName(x.fullName, name));
     return emp ? num(emp.hourlyRate) : 0;
   };
 
@@ -6395,69 +6492,230 @@ function BillingPage() {
 }
 
 /* ─── Schedule ───────────────────────────────────────────────────────────── */
+/* ─── Schedule ───────────────────────────────────────────────────────────────
+   Shared by the desktop calendar and the field app's calendar. Both show the
+   same month grid off the same rules, so "what's on Thursday" is one answer
+   whichever device is asking.
+   ────────────────────────────────────────────────────────────────────────── */
+
+// Stage names that mean the work is finished. Stages are company-defined in
+// Workspace setup, so there's no structural flag to read — this is every
+// "done" name the shipped industry presets use, matched case-insensitively.
+// A company that invents its own final stage name keeps seeing those jobs on
+// the calendar, which is the safe direction to be wrong in.
+const DONE_STAGES = ["completed", "complete", "done", "closed", "delivered", "picked up", "finished", "cancelled", "canceled"];
+const jobIsDone = j => DONE_STAGES.indexOf(String(j.jobStatus || "").trim().toLowerCase()) > -1;
+
+// The days a job occupies, as YYYY-MM-DD strings — they compare and sort
+// correctly as plain text, so there's no Date arithmetic and no timezone edge.
+//
+// An unfinished job does NOT drop off the calendar when its end date passes:
+// it carries forward onto every day since, through today. Work that ran long
+// is still work someone has to do, and it belongs on today's square rather
+// than buried back on the day it was once meant to end. It never runs past
+// today — tomorrow's square is for what's actually planned.
+function jobSpan(job, t) {
+  if (!job.startDate) return null;
+  const start = job.startDate;
+  const planned = job.endDate && job.endDate > start ? job.endDate : start;
+  const carried = !jobIsDone(job) && planned < t;
+  return { start, planned, end: carried ? t : planned, carried };
+}
+
+const spanMap = (jobs, t) => {
+  const m = {};
+  jobs.forEach(j => { const s = jobSpan(j, t); if (s) m[j._id] = s; });
+  return m;
+};
+const jobsOnDay = (jobs, spans, ds) => jobs.filter(j => {
+  const s = spans[j._id];
+  return s && ds >= s.start && ds <= s.end;
+});
+// True only on the days a job has spilled PAST its planned end — the days it
+// was legitimately booked for aren't "carried over".
+const isCarryDay = (spans, id, ds) => !!spans[id] && spans[id].carried && ds > spans[id].planned;
+
+// Every square of a month view, including enough of the neighbouring months to
+// finish the first and last week rows — so the grid is always a clean
+// rectangle instead of trailing off mid-row.
+function monthGrid(year, month) {
+  const cells = [];
+  for (let i = new Date(year, month, 1).getDay(); i > 0; i--) cells.push({ date: new Date(year, month, 1 - i), inMonth: false });
+  const total = new Date(year, month + 1, 0).getDate();
+  for (let d = 1; d <= total; d++) cells.push({ date: new Date(year, month, d), inMonth: true });
+  for (let d = 1; cells.length % 7; d++) cells.push({ date: new Date(year, month, total + d), inMonth: false });
+  return cells;
+}
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const monthLabel = d => d.toLocaleString("default", { month: "long", year: "numeric" });
+const longDay = ds => new Date(ds + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+
+// What's on one day, in full. The calendar squares are deliberately too small
+// for a whole job title, so this is where the truncated text goes to be read.
+function ScheduleDayList({ dayStr, jobs, spans, onOpenJob }) {
+  if (!jobs.length) {
+    return <p style={{ color: C.textMuted, fontSize: 13, textAlign: "center", padding: "20px 0" }}>Nothing scheduled for this day.</p>;
+  }
+  return (
+    <div>
+      {jobs.map(j => {
+        const s = spans[j._id] || {};
+        return (
+          <div key={j._id} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 12, marginBottom: 8, background: C.surface }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+              <div style={{ fontWeight: 700, fontSize: 14, minWidth: 0 }}>{j.jobTitle}</div>
+              <StatusBadge status={j.jobStatus} />
+            </div>
+            {j.clientName && <div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 3 }}>{j.clientName}</div>}
+            <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>
+              {j.startDate}{s.planned && s.planned !== j.startDate ? " → " + s.planned : ""}
+            </div>
+            {isCarryDay(spans, j._id, dayStr) && (
+              <div style={{ fontSize: 12, color: "#92400E", background: "#FFFBEB", border: "1px solid #FDE68A", borderRadius: 6, padding: "5px 8px", marginTop: 6 }}>
+                ↻ Carried over — was due {s.planned} and isn't finished yet.
+              </div>
+            )}
+            {Array.isArray(j.assignedEmployees) && j.assignedEmployees.length > 0 && (
+              <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>👷 {j.assignedEmployees.join(", ")}</div>
+            )}
+            <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}>
+              {j.jobAddress && <MapLink query={j.jobAddress} label="Directions" />}
+              {onOpenJob && (
+                <button type="button" onClick={() => onOpenJob(j)} style={{ background: "none", border: "none", color: C.accent, fontWeight: 700, fontSize: 12.5, cursor: "pointer", padding: 0 }}>
+                  {relabel("Open job")} →
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Fixed, so every square in the month is identical and no week row ends up
+// taller than its neighbours just because someone booked three jobs that day.
+const CAL_CELL_H = 124;
+const CAL_CHIPS = 3;   // chips that fit above the "+N more" line
+
 function SchedulePage() {
   const { navigate } = useRouter();
+  const t = today();
   const [cursor, setCursor] = useState(() => new Date());
-  const jobs = useMemo(() => db.getAll("jobs").items, []);
+  const [showDone, setShowDone] = useState(false);
+  const [openDay, setOpenDay] = useState(null);
+
+  const dated = useMemo(() => db.getAll("jobs").items.filter(j => j.startDate), []);
+  const jobs = useMemo(() => showDone ? dated : dated.filter(j => !jobIsDone(j)), [dated, showDone]);
+  const spans = useMemo(() => spanMap(jobs, t), [jobs, t]);
+  const doneCount = useMemo(() => dated.filter(jobIsDone).length, [dated]);
 
   const year = cursor.getFullYear();
   const month = cursor.getMonth();
-  const monthStart = new Date(year, month, 1);
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const days = Array.from({ length: daysInMonth }, (_, i) => new Date(year, month, i + 1));
-
-  // A job occupies every day from its start date through its end date.
-  const jobsForDay = day => jobs.filter(j => {
-    if (!j.startDate) return false;
-    const start = new Date(j.startDate + "T00:00:00");
-    const end = j.endDate ? new Date(j.endDate + "T00:00:00") : start;
-    return day >= start && day <= end;
-  });
+  const cells = useMemo(() => monthGrid(year, month), [year, month]);
 
   return (
     <div>
       <PageHeader title="Schedule" subtitle="Jobs plotted across the calendar" />
       <div style={card}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20, gap: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16, gap: 12, flexWrap: "wrap" }}>
           <button type="button" onClick={() => setCursor(new Date(year, month - 1, 1))} style={btnOutline}>← Previous</button>
-          <h2 style={{ fontSize: 20, fontWeight: 700 }}>{cursor.toLocaleString("default", { month: "long", year: "numeric" })}</h2>
+          <h2 style={{ fontSize: 20, fontWeight: 700 }}>{monthLabel(cursor)}</h2>
           <div style={{ display: "flex", gap: 8 }}>
             <button type="button" onClick={() => setCursor(new Date())} style={btnOutline}>Today</button>
             <button type="button" onClick={() => setCursor(new Date(year, month + 1, 1))} style={btnOutline}>Next →</button>
           </div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4 }}>
-          {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => (
+
+        {/* minmax(0, 1fr) — not a plain 1fr — is what actually holds the seven
+            columns to the same width. A bare 1fr floors at its content's
+            minimum size, so one long job title widens its own column and
+            squeezes the other six. With the floor at 0 the columns are always
+            equal and the title inside a chip is what gives, via an ellipsis. */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 4 }}>
+          {WEEKDAYS.map(d => (
             <div key={d} style={{ textAlign: "center", fontSize: 11, fontWeight: 700, color: C.textMuted, padding: "8px 4px", textTransform: "uppercase" }}>{d}</div>
           ))}
-          {Array.from({ length: monthStart.getDay() }).map((_, i) => <div key={"pad" + i} />)}
-          {days.map(day => {
-            const dayJobs = jobsForDay(day);
-            const isToday = day.toDateString() === new Date().toDateString();
+          {cells.map(({ date, inMonth }) => {
+            const ds = dateStr(date);
+            const dayJobs = jobsOnDay(jobs, spans, ds);
+            const isToday = ds === t;
             return (
-              <div key={day.toISOString()} style={{ minHeight: 84, background: isToday ? "#EEF2FF" : C.surfaceAlt, borderRadius: 8, padding: 6, border: isToday ? "2px solid " + C.accent : "1px solid " + C.border }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: isToday ? C.accent : C.textMuted, marginBottom: 4 }}>{day.getDate()}</div>
-                {dayJobs.slice(0, 2).map(j => (
-                  <div
-                    key={j._id}
-                    onClick={() => navigate("jobs")}
-                    title={j.jobTitle}
-                    style={{ background: C.primary, color: "#fff", borderRadius: 4, padding: "2px 5px", fontSize: 10, fontWeight: 600, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", cursor: "pointer" }}
-                  >
-                    {j.jobTitle}
-                  </div>
-                ))}
-                {dayJobs.length > 2 && <div style={{ fontSize: 10, color: C.textMuted }}>+{dayJobs.length - 2} more</div>}
+              <div
+                key={ds}
+                onClick={() => setOpenDay(ds)}
+                title={dayJobs.length ? dayJobs.length + " scheduled — click to see them all" : "Nothing scheduled"}
+                style={{
+                  height: CAL_CELL_H, overflow: "hidden", display: "flex", flexDirection: "column", cursor: "pointer",
+                  background: isToday ? "#EEF2FF" : inMonth ? C.surfaceAlt : C.surface,
+                  opacity: inMonth ? 1 : 0.5,
+                  borderRadius: 8, padding: 6,
+                  border: isToday ? "2px solid " + C.accent : "1px solid " + C.border,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: isToday ? C.accent : C.textMuted }}>{date.getDate()}</span>
+                  {dayJobs.length > 0 && <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted }}>{dayJobs.length}</span>}
+                </div>
+                <div style={{ flex: 1, minWidth: 0, minHeight: 0, overflow: "hidden" }}>
+                  {dayJobs.slice(0, CAL_CHIPS).map(j => {
+                    const carry = isCarryDay(spans, j._id, ds);
+                    return (
+                      <div
+                        key={j._id}
+                        title={j.jobTitle + (carry ? " (carried over)" : "")}
+                        style={{
+                          background: carry ? "#FEF3C7" : C.primary, color: carry ? "#92400E" : "#fff",
+                          borderRadius: 4, padding: "2px 5px", fontSize: 10, fontWeight: 600, marginBottom: 2,
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        }}
+                      >
+                        {carry ? "↻ " : ""}{j.jobTitle}
+                      </div>
+                    );
+                  })}
+                  {dayJobs.length > CAL_CHIPS && (
+                    <div style={{ fontSize: 10, fontWeight: 700, color: C.accent, padding: "1px 5px" }}>+{dayJobs.length - CAL_CHIPS} more</div>
+                  )}
+                </div>
               </div>
             );
           })}
         </div>
-        {jobs.length === 0 && (
+
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginTop: 14 }}>
+          <div style={{ fontSize: 12, color: C.textMuted, display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
+            <span>
+              <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 3, background: "#FEF3C7", border: "1px solid #FDE68A", marginRight: 6, verticalAlign: -1 }} />
+              ↻ carried over — past its end date, still unfinished
+            </span>
+            <span>Click any day to read the full list.</span>
+          </div>
+          <Checkbox
+            checked={showDone}
+            onChange={setShowDone}
+            label={"Show completed jobs" + (!showDone && doneCount ? " (" + doneCount + " hidden)" : "")}
+          />
+        </div>
+
+        {dated.length === 0 && (
           <p style={{ color: C.textMuted, fontSize: 13, marginTop: 16, textAlign: "center" }}>
             No jobs scheduled yet — add jobs with a start date to see them here.
           </p>
         )}
       </div>
+
+      {openDay && (
+        <Modal title={longDay(openDay)} onClose={() => setOpenDay(null)} width={560}>
+          <ScheduleDayList
+            dayStr={openDay}
+            jobs={jobsOnDay(jobs, spans, openDay)}
+            spans={spans}
+            onOpenJob={() => { setOpenDay(null); navigate("jobs"); }}
+          />
+        </Modal>
+      )}
     </div>
   );
 }
@@ -6599,8 +6857,18 @@ function TeamPage() {
   const [draftPerms, setDraftPerms] = useState({});
   const [busyId, setBusyId] = useState(null);
   const [copied, setCopied] = useState(false);
+  const [rosterNote, setRosterNote] = useState("");
 
-  const load = async () => { setLoading(true); setMembers(await fetchTeam()); setLoading(false); };
+  // Loading the team is also the moment the roster catches up: anyone approved
+  // since the last look gets their employees row here (see syncTeamRoster).
+  const load = async () => {
+    setLoading(true);
+    const rows = await fetchTeam();
+    setMembers(rows);
+    const added = syncTeamRoster(rows);
+    if (added > 0) { notifyData(); setRosterNote(added + " team " + (added === 1 ? "member was" : "members were") + " added to your Employees list."); }
+    setLoading(false);
+  };
   useEffect(() => { load(); }, []);
 
   if (!user?.isOwner) {
@@ -6670,6 +6938,11 @@ function TeamPage() {
       {/* Active members */}
       <div style={card}>
         <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Team Members</h3>
+        <p style={{ color: C.textMuted, fontSize: 12, marginBottom: 12, lineHeight: 1.6 }}>
+          Everyone here is also on your <strong>Employees</strong> list, so their clocked shifts and logged
+          hours land under a real person. Set each one's pay rate there.
+        </p>
+        {rosterNote && <p style={{ fontSize: 12, color: C.textMuted, marginBottom: 12 }}>✅ {rosterNote}</p>}
         {active.length === 0 && <p style={{ color: C.textMuted, fontSize: 13 }}>No active members yet.</p>}
         {active.map(m => {
           const isMe = m.id === user.id;
@@ -10753,41 +11026,91 @@ function MobileDailyLog() {
 }
 
 // 📅 Schedule — jobs grouped by when, as tappable cards with a map link.
+// 📅 Schedule — the same month calendar as the desktop page, sized for a thumb.
+// Seven columns of ~46px can't hold a job title, so a square carries the date
+// and a count; tapping it lists that day in full underneath.
 function MobileSchedule() {
+  useDataVersion();
   const t = today();
-  const jobs = jobsByClient(getCol("jobs").filter(j => j.startDate)).sort((a, b) => (a.startDate || "").localeCompare(b.startDate || ""));
-  const isToday = j => (j.startDate || "") <= t && (j.endDate || j.startDate || "") >= t;
-  const groups = [
-    { label: "Today", items: jobs.filter(isToday) },
-    { label: "Upcoming", items: jobs.filter(j => (j.startDate || "") > t) },
-    { label: "Earlier", items: jobs.filter(j => (j.endDate || j.startDate || "") < t).reverse() },
-  ].filter(g => g.items.length);
+  const [cursor, setCursor] = useState(() => new Date());
+  const [sel, setSel] = useState(t);
 
-  if (jobs.length === 0) return <div style={{ ...mCard, textAlign: "center", padding: "30px 18px", color: C.textMuted }}>No scheduled jobs yet. Jobs with a start date show up here.</div>;
+  const dated = getCol("jobs").filter(j => j.startDate);
+  const jobs = jobsByClient(dated.filter(j => !jobIsDone(j)));
+  const spans = spanMap(jobs, t);
+
+  const year = cursor.getFullYear();
+  const month = cursor.getMonth();
+  const cells = monthGrid(year, month);
+
+  // Moving months moves the selection with it, so the list underneath always
+  // belongs to the calendar above it. Landing on the current month re-picks
+  // today rather than the 1st.
+  const jump = d => {
+    const c = new Date(year, month + d, 1);
+    setCursor(c);
+    const first = dateStr(c);
+    setSel(first.slice(0, 7) === t.slice(0, 7) ? t : first);
+  };
+
+  const navBtn = { background: C.surface, border: "1px solid " + C.border, borderRadius: 10, width: 38, height: 38, fontSize: 17, fontWeight: 800, color: C.text, cursor: "pointer" };
 
   return (
     <div>
-      {groups.map(g => (
-        <div key={g.label} style={{ marginBottom: 6 }}>
-          <div style={{ fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, color: g.label === "Today" ? C.secondary : C.textMuted, margin: "6px 2px 8px" }}>{g.label}</div>
-          {g.items.map(j => (
-            <div key={j._id} style={{ ...mCard, padding: 14 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
-                <div style={{ fontWeight: 800, fontSize: 15 }}>{j.jobTitle}</div>
-                <StatusBadge status={j.jobStatus} />
-              </div>
-              {j.clientName && <div style={{ fontSize: 13, color: C.textMuted, marginTop: 2 }}>{j.clientName}</div>}
-              <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>
-                {j.startDate}{j.endDate && j.endDate !== j.startDate ? " → " + j.endDate : ""}
-              </div>
-              {Array.isArray(j.assignedEmployees) && j.assignedEmployees.length > 0 && (
-                <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>👷 {j.assignedEmployees.join(", ")}</div>
-              )}
-              {j.jobAddress && <div style={{ marginTop: 8 }}><MapLink query={j.jobAddress} label="Directions" /></div>}
-            </div>
-          ))}
+      <div style={{ ...mCard, padding: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 10 }}>
+          <button type="button" onClick={() => jump(-1)} aria-label="Previous month" style={navBtn}>‹</button>
+          <div style={{ textAlign: "center", minWidth: 0 }}>
+            <div style={{ fontWeight: 800, fontSize: 15, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{monthLabel(cursor)}</div>
+            <button type="button" onClick={() => { setCursor(new Date()); setSel(t); }}
+              style={{ background: "none", border: "none", color: C.accent, fontSize: 12, fontWeight: 700, padding: "2px 0 0", cursor: "pointer" }}>Today</button>
+          </div>
+          <button type="button" onClick={() => jump(1)} aria-label="Next month" style={navBtn}>›</button>
         </div>
-      ))}
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 3 }}>
+          {WEEKDAYS.map(d => (
+            <div key={d} style={{ textAlign: "center", fontSize: 10, fontWeight: 800, color: C.textMuted, paddingBottom: 4 }}>{d.slice(0, 2)}</div>
+          ))}
+          {cells.map(({ date, inMonth }) => {
+            const ds = dateStr(date);
+            const dayJobs = jobsOnDay(jobs, spans, ds);
+            const n = dayJobs.length;
+            const carry = dayJobs.some(j => isCarryDay(spans, j._id, ds));
+            const isToday = ds === t;
+            const picked = ds === sel;
+            return (
+              <button
+                key={ds}
+                type="button"
+                onClick={() => setSel(ds)}
+                style={{
+                  height: 46, borderRadius: 10, padding: 0, cursor: "pointer",
+                  display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2,
+                  background: picked ? C.secondary : isToday ? "#EEF2FF" : C.surface,
+                  border: picked ? "2px solid " + C.secondary : isToday ? "2px solid " + C.accent : "1px solid " + C.border,
+                  opacity: inMonth ? 1 : 0.4,
+                }}
+              >
+                <span style={{ fontSize: 13, fontWeight: picked || isToday ? 800 : 600, color: picked ? "#fff" : isToday ? C.accent : C.text, lineHeight: 1 }}>{date.getDate()}</span>
+                {/* The empty span keeps every square the same shape on days with nothing on them. */}
+                {n > 0
+                  ? <span style={{ fontSize: 9, fontWeight: 800, lineHeight: 1, color: "#fff", background: picked ? "rgba(255,255,255,0.35)" : carry ? "#D97706" : C.secondary, borderRadius: 99, padding: "2px 5px", minWidth: 14 }}>{n}</span>
+                  : <span style={{ height: 13 }} />}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div style={{ fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, color: sel === t ? C.secondary : C.textMuted, margin: "10px 2px 8px" }}>
+        {sel === t ? "Today · " : ""}{longDay(sel)}
+      </div>
+      <ScheduleDayList dayStr={sel} jobs={jobsOnDay(jobs, spans, sel)} spans={spans} />
+
+      {dated.length === 0
+        ? <div style={{ ...mCard, textAlign: "center", padding: "20px 18px", color: C.textMuted, fontSize: 13 }}>No scheduled jobs yet. Jobs with a start date show up here.</div>
+        : <div style={{ fontSize: 11.5, color: C.textMuted, textAlign: "center", padding: "4px 8px 2px" }}>Completed jobs are hidden. Unfinished ones carry over to today (↻).</div>}
     </div>
   );
 }

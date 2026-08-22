@@ -294,6 +294,34 @@ from the add-on card on **Subscriptions** (route `#/setup`).
   `employees` collection is purely informational and NOT linked to login accounts —
   matching to "whose shift is this" is done by plain-text name (`employeeName ===
   user.name`), same as everywhere else time gets attributed to a person.
+- **The Schedule is one month calendar on both devices**, off one set of helpers
+  (`jobIsDone` / `jobSpan` / `spanMap` / `jobsOnDay` / `isCarryDay` / `monthGrid`)
+  that sit above `SchedulePage`; the field app's `MobileSchedule` imports the same
+  ones, so "what's on Thursday" has one answer per device. Dates are compared as
+  `YYYY-MM-DD` **strings** — they sort correctly as text, which sidesteps both Date
+  arithmetic and the timezone bug `toISOString()` causes west of Greenwich.
+  - **Finished jobs are hidden, and "finished" is a name list.** Stages are
+    company-defined in Workspace setup, so there is no structural "done" flag to
+    read; `DONE_STAGES` matches the final-stage names the shipped presets use
+    (completed/done/closed/delivered/picked up/cancelled…), case-insensitively. A
+    company that invents its own final stage name keeps seeing those jobs — that's
+    the safe direction to be wrong in. The desktop page has a "Show completed"
+    checkbox, default off.
+  - **An unfinished job carries forward onto every day since its end date, through
+    today** (`jobSpan().carried`), drawn in amber with a ↻. Work that ran long is
+    still work someone has to do, and it belongs on today's square. It deliberately
+    never projects past today — tomorrow's square is for what's actually planned —
+    and the days it was genuinely booked for are not marked as carried
+    (`isCarryDay` is true only *past* `planned`).
+  - **The grid is `repeat(7, minmax(0, 1fr))`, not `repeat(7, 1fr)`.** A bare `1fr`
+    floors at its content's minimum size, so one long job title widened its own
+    column to 354px and squeezed the other six to 87px. With the floor at 0 the
+    columns are always equal and the chip's text is what gives, via an ellipsis.
+    Cell height is likewise fixed (`CAL_CELL_H`) so no week row is taller than its
+    neighbours. Don't "tidy" either back to auto sizing — the squares being
+    identical is the whole requirement. Overflow goes to "+N more", and clicking
+    any day opens the full list (`ScheduleDayList`, shared by the modal and the
+    phone's day panel).
 
 ---
 
