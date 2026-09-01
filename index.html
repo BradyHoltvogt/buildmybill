@@ -5293,7 +5293,7 @@ function QuotesPage({ startNew }) {
 /* ─── Time tracking ──────────────────────────────────────────────────────── */
 const newTimeRow = () => ({
   id: genId(), jobLocation: "", contract: "", workDone: "",
-  startTime: "08:00", endTime: "17:00", equipment: "", notes: "", mileage: "",
+  startTime: "08:00", endTime: "17:00", equipment: "", equipHours: "", notes: "", mileage: "",
 });
 
 // Edit an existing "timeentries" record — used from both the Time Tracking
@@ -5397,9 +5397,10 @@ function TimeEntryPage() {
         equipmentUsed: r.equipment,
         mileageDriven: num(r.mileage),
       });
-      // The equipment picked for a row is assumed to have run for that row's
-      // hours — bills it and rolls the hours onto the equipment's total.
-      if (r.equipment) logEquipmentUsage({ equipmentName: r.equipment, hours: hrs, employeeName, entryDate: date, jobName: r.jobLocation, source: "desktop-time-entry" });
+      // Bills the machine and rolls the hours onto its total. Its own hours if
+      // they were given, otherwise the row's — the old behaviour, kept for
+      // anyone who leaves the column alone.
+      if (r.equipment) logEquipmentUsage({ equipmentName: r.equipment, hours: num(r.equipHours) > 0 ? num(r.equipHours) : hrs, employeeName, entryDate: date, jobName: r.jobLocation, source: "desktop-time-entry" });
     });
     setRows([newTimeRow()]);
     refresh();
@@ -5427,10 +5428,10 @@ function TimeEntryPage() {
         </div>
 
         <div className="scroll-x">
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 860 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 940 }}>
             <thead>
               <tr style={{ background: C.surfaceAlt }}>
-                {["Job / Location", "Work Done", "Start", "End", "Hrs", "Equipment", "Miles", "Notes", ""].map(h => (
+                {["Job / Location", "Work Done", "Start", "End", "Hrs", "Equipment", "Equip. Hrs", "Miles", "Notes", ""].map(h => (
                   <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontWeight: 700, fontSize: 11, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", borderBottom: "2px solid " + C.border }}>{h}</th>
                 ))}
               </tr>
@@ -5461,6 +5462,16 @@ function TimeEntryPage() {
                         </select>
                       )
                       : <input value={r.equipment} onChange={e => updRow(r.id, "equipment", e.target.value)} placeholder="None" style={{ ...inputCls, width: 110 }} />}
+                  </td>
+                  {/* How long the machine actually ran. Left blank it bills for
+                      the whole row, which is what this page always did — but a
+                      machine that ran two hours of an eight hour day was being
+                      billed for eight, and there was nowhere to say otherwise. */}
+                  <td style={{ padding: "6px 4px" }}>
+                    <input type="number" min="0" step="any" value={r.equipHours} onChange={e => updRow(r.id, "equipHours", e.target.value)}
+                      placeholder={r.equipment ? hoursBetween(r.startTime, r.endTime).toFixed(1) : "—"} disabled={!r.equipment}
+                      title={r.equipment ? "Blank = the same hours as the row" : "Pick equipment first"}
+                      style={{ ...inputCls, width: 80, opacity: r.equipment ? 1 : 0.5 }} />
                   </td>
                   <td style={{ padding: "6px 4px" }}><input type="number" min="0" value={r.mileage} onChange={e => updRow(r.id, "mileage", e.target.value)} placeholder="0" style={{ ...inputCls, width: 70 }} /></td>
                   <td style={{ padding: "6px 4px" }}><input value={r.notes} onChange={e => updRow(r.id, "notes", e.target.value)} placeholder="Notes…" style={{ ...inputCls, minWidth: 110 }} /></td>
@@ -5506,28 +5517,200 @@ function TimeEntryPage() {
   );
 }
 
+/* ─── Daily log, the office half ─────────────────────────────────────────────
+   The field app's daily log and this page write to the same place, so they have
+   to ask for the same things. They didn't: the phone could record equipment
+   hours, materials fitted, loads hauled and a maintenance reading, and this page
+   could record none of it — anything logged from a desk was a thinner record
+   than the same day logged from a truck, and the difference showed up as money
+   missing off the bill.
+
+   The three editors below are that missing half. They hold the SAME row shapes
+   the field app holds (emptyEquipRow / emptyMaterialRow / emptyLoadRow) and save
+   through the SAME helpers (logEquipmentUsage / logMaterialUse), so an office
+   entry and a phone entry are indistinguishable once they land. Only the dress
+   is different — desktop inputs instead of thumb-sized ones. */
+function DLRowBox({ label, children, onRemove }) {
+  return (
+    <div style={{ background: C.surface, border: "1px solid " + C.border, borderRadius: 8, padding: 12, marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+        <span style={{ fontSize: 10, fontWeight: 800, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</span>
+        {onRemove && <button type="button" onClick={onRemove} title="Remove" style={{ background: "none", border: "none", color: C.textMuted, fontSize: 17, lineHeight: 1, cursor: "pointer" }}>×</button>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// Equipment that ran on this job, each with its OWN hours. The old page had a
+// single "Equipment" dropdown and quietly billed it for however long the person
+// worked, which is only right by accident — a machine that ran two hours of an
+// eight hour day was billed for eight.
+function DLEquipmentEditor({ rows, equipment, listId, onChange }) {
+  const upd = (id, k, v) => onChange(rows.map(r => (r.id === id ? { ...r, [k]: v } : r)));
+  return (
+    <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: 12, marginTop: 8 }}>
+      {rows.map((r, i) => (
+        <DLRowBox key={r.id} label={"Equipment " + (i + 1)} onRemove={rows.length > 1 ? () => onChange(rows.filter(x => x.id !== r.id)) : null}>
+          <div className="row-wrap" style={{ gap: 12 }}>
+            <Field label="Equipment" style={{ marginBottom: 0 }}>
+              <input list={listId} value={r.equipment} onChange={e => upd(r.id, "equipment", e.target.value)} placeholder="Pick or type equipment" style={{ ...inputCls, width: 240 }} />
+            </Field>
+            <Field label="Hours Used" style={{ marginBottom: 0 }}>
+              <input type="number" min="0" step="any" value={r.hours} onChange={e => upd(r.id, "hours", e.target.value)} placeholder="0" style={{ ...inputCls, width: 120 }} />
+            </Field>
+          </div>
+        </DLRowBox>
+      ))}
+      <datalist id={listId}>{equipment.map(eq => <option key={eq._id} value={eq.equipmentName} />)}</datalist>
+      <button type="button" onClick={() => onChange([...rows, emptyEquipRow()])} style={btnOutline}>+ Add equipment</button>
+      <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>Billed at each item's rate and added to its total hours on the Equipment page.</div>
+    </div>
+  );
+}
+
+// Parts fitted on the job. Priced at the point of use — picking a stocked item
+// fills the unit and price in, and both stay editable, because the price on the
+// shelf is not always the price that goes on this bill.
+function DLMaterialEditor({ rows, inventory, listId, onChange }) {
+  const upd = (id, k, v) => onChange(rows.map(r => (r.id === id ? { ...r, [k]: v } : r)));
+  const pick = (id, name) => onChange(rows.map(r => {
+    if (r.id !== id) return r;
+    const hit = inventory.find(i => (i.materialName || "").trim().toLowerCase() === String(name || "").trim().toLowerCase());
+    return hit ? { ...r, item: name, unit: hit.unitOfMeasure || "", price: hit.unitPrice != null && hit.unitPrice !== "" ? String(hit.unitPrice) : "" } : { ...r, item: name };
+  }));
+  const total = rows.reduce((t, r) => t + num(r.qty) * num(r.price), 0);
+  return (
+    <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: 12, marginTop: 8 }}>
+      {rows.map((r, i) => (
+        <DLRowBox key={r.id} label={"Material " + (i + 1)} onRemove={rows.length > 1 ? () => onChange(rows.filter(x => x.id !== r.id)) : null}>
+          <div className="row-wrap" style={{ gap: 12 }}>
+            <Field label="What Was Used" style={{ marginBottom: 0 }}>
+              <input list={listId} value={r.item} onChange={e => pick(r.id, e.target.value)} placeholder="Pick from stock, or type anything" style={{ ...inputCls, width: 240 }} />
+            </Field>
+            <Field label="How Many" style={{ marginBottom: 0 }}>
+              <input type="number" min="0" step="any" value={r.qty} onChange={e => upd(r.id, "qty", e.target.value)} placeholder="0" style={{ ...inputCls, width: 110 }} />
+            </Field>
+            <Field label="Unit" style={{ marginBottom: 0 }}>
+              <input value={r.unit} onChange={e => upd(r.id, "unit", e.target.value)} placeholder="ft, ea, box" style={{ ...inputCls, width: 110 }} />
+            </Field>
+            <Field label="Price Each" style={{ marginBottom: 0 }}>
+              <input type="number" min="0" step="any" value={r.price} onChange={e => upd(r.id, "price", e.target.value)} placeholder="0.00" style={{ ...inputCls, width: 120 }} />
+            </Field>
+            {num(r.qty) * num(r.price) > 0 && (
+              <div style={{ fontSize: 13, color: C.textMuted, paddingBottom: 8 }}>Line: <strong style={{ color: C.text }}>{money(num(r.qty) * num(r.price))}</strong></div>
+            )}
+          </div>
+        </DLRowBox>
+      ))}
+      <datalist id={listId}>{inventory.map(i => <option key={i._id} value={i.materialName} />)}</datalist>
+      <button type="button" onClick={() => onChange([...rows, emptyMaterialRow()])} style={btnOutline}>+ Add material</button>
+      {total > 0 && (
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: "1px solid " + C.border, fontSize: 14, fontWeight: 800 }}>
+          <span>Materials on this entry</span><span>{money(total)}</span>
+        </div>
+      )}
+      <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>Billed on the report. Anything that matches a stocked item also comes off inventory.</div>
+    </div>
+  );
+}
+
+// One row per load, each with its own truck — the same shape the scale ticket
+// comes in, so the right truck/yards/ticket combination reaches the billing export.
+function DLLoadEditor({ rows, trucks, listId, onChange }) {
+  const upd = (id, k, v) => onChange(rows.map(r => (r.id === id ? { ...r, [k]: v } : r)));
+  return (
+    <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: 12, marginTop: 8 }}>
+      {rows.map((r, i) => (
+        <DLRowBox key={r.id} label={"Load " + (i + 1)} onRemove={rows.length > 1 ? () => onChange(rows.filter(x => x.id !== r.id)) : null}>
+          <div className="row-wrap" style={{ gap: 12 }}>
+            <Field label="Truck" style={{ marginBottom: 0 }}>
+              <input list={listId} value={r.truck} onChange={e => upd(r.id, "truck", e.target.value)} placeholder="Pick or type a truck" style={{ ...inputCls, width: 220 }} />
+            </Field>
+            <Field label="Yards" style={{ marginBottom: 0 }}>
+              <input type="number" min="0" step="any" value={r.yards} onChange={e => upd(r.id, "yards", e.target.value)} placeholder="0" style={{ ...inputCls, width: 110 }} />
+            </Field>
+            <Field label="Ticket #" style={{ marginBottom: 0 }}>
+              <input value={r.ticketNumber} onChange={e => upd(r.id, "ticketNumber", e.target.value)} placeholder="Scale ticket #" style={{ ...inputCls, width: 160 }} />
+            </Field>
+          </div>
+        </DLRowBox>
+      ))}
+      <datalist id={listId}>{trucks.map(eq => <option key={eq._id} value={eq.equipmentName} />)}</datalist>
+      <button type="button" onClick={() => onChange([...rows, emptyLoadRow()])} style={btnOutline}>+ Add load</button>
+    </div>
+  );
+}
+
+// A daily-log row. Deliberately the same set of questions the field app asks, in
+// the same order, under the same headings — somebody filling this in on a laptop
+// and somebody filling it in on a phone should recognise each other's work.
+const newDailyRow = () => ({
+  id: genId(), jobId: "", jobName: "", contract: "", workDone: "",
+  startTime: "08:00", endTime: "17:00", notes: "", mileage: "",
+  equipmentUse: false, equipRows: [],
+  materialsUse: false, materialRows: [],
+  hauling: false, loads: [],
+  maintenance: false, maintUnit: "", maintMileage: "", maintHours: "",
+});
+
 function DailyLogPage() {
   const employeeOptions = useEmployeeOptions();
+  const dataVersion = useDataVersion();
   const [employeeName, setEmployeeName] = useState(employeeOptions[0] || "Unknown");
   const [entryDate, setEntryDate] = useState(today());
-  const [rows, setRows] = useState([newTimeRow()]);
+  const [rows, setRows] = useState([newDailyRow()]);
   const [message, setMessage] = useState("");
-  const jobs = useMemo(() => db.getAll("jobs").items, []);
-  const contracts = useMemo(() => db.getAll("contracts").items, []);
-  const equipment = useMemo(() => db.getAll("equipment").items, []);
+  const [error, setError] = useState("");
+  const jobs = useMemo(() => db.getAll("jobs").items, [dataVersion]);
+  const contracts = useMemo(() => db.getAll("contracts").items, [dataVersion]);
+  const equipment = useMemo(() => db.getAll("equipment").items, [dataVersion]);
+  const inventory = useMemo(() => db.getAll("inventory").items, [dataVersion]);
+  const trucks = equipment.filter(eq => eq.equipmentType === "Truck" || eq.equipmentType === "Semi");
 
   const updRow = (id, k, v) => setRows(r => r.map(x => (x.id === id ? { ...x, [k]: v } : x)));
   const delRow = id => setRows(r => r.filter(x => x.id !== id));
   const totalHours = rows.reduce((t, r) => t + hoursBetween(r.startTime, r.endTime), 0);
 
+  // Ticking a section opens it with one row already in it — nobody should have
+  // to tick a box and then hunt for an "add" button to say the obvious thing.
+  const toggleSection = (r, flag, listKey, blank) => {
+    const on = !r[flag];
+    setRows(list => list.map(x => (x.id !== r.id ? x
+      : { ...x, [flag]: on, [listKey]: on && x[listKey].length === 0 ? [blank()] : x[listKey] })));
+  };
+
+  // The job select carries the job's id, and the entry is filed under the job's
+  // TITLE. It used to be filed under the job's address, which is not what the
+  // field app does — so the same job logged from a desk and from a truck landed
+  // under two different names, and the billing filter only ever found one of them.
+  const pickJob = (r, id) => {
+    const j = jobs.find(x => x._id === id);
+    setRows(list => list.map(x => (x.id === r.id ? { ...x, jobId: id, jobName: j ? (j.jobTitle || "") : "" } : x)));
+  };
+
+  const rowEquip = r => (r.equipmentUse ? r.equipRows.filter(x => x.equipment && num(x.hours) > 0) : []);
+  const rowMats = r => (r.materialsUse ? r.materialRows.filter(x => String(x.item || "").trim() && num(x.qty) > 0) : []);
+  const rowLoads = r => (r.hauling ? r.loads.filter(x => x.truck && (x.yards || x.ticketNumber)) : []);
+  const rowHasSomething = r => !!(r.jobId || String(r.workDone || "").trim() || r.maintenance
+    || rowEquip(r).length || rowMats(r).length || rowLoads(r).length);
+
   const submit = () => {
-    const valid = rows.filter(r => r.jobLocation || r.workDone);
-    if (valid.length === 0) { window.alert("Fill in at least one row before submitting."); return; }
+    setError("");
+    const valid = rows.filter(rowHasSomething);
+    if (valid.length === 0) { setError("Fill in at least one row before submitting — pick a job, or describe the work."); return; }
+    const missingUnit = valid.find(r => r.maintenance && !String(r.maintUnit || "").trim());
+    if (missingUnit) { setError("Pick or enter the equipment unit for the maintenance."); return; }
+
     valid.forEach(r => {
       const hrs = hoursBetween(r.startTime, r.endTime);
+      const equip = rowEquip(r);
+      const mats = rowMats(r);
+      const loads = rowLoads(r);
       db.create("timeentries", {
         employeeName,
-        jobName: r.jobLocation,
+        jobName: r.jobName,
+        jobId: r.jobId,
         contract: r.contract,
         entryDate,
         hoursWorked: hrs,
@@ -5535,34 +5718,75 @@ function DailyLogPage() {
         endTime: r.endTime,
         workDescription: r.workDone,
         notes: r.notes,
-        equipmentUsed: r.equipment,
+        // Kept for the Work Logs table, which has always shown a name here. On a
+        // maintenance row it's the unit being worked on, same as the field app.
+        equipmentUsed: r.maintenance ? r.maintUnit : equip.map(x => x.equipment).join(", "),
         mileageDriven: num(r.mileage),
+        isMaintenance: !!r.maintenance,
+        maintUnit: r.maintUnit, maintMileage: r.maintMileage, maintHours: r.maintHours,
+        source: "desktop-daily-log",
       });
-      // The equipment picked for a row is assumed to have run for that row's
-      // hours — bills it and rolls the hours onto the equipment's total.
-      if (r.equipment) logEquipmentUsage({ equipmentName: r.equipment, hours: hrs, employeeName, entryDate, jobName: r.jobLocation, source: "desktop-daily-log" });
+
+      // A maintenance reading is an odometer/engine-hour snapshot: it OVERWRITES
+      // the machine's running totals rather than adding to them, which is what
+      // equipment usage below does instead. Same rule as the field app.
+      if (r.maintenance && r.maintUnit && (r.maintHours || r.maintMileage)) {
+        const eq = getCol("equipment").find(e => (e.equipmentName || "").trim() === r.maintUnit.trim());
+        if (eq) {
+          const patch = { ...eq, lastServiceDate: entryDate };
+          if (r.maintHours) patch.totalHours = num(r.maintHours);
+          if (r.maintMileage) patch.currentMileage = num(r.maintMileage);
+          db.update("equipment", patch);
+        }
+      }
+
+      loads.forEach(l => db.create("loads", {
+        employeeName, entryDate, jobId: r.jobId, jobName: r.jobName,
+        truck: l.truck, yards: num(l.yards), ticketNumber: l.ticketNumber,
+        source: "desktop-daily-log",
+      }));
+      equip.forEach(x => logEquipmentUsage({
+        equipmentName: x.equipment, hours: x.hours, employeeName, entryDate,
+        jobId: r.jobId, jobName: r.jobName, source: "desktop-daily-log",
+      }));
+      mats.forEach(m => logMaterialUse({
+        materialName: m.item, quantity: m.qty, unit: m.unit, unitPrice: m.price,
+        employeeName, entryDate, jobId: r.jobId, jobName: r.jobName, source: "desktop-daily-log",
+      }));
     });
-    setRows([newTimeRow()]);
+
+    notifyData();
+    setRows([newDailyRow()]);
     setMessage("Daily log submitted — " + valid.length + " entries saved.");
     setTimeout(() => setMessage(""), 3000);
   };
 
   const exportCSV = () => {
+    const summarise = (list, fn) => list.map(fn).join("; ");
     const rowsOut = [
       ["Date", entryDate],
       ["Employee", employeeName],
       [],
-      ["Job Location", "Contract", "Work Done", "Start", "End", "Hours", "Equipment", "Miles", "Notes"],
-      ...rows.map(r => [r.jobLocation, r.contract, r.workDone, r.startTime, r.endTime, hoursBetween(r.startTime, r.endTime).toFixed(2), r.equipment, r.mileage, r.notes]),
+      ["Job", "Contract", "Work Done", "Start", "End", "Hours", "Equipment Used", "Materials Used", "Loads Hauled", "Maintenance", "Miles", "Notes"],
+      ...rows.map(r => [
+        r.jobName, r.contract, r.workDone, r.startTime, r.endTime, hoursBetween(r.startTime, r.endTime).toFixed(2),
+        summarise(rowEquip(r), x => x.equipment + " " + num(x.hours).toFixed(2) + "h"),
+        summarise(rowMats(r), x => num(x.qty) + " " + (x.unit || "") + " " + x.item),
+        summarise(rowLoads(r), x => x.truck + " " + num(x.yards) + "yd" + (x.ticketNumber ? " #" + x.ticketNumber : "")),
+        r.maintenance ? r.maintUnit + (r.maintMileage ? " " + r.maintMileage + "km" : "") + (r.maintHours ? " " + r.maintHours + "hrs" : "") : "",
+        r.mileage, r.notes,
+      ]),
       [],
       ["", "", "TOTAL HOURS", totalHours.toFixed(2)],
     ];
     downloadFile("daily_log_" + entryDate + ".csv", toCSV(rowsOut), "text/csv;charset=utf-8");
   };
 
+  const sectionLbl = { display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 700, cursor: "pointer" };
+
   return (
     <div>
-      <PageHeader title="Daily Log" subtitle="Record daily work activities, hours, and equipment usage" />
+      <PageHeader title="Daily Log" subtitle="Record daily work, hours, equipment, materials and loads — the same log the field app files" />
       <Toast message={message} />
 
       <div style={{ ...card, marginBottom: 20 }}>
@@ -5582,10 +5806,10 @@ function DailyLogPage() {
         {rows.map(r => (
           <div key={r.id} style={{ background: C.surfaceAlt, borderRadius: 10, padding: 16, marginBottom: 10 }}>
             <div className="grid-2" style={{ gap: 12 }}>
-              <Field label="Job Location">
-                <select value={r.jobLocation} onChange={e => updRow(r.id, "jobLocation", e.target.value)} style={inputCls}>
-                  <option value="">Select job…</option>
-                  {jobsByClient(jobs).map(j => <option key={j._id} value={j.jobAddress || j.jobTitle}>{jobLabel(j)}</option>)}
+              <Field label="Job">
+                <select value={r.jobId} onChange={e => pickJob(r, e.target.value)} style={inputCls}>
+                  <option value="">No specific job</option>
+                  {jobsByClient(jobs).map(j => <option key={j._id} value={j._id}>{jobLabel(j)}</option>)}
                 </select>
               </Field>
               <Field label="Contract">
@@ -5601,24 +5825,74 @@ function DailyLogPage() {
               <Field label="Hours">
                 <div style={{ ...inputCls, width: 90, textAlign: "center", fontWeight: 700, color: C.accent }}>{hoursBetween(r.startTime, r.endTime).toFixed(1)}h</div>
               </Field>
-              <Field label="Equipment">
-                <select value={r.equipment} onChange={e => updRow(r.id, "equipment", e.target.value)} style={{ ...inputCls, width: 180 }}>
-                  <option value="">No equipment</option>
-                  {equipment.map(eq => <option key={eq._id} value={eq.equipmentName}>{eq.equipmentName}</option>)}
-                </select>
-              </Field>
               <Field label="Miles Driven"><input type="number" min="0" value={r.mileage} onChange={e => updRow(r.id, "mileage", e.target.value)} placeholder="0" style={{ ...inputCls, width: 110 }} /></Field>
             </div>
             <div className="grid-2" style={{ gap: 12 }}>
               <Field label="Work Done"><TextInput value={r.workDone} onChange={v => updRow(r.id, "workDone", v)} placeholder="Excavation, foundation work…" rows={2} /></Field>
               <Field label="Notes"><TextInput value={r.notes} onChange={v => updRow(r.id, "notes", v)} placeholder="Additional notes…" rows={2} /></Field>
             </div>
-            {rows.length > 1 && <button type="button" onClick={() => delRow(r.id)} style={{ ...btnDanger, fontSize: 11 }}>Remove Row</button>}
+
+            {/* Everything below is what the field app has always asked for and
+                this page never did. Same wording, same order, same records. */}
+            <div style={{ borderTop: "1px solid " + C.border, marginTop: 6, paddingTop: 12 }}>
+              <label style={sectionLbl}>
+                <input type="checkbox" checked={r.equipmentUse} onChange={() => toggleSection(r, "equipmentUse", "equipRows", emptyEquipRow)} style={{ accentColor: C.secondary, width: 16, height: 16 }} />
+                🚜 Equipment used on this job
+              </label>
+              {r.equipmentUse && (
+                <DLEquipmentEditor rows={r.equipRows} equipment={equipment} listId={"dl-equip-" + r.id}
+                  onChange={next => updRow(r.id, "equipRows", next)} />
+              )}
+
+              <label style={{ ...sectionLbl, marginTop: 12 }}>
+                <input type="checkbox" checked={r.materialsUse} onChange={() => toggleSection(r, "materialsUse", "materialRows", emptyMaterialRow)} style={{ accentColor: C.secondary, width: 16, height: 16 }} />
+                📦 Materials used
+              </label>
+              {r.materialsUse && (
+                <DLMaterialEditor rows={r.materialRows} inventory={inventory} listId={"dl-mat-" + r.id}
+                  onChange={next => updRow(r.id, "materialRows", next)} />
+              )}
+
+              <label style={{ ...sectionLbl, marginTop: 12 }}>
+                <input type="checkbox" checked={r.maintenance} onChange={e => updRow(r.id, "maintenance", e.target.checked)} style={{ accentColor: C.secondary, width: 16, height: 16 }} />
+                🔧 This is equipment maintenance
+              </label>
+              {r.maintenance && (
+                <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: 12, marginTop: 8 }}>
+                  <div className="row-wrap" style={{ gap: 12 }}>
+                    <Field label="Unit / Equipment" style={{ marginBottom: 0 }}>
+                      <input list={"dl-maint-" + r.id} value={r.maintUnit} onChange={e => updRow(r.id, "maintUnit", e.target.value)} placeholder="Unit number, or pick equipment" style={{ ...inputCls, width: 240 }} />
+                      <datalist id={"dl-maint-" + r.id}>{equipment.map(eq => <option key={eq._id} value={eq.equipmentName} />)}</datalist>
+                    </Field>
+                    <Field label="Mileage (km)" style={{ marginBottom: 0 }}>
+                      <input type="number" min="0" value={r.maintMileage} onChange={e => updRow(r.id, "maintMileage", e.target.value)} placeholder="0" style={{ ...inputCls, width: 130 }} />
+                    </Field>
+                    <Field label="Engine Hours" style={{ marginBottom: 0 }}>
+                      <input type="number" min="0" step="any" value={r.maintHours} onChange={e => updRow(r.id, "maintHours", e.target.value)} placeholder="0" style={{ ...inputCls, width: 130 }} />
+                    </Field>
+                  </div>
+                  <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>Describe the maintenance in “Work Done” above. The reading replaces the machine's running totals.</div>
+                </div>
+              )}
+
+              <label style={{ ...sectionLbl, marginTop: 12 }}>
+                <input type="checkbox" checked={r.hauling} onChange={() => toggleSection(r, "hauling", "loads", emptyLoadRow)} style={{ accentColor: C.secondary, width: 16, height: 16 }} />
+                🚛 Loads hauled
+              </label>
+              {r.hauling && (
+                <DLLoadEditor rows={r.loads} trucks={trucks} listId={"dl-truck-" + r.id}
+                  onChange={next => updRow(r.id, "loads", next)} />
+              )}
+            </div>
+
+            {rows.length > 1 && <button type="button" onClick={() => delRow(r.id)} style={{ ...btnDanger, fontSize: 11, marginTop: 12 }}>Remove Row</button>}
           </div>
         ))}
 
+        {error && <div style={{ background: "#FEF2F2", color: "#DC2626", padding: "10px 14px", borderRadius: 8, marginTop: 12, fontSize: 13 }}>{error}</div>}
+
         <div style={{ display: "flex", gap: 12, marginTop: 16, flexWrap: "wrap" }}>
-          {rows.length < 30 && <button type="button" onClick={() => setRows(r => [...r, newTimeRow()])} style={btnOutline}>+ Add Row</button>}
+          {rows.length < 30 && <button type="button" onClick={() => setRows(r => [...r, newDailyRow()])} style={btnOutline}>+ Add Row</button>}
           <button type="button" onClick={exportCSV} style={btnOutline}>📊 Export CSV</button>
           <button type="button" onClick={submit} style={btnSecondary}>Submit Daily Log</button>
         </div>
@@ -8690,6 +8964,18 @@ function canAccess(navId, user) {
 
 const QC_HISTORY_KEY = "bmb_qc_history";
 const QC_Speech = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+// How long dictation is given to prove it works, and then to hear a sentence.
+// A speech service that accepts .start() and never says anything again is a real
+// thing on a phone, so the mic is never left running on hope alone.
+const QC_MIC_START_MS = 4000;
+const QC_MIC_LISTEN_MS = 15000;
+// Detach every handler before tearing a recogniser down. Without this, abort()
+// fires onend/onerror on the way out and walks straight back into the teardown
+// that is already running.
+function qcSilenceMic(r) {
+  if (!r) return;
+  try { r.onresult = r.onerror = r.onend = r.onstart = r.onaudiostart = r.onaudioend = r.onspeechend = r.onnomatch = null; } catch (e) {}
+}
 
 const qcNorm = s => String(s == null ? "" : s)
   .replace(/[‘’]/g, "'").replace(/[“”]/g, '"')
@@ -10049,12 +10335,21 @@ function QuickCommand({ onClose }) {
   const inputRef = useRef(null);
   const recRef = useRef(null);
   const fileRef = useRef(null);
+  const micTimerRef = useRef(null);
 
   const ctx = { user, company, navigate, isMobile };
 
   useEffect(() => {
     const t = setTimeout(() => { if (inputRef.current) inputRef.current.focus(); }, 80);
-    return () => { clearTimeout(t); try { if (recRef.current) recRef.current.abort(); } catch (e) {} };
+    // Tear the recogniser down by hand rather than through stopListening — this
+    // runs on unmount, where setting state would be shouting at nobody.
+    return () => {
+      clearTimeout(t);
+      if (micTimerRef.current) clearTimeout(micTimerRef.current);
+      const r = recRef.current;
+      recRef.current = null;
+      if (r) { qcSilenceMic(r); try { r.abort(); } catch (e) {} }
+    };
   }, []);
 
   const interpret = (raw) => {
@@ -10125,22 +10420,76 @@ function QuickCommand({ onClose }) {
     setText("Photo — " + a.label.toLowerCase());
   };
 
+  // Dictation.
+  //
+  // This is written defensively on purpose. The browser's speech service will
+  // happily accept .start() on a phone — especially inside the installed app —
+  // and then never fire a single event back. The first version had no way out of
+  // that: the button was already showing "listening", so tapping it called
+  // .stop() on a recogniser that had never actually started, nothing came back,
+  // and the only way to get the command bar working again was to kill the app
+  // and reopen it. Every path below ends with the recogniser torn down and the
+  // button usable again, and a watchdog guarantees one of those paths is taken.
+  const stopListening = (msg) => {
+    if (micTimerRef.current) { clearTimeout(micTimerRef.current); micTimerRef.current = null; }
+    const r = recRef.current;
+    recRef.current = null;
+    if (r) {
+      qcSilenceMic(r);   // detach first, so the teardown can't call us back in
+      try { r.abort(); } catch (e) { try { r.stop(); } catch (e2) {} }
+    }
+    setListening(false);
+    if (msg) setError(msg);
+  };
+
+  // The watchdog. Re-armed once the mic actually opens, so a long sentence isn't
+  // cut off by the short "did this thing even start" timer.
+  const armMic = (ms, msg) => {
+    if (micTimerRef.current) clearTimeout(micTimerRef.current);
+    micTimerRef.current = setTimeout(() => { micTimerRef.current = null; stopListening(msg); }, ms);
+  };
+
   const listen = () => {
     if (!QC_Speech) return;
-    if (listening) { try { recRef.current && recRef.current.stop(); } catch (e) {} return; }
-    try {
-      const r = new QC_Speech();
-      recRef.current = r;
-      r.lang = navigator.language || "en-CA";
-      r.interimResults = false;
-      r.continuous = false;
-      r.maxAlternatives = 1;
-      r.onresult = e => { const said = e.results[0][0].transcript; setText(said); interpret(said); };
-      r.onerror = () => { setListening(false); setError("Couldn't hear that — check the microphone permission for this site."); };
-      r.onend = () => setListening(false);
-      setListening(true);
-      r.start();
-    } catch (e) { setListening(false); }
+    // A second tap always cancels — including when the recogniser has gone quiet
+    // on us and `listening` is the only thing still saying otherwise.
+    if (recRef.current || listening) { stopListening(); return; }
+
+    let r;
+    try { r = new QC_Speech(); }
+    catch (e) { stopListening("Dictation isn't available in this browser — type it instead."); return; }
+
+    recRef.current = r;
+    r.lang = navigator.language || "en-CA";
+    r.interimResults = false;
+    r.continuous = false;
+    r.maxAlternatives = 1;
+    // The mic is live, so the device clearly can do this — swap the short
+    // start-up watchdog for the longer one that covers actually speaking.
+    r.onaudiostart = () => { if (recRef.current === r) armMic(QC_MIC_LISTEN_MS, "Didn't catch that — try again, or type it."); };
+    r.onresult = e => {
+      let said = "";
+      try { said = e.results[0][0].transcript; } catch (err) { said = ""; }
+      stopListening();
+      if (said) { setText(said); interpret(said); }
+    };
+    r.onerror = e => {
+      const code = e && e.error;
+      stopListening(
+        code === "not-allowed" || code === "service-not-allowed"
+          ? "The microphone is blocked for this site — allow it in your browser settings, or type it instead."
+          : code === "no-speech" || code === "aborted"
+            ? "Didn't hear anything — try again, or type it."
+            : "Couldn't hear that — type it instead."
+      );
+    };
+    r.onend = () => { if (recRef.current === r) stopListening(); };
+
+    setError(""); setSuggestions([]);
+    setListening(true);
+    armMic(QC_MIC_START_MS, "Dictation didn't start on this device — type it instead.");
+    try { r.start(); }
+    catch (e) { stopListening("Dictation is still finishing the last try — give it a second."); }
   };
 
   /* One field of the review card. Every field is editable — the parse is a head
@@ -10215,7 +10564,13 @@ function QuickCommand({ onClose }) {
               >🎤</button>
             )}
           </div>
-          {listening && <div style={{ fontSize: 12.5, color: C.destructive, fontWeight: 700, marginTop: 8 }}>Listening… say what you want done.</div>}
+          {listening && (
+            <div style={{ fontSize: 12.5, color: C.destructive, fontWeight: 700, marginTop: 8 }}>
+              Listening… say what you want done.
+              <button type="button" onClick={() => stopListening()}
+                style={{ background: "none", border: "none", color: C.destructive, fontSize: 12.5, fontWeight: 800, textDecoration: "underline", cursor: "pointer", padding: "0 0 0 6px" }}>Stop</button>
+            </div>
+          )}
 
           <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
             <button
@@ -11764,7 +12119,154 @@ function MobileJob({ job, onClose, onLogJob }) {
   );
 }
 
+// ➕ Build a job from the phone.
+//
+// A job could only ever be created on the full website, which is the wrong way
+// round for how the work actually arrives: somebody rings while the truck is
+// moving, or the customer standing in the driveway asks for one more thing.
+// Making the crew wait until they're back at a desk means the job gets written
+// on a hand, and half of them never reach the system at all.
+//
+// It asks for exactly what the Jobs page asks for, in the same order, and writes
+// the same record — including the private-by-default visibility rule, which is
+// the one field where getting it wrong exposes work to the whole company.
+// Location reuses the desktop's LocationPicker (address search, legal land
+// description, or a GPS pin), because a crew standing on the site has the best
+// coordinates anyone is going to get.
+function MobileJobForm({ startDate, onSaved, onClose }) {
+  const { user } = useAuth();
+  useDataVersion();
+  const canPrivate = user?.isOwner || user?.role === "Owner" || user?.role === "Manager";
+  const clientNames = getCol("clients").map(c => c.clientName).filter(Boolean);
+  const expired = workersWithExpiredCerts();
+  const crewNames = getCol("employees").filter(e => e.isActive !== false).map(e => e.fullName).filter(Boolean);
+
+  const [form, setForm] = useState(() => ({
+    jobTitle: "", clientName: "", jobAddress: "",
+    startDate: startDate || today(), endDate: "",
+    jobStatus: workflowStages()[0] || "",
+    assignedEmployees: [], visibility: canPrivate ? "private" : "all",
+    mobilization: false, mobilizationCost: "", jobDescription: "",
+  }));
+  const [picking, setPicking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const toggleCrew = name => setForm(f => ({
+    ...f,
+    assignedEmployees: f.assignedEmployees.includes(name)
+      ? f.assignedEmployees.filter(n => n !== name)
+      : [...f.assignedEmployees, name],
+  }));
+
+  const save = () => {
+    if (!form.jobTitle.trim()) { setErr("Give the job a name first."); return; }
+    setBusy(true);
+    const rec = db.create("jobs", {
+      ...form,
+      jobTitle: form.jobTitle.trim(),
+      clientName: form.clientName.trim(),
+      mobilizationCost: form.mobilization ? num(form.mobilizationCost) : "",
+    });
+    notifyData();
+    setBusy(false);
+    if (onSaved) onSaved(rec);
+  };
+
+  return (
+    <div>
+      <button type="button" onClick={onClose}
+        style={{ background: "none", border: "none", color: C.accent, fontWeight: 700, fontSize: 14, cursor: "pointer", marginBottom: 8, padding: "4px 0" }}>
+        ‹ Cancel
+      </button>
+
+      <div style={mCard}>
+        <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 4 }}>{relabel("New job")}</div>
+        <div style={{ fontSize: 12, color: C.textMuted }}>{relabel("It shows up on the schedule and everywhere else the moment you save it.")}</div>
+
+        <label style={mLbl}>{relabel("Job name")} *</label>
+        <input value={form.jobTitle} onChange={e => set("jobTitle", e.target.value)} placeholder="Short name for the work" style={mInput} />
+
+        <label style={mLbl}>Client</label>
+        <input list="mj-clients" value={form.clientName} onChange={e => set("clientName", e.target.value)} placeholder="Type or pick a client" style={mInput} />
+        <datalist id="mj-clients">{clientNames.map((n, i) => <option key={i} value={n} />)}</datalist>
+
+        <label style={mLbl}>{relabel("Job location")}</label>
+        <input value={form.jobAddress} onChange={e => set("jobAddress", e.target.value)} placeholder="Site address, or a pin" style={mInput} />
+        <button type="button" onClick={() => setPicking(true)}
+          style={{ ...mBtn, background: C.surfaceAlt, color: C.text, border: "1px solid " + C.border, marginTop: 8, padding: "10px", fontSize: 13 }}>
+          🗺️ Find it — address, land location or GPS
+        </button>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1 }}><label style={mLbl}>Start</label><input type="date" value={form.startDate} onChange={e => set("startDate", e.target.value)} style={mInput} /></div>
+          <div style={{ flex: 1 }}><label style={mLbl}>End</label><input type="date" value={form.endDate} onChange={e => set("endDate", e.target.value)} style={mInput} /></div>
+        </div>
+
+        <label style={mLbl}>Status</label>
+        <select value={form.jobStatus} onChange={e => set("jobStatus", e.target.value)} style={mInput}>
+          {workflowStages().map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+
+        <label style={mLbl}>Crew</label>
+        {crewNames.length === 0
+          ? <div style={{ fontSize: 12, color: C.textMuted }}>Nobody on the roster yet — the office adds people on the Employees page.</div>
+          : (
+            <div style={{ background: C.surfaceAlt, borderRadius: 10, padding: 6 }}>
+              {crewNames.map(n => {
+                const on = form.assignedEmployees.includes(n);
+                return (
+                  <button key={n} type="button" onClick={() => toggleCrew(n)}
+                    style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", textAlign: "left", background: on ? C.surface : "transparent", border: "1px solid " + (on ? C.secondary : "transparent"), borderRadius: 8, padding: "10px 12px", marginBottom: 4, cursor: "pointer", fontSize: 14, color: C.text }}>
+                    <span style={{ fontSize: 15, color: on ? C.secondary : C.textMuted }}>{on ? "☑" : "☐"}</span>
+                    <span style={{ fontWeight: on ? 700 : 500 }}>{n}</span>
+                    {/* Assigning somebody with a lapsed ticket still goes through —
+                        only the office knows whether this job needs it — but it is
+                        said out loud, exactly as the desktop picker says it. */}
+                    {expired.has(n) && <span style={{ fontSize: 11, color: "#DC2626", fontWeight: 700 }}>⛔ expired cert</span>}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+        {canPrivate && (
+          <>
+            <label style={mLbl}>Who can see it</label>
+            <select value={form.visibility} onChange={e => set("visibility", e.target.value)} style={mInput}>
+              <option value="private">Private — owners, managers &amp; assigned crew</option>
+              <option value="all">Everyone in the company</option>
+            </select>
+          </>
+        )}
+
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+          <input type="checkbox" checked={form.mobilization} onChange={e => set("mobilization", e.target.checked)} style={{ accentColor: C.secondary, width: 18, height: 18 }} />
+          🚚 Charge a mobilization fee
+        </label>
+        {form.mobilization && (
+          <>
+            <label style={mLbl}>Mobilization cost ($)</label>
+            <input type="number" inputMode="decimal" value={form.mobilizationCost} onChange={e => set("mobilizationCost", e.target.value)} placeholder="e.g. 500" style={mInput} />
+          </>
+        )}
+
+        <label style={mLbl}>{relabel("What the job is")}</label>
+        <textarea value={form.jobDescription} onChange={e => set("jobDescription", e.target.value)} rows={3} placeholder="Project details…" style={{ ...mInput, resize: "vertical" }} />
+
+        {err && <div style={{ textAlign: "center", color: "#DC2626", fontSize: 13, marginTop: 12, fontWeight: 600 }}>{err}</div>}
+        <button type="button" onClick={save} disabled={busy} style={{ ...mBtn, background: C.secondary, color: "#fff", marginTop: 14, opacity: busy ? .6 : 1 }}>
+          {busy ? "Saving…" : relabel("Create job")}
+        </button>
+      </div>
+
+      {picking && <LocationPicker onPick={v => { set("jobAddress", v); setPicking(false); }} onClose={() => setPicking(false)} />}
+    </div>
+  );
+}
+
 function MobileSchedule({ onLogJob }) {
+  const { user } = useAuth();
   useDataVersion();
   const t = today();
   const [cursor, setCursor] = useState(() => new Date());
@@ -11772,6 +12274,9 @@ function MobileSchedule({ onLogJob }) {
   // Hold the id, not the record: the open job re-reads from the store on every
   // render, so a photo added on this screen doesn't leave a stale copy behind.
   const [openId, setOpenId] = useState(null);
+  const [creating, setCreating] = useState(false);
+  // Same gate as the sidebar's Jobs section — whoever may open jobs may add one.
+  const canAddJob = canAccess("jobs", user);
 
   const dated = getCol("jobs").filter(j => j.startDate);
   const jobs = jobsByClient(dated.filter(j => !jobIsDone(j)));
@@ -11795,6 +12300,15 @@ function MobileSchedule({ onLogJob }) {
 
   const open = openId ? getCol("jobs").find(j => j._id === openId) : null;
   if (open) return <MobileJob job={open} onClose={() => setOpenId(null)} onLogJob={onLogJob} />;
+  // A new job opens straight onto its own screen — the next thing anybody wants
+  // after writing one down is directions, a phone number, or a photo of it.
+  if (creating) return (
+    <MobileJobForm
+      startDate={sel}
+      onSaved={rec => { setCreating(false); setOpenId(rec._id); }}
+      onClose={() => setCreating(false)}
+    />
+  );
 
   return (
     <div>
@@ -11844,8 +12358,18 @@ function MobileSchedule({ onLogJob }) {
         </div>
       </div>
 
-      <div style={{ fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, color: sel === t ? C.secondary : C.textMuted, margin: "10px 2px 8px" }}>
-        {sel === t ? "Today · " : ""}{longDay(sel)}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, margin: "10px 2px 8px" }}>
+        <div style={{ fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, color: sel === t ? C.secondary : C.textMuted, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {sel === t ? "Today · " : ""}{longDay(sel)}
+        </div>
+        {/* Starts on whichever day is selected — the day you were looking at is
+            almost always the day the job is for. */}
+        {canAddJob && (
+          <button type="button" onClick={() => setCreating(true)}
+            style={{ flexShrink: 0, background: C.secondary, color: "#fff", border: "none", borderRadius: 10, padding: "8px 12px", fontSize: 13, fontWeight: 800, cursor: "pointer" }}>
+            ＋ {relabel("New job")}
+          </button>
+        )}
       </div>
       <ScheduleDayList dayStr={sel} jobs={jobsOnDay(jobs, spans, sel)} spans={spans} onOpenJob={j => setOpenId(j._id)} />
 

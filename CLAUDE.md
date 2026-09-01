@@ -432,6 +432,59 @@ from the add-on card on **Subscriptions** (route `#/setup`).
     identical is the whole requirement. Overflow goes to "+N more", and clicking
     any day opens the full list (`ScheduleDayList`, shared by the modal and the
     phone's day panel).
+- **The website's Daily Log asks exactly what the field app's daily log asks.**
+  They always wrote to the same collections, but not the same amount of them:
+  the phone could record equipment hours, materials fitted, loads hauled and a
+  maintenance reading, and `DailyLogPage` could record none of it — a day logged
+  from a desk was a thinner record than the same day logged from a truck, and
+  the difference came off the bill. The desktop page now carries the same four
+  sections, in the same order, under the same headings, and saves through the
+  same helpers (`logEquipmentUsage` / `logMaterialUse`, `loads`, the maintenance
+  patch onto the equipment record). `DLEquipmentEditor` / `DLMaterialEditor` /
+  `DLLoadEditor` are the desktop dress on the *same row shapes* the field app
+  uses (`emptyEquipRow` / `emptyMaterialRow` / `emptyLoadRow`) — if you add a
+  field to one side, add it to the other or they drift apart again.
+  - The desktop log used to file an entry under the job's **address**
+    (`jobAddress || jobTitle`); the field app has always filed it under the
+    **title**. The same job logged from both ended up under two names, and the
+    billing filter, the job checklist and the crew's own "logged today" list only
+    ever found one of them. The select now carries the job's id and the entry
+    stores `jobName` = title plus `jobId`. Old rows keep the address they were
+    saved with — nothing was rewritten.
+  - What is deliberately *not* on the desktop page: "find nearby site" (a GPS
+    match, meaningless at a desk) and photo attachment (that lives on the job
+    itself, on the Jobs page).
+- **Equipment is billed for its own hours, not the person's.** Both desktop entry
+  points used to assume a machine ran for exactly as long as whoever logged the
+  row worked, which is right by accident — a machine that ran two hours of an
+  eight hour day was billed for eight, and there was nowhere to say otherwise.
+  The Daily Log takes any number of machines each with their own hours; Time
+  Tracking has an **Equip. Hrs** column beside its equipment picker that falls
+  back to the row's hours when left blank, so nobody's existing habit changes.
+- **Dictation can hang, so it is on a watchdog.** The Quick Command mic used to
+  lock the command bar up: the browser's speech service will accept `.start()` on
+  a phone — especially inside the installed PWA — and then never fire a single
+  event, leaving the button showing "listening" while `.stop()` on a recogniser
+  that never started did nothing. The only way out was killing the app. Now
+  `stopListening()` is the one teardown path (detach every handler via
+  `qcSilenceMic` *before* aborting, or the abort walks back into the teardown
+  already running), a second tap always cancels, there is a visible **Stop**, and
+  `armMic` guarantees one of those paths is taken: `QC_MIC_START_MS` (4 s) to
+  prove the mic opens at all, re-armed to `QC_MIC_LISTEN_MS` (15 s) once
+  `onaudiostart` fires so a long sentence isn't cut off. Don't "simplify" this
+  back to trusting `onend`.
+- **A job can be built from the phone** (`MobileJobForm`, the ＋ New job button on
+  the field app's schedule). Jobs were website-only, which is the wrong way round
+  for how work actually arrives — somebody rings while the truck is moving — so it
+  got written on a hand and half of them never reached the system. It asks for
+  what the Jobs page asks for, in the same order, and writes the same record,
+  **including private-by-default visibility** (owners/managers only, same as the
+  desktop form) and the `⛔ expired cert` marking in the crew picker. Location
+  reuses the desktop's `LocationPicker` — address search, legal land description
+  or a GPS pin — because a crew standing on the site has the best coordinates
+  anyone is going to get. It starts on whichever day was selected on the calendar,
+  and saving opens the new job's screen, since the next thing anybody wants is
+  directions or a photo.
 
 ---
 
