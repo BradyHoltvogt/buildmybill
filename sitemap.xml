@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One real URL. The app is a single page behind hash routing (#/jobs, #/quotes…),
+     and hash fragments are not separate URLs to a search engine, so listing them
+     would be listing the same page six times. When a genuine second page exists
+     (a real /pricing, a features page), add it here. -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://www.buildmybill.com/</loc>
+    <lastmod>2026-09-13</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>

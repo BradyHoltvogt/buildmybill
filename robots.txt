@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+
+# The app's own vendored libraries are not content. Crawling them wastes the
+# crawl budget on 2 MB of React and a language model for the OCR.
+Disallow: /vendor/
+
+Sitemap: https://www.buildmybill.com/sitemap.xml

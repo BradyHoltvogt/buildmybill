@@ -4,6 +4,46 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>BuildMyBill — Business Management Built Around Your Trade</title>
+
+<!-- ── Findability (see Brady Brain/agents/sign-shop.md, lane A) ──
+     None of this changes how the app behaves. It is what a search engine and a
+     link preview read, and before it existed there was nothing for either to read:
+     the whole page is drawn by JavaScript after load. -->
+<meta name="description" content="Quotes, invoices, time tracking, jobs and safety forms for small trades and construction businesses — plus a field app your crew runs on their phone." />
+<link rel="canonical" href="https://www.buildmybill.com/" />
+<meta name="robots" content="index, follow" />
+
+<!-- Link preview card: Facebook, Instagram, iMessage, WhatsApp, LinkedIn.
+     These scrapers do NOT run JavaScript, so without these tags a pasted link
+     shows the bare URL and nothing else. -->
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="BuildMyBill" />
+<meta property="og:url" content="https://www.buildmybill.com/" />
+<meta property="og:title" content="BuildMyBill — Business Management Built Around Your Trade" />
+<meta property="og:description" content="Quotes, invoices, time tracking, jobs and safety forms for small trades and construction businesses — plus a field app your crew runs on their phone." />
+<meta property="og:image" content="https://www.buildmybill.com/og-image.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="BuildMyBill — Build My Bill. Run Your Business." />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="BuildMyBill — Business Management Built Around Your Trade" />
+<meta name="twitter:description" content="Quotes, invoices, time tracking, jobs and safety forms for small trades and construction businesses — plus a field app your crew runs on their phone." />
+<meta name="twitter:image" content="https://www.buildmybill.com/og-image.png" />
+
+<!-- Structured data. Only facts that are true of the app today: no ratings,
+     no customer counts, no prices. Nothing here is claimed that CLAUDE.md
+     does not already say. -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "BuildMyBill",
+  "url": "https://www.buildmybill.com/",
+  "applicationCategory": "BusinessApplication",
+  "operatingSystem": "Web browser, iOS and Android (installable web app)",
+  "description": "Business management for small trades and construction businesses: quotes, invoices, client records, jobs, time tracking, daily logs, safety forms, equipment, inventory and scheduling, with a phone-first field app for crews."
+}
+</script>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2316A34A'/><text x='16' y='23' font-size='20' font-family='system-ui' font-weight='800' fill='white' text-anchor='middle'>B</text></svg>" />
 <!-- PWA / installable field app -->
 <link rel="manifest" href="manifest.webmanifest" />
@@ -167,6 +207,35 @@
     <div class="msg">Starting BuildMyBill…</div>
   </div>
   <div id="root"></div>
+
+  <!-- Crawlable fallback. The landing page above is drawn by React after load, so a
+       crawler that does not run JavaScript sees an empty page. This is the same copy
+       as the real hero and feature cards — if you change one, change the other, or
+       the site starts saying two different things. It is never shown to a visitor
+       whose browser runs JS, which is all of them. -->
+  <noscript>
+    <h1>BuildMyBill — Build My Bill. Run Your Business.</h1>
+    <p>Quotes, invoices, time tracking, jobs, equipment, inventory and safety checks —
+       one platform, set up around the way your business actually works.</p>
+    <h2>One platform. Every tool.</h2>
+    <ul>
+      <li><strong>Quotes &amp; Invoices</strong> — line items, tax, discounts and one-click PDF printing.</li>
+      <li><strong>Job Management</strong> — every project from start to finish: addresses, timelines, clients, crew.</li>
+      <li><strong>Time Tracking</strong> — daily hours, equipment usage and mileage, exported to CSV.</li>
+      <li><strong>Client &amp; Team</strong> — clients, employees and subcontractors in one place.</li>
+      <li><strong>Inventory &amp; Equipment</strong> — stock across warehouses and your whole equipment fleet.</li>
+      <li><strong>Safety &amp; Compliance</strong> — vehicle checklists, safety forms and manager log books built in.</li>
+    </ul>
+    <h2>Not a one-size-fits-all app</h2>
+    <p>Construction, lawn care, plumbing, cleaning, hauling, a law office — same platform,
+       set up differently for each. Three questions at signup and it reshapes itself
+       around your business.</p>
+    <h2>Built for the field</h2>
+    <p>An installable phone app for crews: clock in and out, log the day, take job photos,
+       file safety forms with no signal, and see the schedule — without calling the office.</p>
+    <p>This page needs JavaScript to run the app itself. Visit
+       <a href="https://www.buildmybill.com/">www.buildmybill.com</a> in any modern browser.</p>
+  </noscript>
 
   <script src="vendor/react.production.min.js"></script>
   <script src="vendor/react-dom.production.min.js"></script>
