@@ -473,6 +473,35 @@ from the add-on card on **Subscriptions** (route `#/setup`).
   prove the mic opens at all, re-armed to `QC_MIC_LISTEN_MS` (15 s) once
   `onaudiostart` fires so a long sentence isn't cut off. Don't "simplify" this
   back to trusting `onend`.
+- **Nothing on the boot path is allowed to wait forever.** The whole app is behind
+  one gate — the first auth check — and `setReady(true)` used to be reachable *only*
+  from inside `supa.auth.onAuthStateChange`. That callback is not guaranteed to fire:
+  on startup supabase-js refreshes the stored token before it reports anything, and
+  if that call never comes back (backend unreachable or paused, phone offline, wifi
+  that accepts the connection and then sits on it) no event is ever emitted and the
+  app sits on "Starting BuildMyBill…" until it is force-quit. Offline was the worst
+  of it — the field app is built to work with no signal, and a crew in a pit could
+  not get past the splash to the safety forms already queued on their own phone.
+  - `BOOT_AUTH_MS` (10 s) is a watchdog in `AuthProvider`: if the listener hasn't
+    reported by then, the boot is decided from `storedSession()` — the
+    `sb-<ref>-auth-token` row read straight out of storage, because at that point
+    asking the library anything goes back through the machinery that just failed.
+    A still-valid token carries on into `bootstrap()`; anything else lands on the
+    sign-in screen with `bootStalled` set, which says why. It never races the normal
+    path (`heard` short-circuits it) and a late event is handled exactly as before,
+    so a slow-but-working connection self-heals.
+  - `BOOT_DATA_MS` (45 s) wraps the three bootstrap queries in `withTimeout`, so
+    "Loading your company data…" can't hang the same way.
+  - `FullScreenLoader` grows a **Try again / Sign in again** pair after
+    `LOADER_SLOW_MS`, and the pre-React `#boot` div has its own 15 s version for the
+    case where a vendor script never loads. "Sign in again" is `hardResetSession()`,
+    which drops the stored token itself rather than calling `signOut()` — signOut is
+    a network call, and the network not answering is the reason we're on that screen.
+  - Don't "simplify" any of this back to trusting the callback. Verified against five
+    boot states (signed out; expired token + dead backend; expired token + offline;
+    valid token + dead backend; valid token + offline) — the last four all hung
+    forever before, and all four now reach a screen with buttons on it in ~10 s.
+
 - **A job can be built from the phone** (`MobileJobForm`, the ＋ New job button on
   the field app's schedule). Jobs were website-only, which is the wrong way round
   for how work actually arrives — somebody rings while the truck is moving — so it

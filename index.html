@@ -205,8 +205,27 @@
   <div id="boot">
     <div class="logo">B</div>
     <div class="msg">Starting BuildMyBill…</div>
+    <div id="boot-stuck" style="display:none; max-width:320px; text-align:center; font-size:13px; line-height:1.6; opacity:.85">
+      The app didn't finish loading. This is almost always a connection that
+      dropped part-way through.
+      <div style="margin-top:14px">
+        <button type="button" onclick="location.reload()"
+          style="padding:10px 18px; border-radius:10px; border:none; background:#16A34A; color:#fff; font-weight:700; font-size:14px; cursor:pointer">Try again</button>
+      </div>
+    </div>
   </div>
   <div id="root"></div>
+
+  <script>
+    /* This screen is shown before a single line of the app has run, so if one of
+       the scripts below fails to load there is nothing left to clear it — the
+       splash simply stays up. Put a way out on it. (The app's own loading screen,
+       which looks the same, has its own version of this once React is running.) */
+    setTimeout(function () {
+      var stuck = document.getElementById("boot-stuck");
+      if (stuck && document.getElementById("boot")) stuck.style.display = "block";
+    }, 15000);
+  </script>
 
   <!-- Crawlable fallback. The landing page above is drawn by React after load, so a
        crawler that does not run JavaScript sees an empty page. This is the same copy
@@ -310,6 +329,80 @@ const storage = {
   set(key, v) { try { localStorage.setItem(key, v); return true; } catch { return false; } },
   remove(key) { try { localStorage.removeItem(key); } catch {} },
 };
+
+/* ─── Boot safety net ────────────────────────────────────────────────────────
+   Every screen in this app is behind one gate: the first auth check. That check
+   used to have no way of failing — if the network call it depends on never came
+   back, the splash screen stayed up forever and there was nothing on it to press.
+   A dead cell signal, a paused backend or a captive-portal wifi all landed the
+   same way: "Starting BuildMyBill…" and nothing else, for good.
+
+   So nothing on the boot path is allowed to wait forever. Anything that can hang
+   is raced against a clock, and when the clock wins we fall back to what we can
+   read locally and let the person into a screen with buttons on it. */
+const BOOT_AUTH_MS = 10000;   // first auth check — generous, a slow phone still wins
+const BOOT_DATA_MS = 45000;   // company data load — a big company is a big query
+const LOADER_SLOW_MS = 10000; // when the loader starts offering a way out
+
+class TimeoutError extends Error {}
+
+// Race a promise against a clock. The promise is NOT cancelled (fetch can't be) —
+// it simply stops being the thing we wait on.
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new TimeoutError((label || "That") + " took too long to respond")), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/* The session supabase-js keeps in storage, read directly. Used only when the
+   library's own startup didn't report back — at that point asking it anything
+   goes through the same machinery that just failed to answer. The key is
+   `sb-<project ref>-auth-token`; we match the shape rather than rebuild it, so
+   this keeps working if the ref or the library's naming ever changes. */
+function storedAuthKeys() {
+  const keys = [];
+  [localStorage, sessionStorage].forEach(store => {
+    try {
+      for (let i = 0; i < store.length; i++) {
+        const k = store.key(i);
+        if (/^sb-.*-auth-token$/.test(k || "")) keys.push([store, k]);
+      }
+    } catch (e) {}
+  });
+  return keys;
+}
+
+function storedSession() {
+  for (const [store, k] of storedAuthKeys()) {
+    try {
+      const raw = store.getItem(k);
+      if (!raw) continue;
+      const sess = JSON.parse(raw);
+      if (sess && sess.access_token && sess.user && sess.user.id) return sess;
+    } catch (e) {}
+  }
+  return null;
+}
+
+// Treat "about to expire" as expired: a token with seconds left can't survive the
+// refresh we already know we can't reach the server to do.
+function sessionUsable(sess) {
+  if (!sess) return false;
+  const exp = Number(sess.expires_at || 0);
+  return !exp || exp * 1000 > Date.now() + 30000;
+}
+
+// The escape hatch. signOut() is a network call, and the whole reason we're here
+// is that the network isn't answering — so drop the stored session ourselves and
+// reload into a clean sign-in.
+function hardResetSession() {
+  storedAuthKeys().forEach(([store, k]) => { try { store.removeItem(k); } catch (e) {} });
+  window.location.reload();
+}
 
 const COLLECTIONS = [
   "quotes", "clients", "jobs", "employees", "subcontractors", "equipment",
@@ -1446,6 +1539,7 @@ function AuthProvider({ children }) {
   const [noAccess, setNoAccess] = useState(false); // signed in but no membership (removed/denied)
   const [ready, setReady] = useState(false);       // first auth check finished
   const [dataReady, setDataReady] = useState(false); // records loaded for this session
+  const [bootStalled, setBootStalled] = useState(false); // first auth check never answered
   const companyRef = useRef(null);
   companyRef.current = company;
   // The company's wording, stages and sections have to be live BEFORE anything
@@ -1463,7 +1557,8 @@ function AuthProvider({ children }) {
     const loadData = async () => {
       let prof = null;
       for (let attempt = 0; attempt < 4 && !prof; attempt++) {
-        const { data, error } = await supa.from("profiles").select("*").eq("id", sess.user.id).maybeSingle();
+        const { data, error } = await withTimeout(
+          supa.from("profiles").select("*").eq("id", sess.user.id).maybeSingle(), BOOT_DATA_MS, "Your account");
         if (error) throw error;
         prof = data;
         if (!prof) await new Promise(r => setTimeout(r, 500)); // signup trigger race — retry
@@ -1476,10 +1571,11 @@ function AuthProvider({ children }) {
       // (A missing status — e.g. before the team migration runs — counts as active.)
       if (prof.status && prof.status !== "active") { CURRENT_COMPANY_ID = null; clearStore(); setCompany(null); setDataReady(true); return; }
       CURRENT_COMPANY_ID = prof.company_id;
-      const { data: comp, error: cErr } = await supa.from("companies").select("*").eq("id", prof.company_id).maybeSingle();
+      const { data: comp, error: cErr } = await withTimeout(
+        supa.from("companies").select("*").eq("id", prof.company_id).maybeSingle(), BOOT_DATA_MS, "Your company");
       if (cErr) throw cErr;
       setCompany(comp ? companyRowToApp(comp) : { id: prof.company_id, companyName: "My Company" });
-      await loadAllRecords();
+      await withTimeout(loadAllRecords(), BOOT_DATA_MS, "Your company data");
       // Everyone who can sign in belongs on the employee roster — otherwise the
       // hours they clock have no one to attach to (see syncTeamRoster). An
       // owner/manager syncs the whole team; anyone else only ensures their own
@@ -1504,7 +1600,12 @@ function AuthProvider({ children }) {
     };
     const fail = (e) => {
       console.error("bootstrap failed:", e);
-      window.alert("Could not load your account data: " + (e.message || e) + "\nTry signing out and back in.");
+      // Say which of the two it is. "Your account is broken" when the wifi dropped
+      // sends people to the wrong problem entirely.
+      const offline = e instanceof TimeoutError || !navigator.onLine || /failed to fetch|networkerror|load failed/i.test(String(e && e.message));
+      window.alert(offline
+        ? "Couldn't reach the server, so your data isn't loaded.\nCheck your connection and reload the page."
+        : "Could not load your account data: " + (e.message || e) + "\nTry signing out and back in.");
       setDataReady(true); // let the app render rather than hang
     };
 
@@ -1524,7 +1625,10 @@ function AuthProvider({ children }) {
 
   useEffect(() => {
     let lastUserId = null;
+    let heard = false; // has the auth library reported its first result yet?
+
     const { data: sub } = supa.auth.onAuthStateChange((event, sess) => {
+      heard = true;
       setSession(sess);
       const uid = sess?.user?.id || null;
       if (event === "SIGNED_OUT" || !uid) {
@@ -1541,7 +1645,42 @@ function AuthProvider({ children }) {
         setReady(true);
       }
     });
-    return () => { sub.subscription.unsubscribe(); };
+
+    /* The listener above is the ONLY thing that clears the splash screen, and it
+       is not guaranteed to fire. On startup the auth library refreshes a stored
+       token before it reports anything; if that call never comes back — backend
+       unreachable, phone offline, wifi that accepts the connection and then sits
+       on it — no event is ever emitted and the app waits at "Starting
+       BuildMyBill…" until it's force-quit. Offline was the worst of it: the field
+       app is built to work with no signal, and a crew in a pit couldn't get past
+       the splash to reach the safety forms already queued on their phone.
+
+       So we give it a deadline. If nothing has been heard by then we decide the
+       boot ourselves from the session in storage. This never races the normal
+       path: if the library answers first, `heard` is set and this does nothing —
+       and if it answers late, its event arrives to a mounted app and is handled
+       exactly as it would have been. */
+    const watchdog = setTimeout(() => {
+      if (heard) return;
+      const sess = storedSession();
+      console.warn("Auth startup didn't report in " + BOOT_AUTH_MS + "ms — continuing from stored session.");
+      if (sessionUsable(sess)) {
+        // The saved token is still valid, so it doesn't need the refresh that
+        // just failed. Carry on and load: bootstrap has its own timeouts.
+        setBootStalled(false);
+        setSession(sess);
+        lastUserId = sess.user.id;
+        setDataReady(false);
+        bootstrap(sess).finally(() => setReady(true));
+      } else {
+        // No usable session to go on. Show the sign-in screen with a word about
+        // why — landing on it unannounced looks like being silently logged out.
+        setBootStalled(true);
+        setReady(true);
+      }
+    }, BOOT_AUTH_MS);
+
+    return () => { clearTimeout(watchdog); sub.subscription.unsubscribe(); };
   }, []);
 
   useEffect(() => { applyBranding(company); }, [company]);
@@ -1646,7 +1785,7 @@ function AuthProvider({ children }) {
 
   return (
     <AuthCtx.Provider value={{
-      user, isAuthenticated: !!session, pending, noAccess, ready, dataReady,
+      user, isAuthenticated: !!session, pending, noAccess, ready, dataReady, bootStalled,
       login, signup, logout, refresh, checkCompanyCode,
       fetchTeam, approveMember, removeMember, setMemberRole, setMemberPermissions,
     }}>
@@ -8237,7 +8376,7 @@ const FEATURES = [
 ];
 
 function LoginPage() {
-  const { login, signup, checkCompanyCode } = useAuth();
+  const { login, signup, checkCompanyCode, bootStalled } = useAuth();
   const [showModal, setShowModal] = useState(false);
   const [isRegister, setIsRegister] = useState(false);
   const [joinMode, setJoinMode] = useState(false);          // register: join existing vs create new
@@ -8322,6 +8461,16 @@ function LoginPage() {
           <button type="button" onClick={() => open(true)} style={{ ...s.btnGreen, padding: "9px 20px", fontSize: 14 }}>Get Started Free</button>
         </div>
       </nav>
+
+      {/* The boot watchdog gave up waiting for the server and sent us here. Somebody
+          who was signed in a minute ago deserves to be told that, rather than being
+          left to conclude the app forgot them. */}
+      {bootStalled && (
+        <div style={{ background: "#FEF3C7", borderBottom: "1px solid #FDE68A", color: "#92400E", padding: "12px 5%", fontSize: 14, lineHeight: 1.5 }}>
+          <strong>Couldn't reach the server.</strong> Your saved sign-in couldn't be checked, so you're back at the start.
+          Check your internet connection and sign in again.
+        </div>
+      )}
 
       <section style={s.hero}>
         <div style={s.heroTag}>Business Management, Shaped To Your Trade</div>
@@ -10899,11 +11048,35 @@ const PAGES = {
   profile: () => <ProfilePage />,
 };
 
+/* The loading screen is the one screen a person can get trapped on, so after a
+   few seconds it stops being a spinner and starts being a way out. The watchdog
+   in AuthProvider should mean nobody ever waits this long — this is the backstop
+   to the backstop, and it costs one timer. */
 function FullScreenLoader({ label }) {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setSlow(true), LOADER_SLOW_MS);
+    return () => clearTimeout(t);
+  }, []);
+  const btn = { padding: "10px 18px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.35)", background: "transparent", color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer" };
   return (
-    <div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, background: C.primary, color: "#fff", fontFamily: "system-ui, sans-serif" }}>
+    <div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, padding: 24, background: C.primary, color: "#fff", fontFamily: "system-ui, sans-serif", textAlign: "center" }}>
       <div style={{ width: 56, height: 56, borderRadius: 14, background: C.secondary, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26, fontWeight: 800 }}>B</div>
       <div style={{ fontSize: 13, opacity: 0.6 }}>{label}</div>
+      {slow && (
+        <div style={{ marginTop: 18, maxWidth: 340 }}>
+          <div style={{ fontSize: 13, opacity: 0.85, lineHeight: 1.6, marginBottom: 14 }}>
+            This is taking longer than it should — usually a dropped connection.
+          </div>
+          <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+            <button type="button" style={{ ...btn, background: C.secondary, border: "none" }} onClick={() => window.location.reload()}>Try again</button>
+            <button type="button" style={btn} onClick={hardResetSession}>Sign in again</button>
+          </div>
+          <div style={{ fontSize: 11, opacity: 0.5, marginTop: 12, lineHeight: 1.5 }}>
+            "Sign in again" clears this device's saved login. Nothing on your account is deleted.
+          </div>
+        </div>
+      )}
     </div>
   );
 }
