@@ -198,6 +198,14 @@
     font-size: 26px; font-weight: 800;
   }
   #boot .msg { font-size: 13px; opacity: .6; }
+  /* Shown only by the boot watchdog, when the app never mounted. */
+  #boot.failed .logo { background: #B91C1C; }
+  #boot .fail-msg { font-size: 13px; opacity: .75; max-width: 280px; text-align: center; }
+  #boot button {
+    margin-top: 4px; padding: 9px 18px; border: 0; border-radius: 8px;
+    background: #16A34A; color: #fff; font-size: 14px; font-weight: 600;
+    font-family: inherit; cursor: pointer;
+  }
 </style>
 <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
 </head>
@@ -207,6 +215,100 @@
     <div class="msg">Starting BuildMyBill…</div>
   </div>
   <div id="root"></div>
+
+  <!-- Boot watchdog. Deliberately plain JavaScript in its own script tag, OUTSIDE the
+       inline text/babel block further down — that is the entire point of it. If the
+       Babel script fails to compile, nothing inside it runs, including its last line,
+       which is what removes the boot splash above. The live site would then sit on
+       "Starting BuildMyBill…" forever, and a spinner reads as "loading", so people wait
+       instead of reloading. Keep it dependency-free and keep it out of the Babel block;
+       a watchdog that dies with the thing it is watching is no watchdog.
+
+       It waits for the vendor scripts rather than racing a fixed clock from page start.
+       A crew on one bar of rural signal can legitimately still be downloading React,
+       Babel and a 500KB inline script well past any timeout worth setting, and telling
+       them it failed when it was only slow is worse than saying nothing — that is the
+       exact person this is here to protect. So the countdown starts at the window load
+       event, when the network is finished and only compiling and rendering are left.
+       Slow downloads cost the visitor nothing; a genuine failure still gets caught.
+
+       BOOT_HANG_MS is the backstop for the other case: load never fires at all because
+       a request is hanging. Whichever fires first wins, and it only ever reports once. -->
+  <script>
+    (function () {
+      var BOOT_GRACE_MS = 30000;  // after everything has downloaded
+      var BOOT_HANG_MS  = 120000; // absolute, for when the download never finishes
+      var reported = false;
+
+      // The globals the app cannot start without. If one of these is missing the
+      // browser never got the file, which is a different problem from code that
+      // arrived and would not run — and it deserves different advice.
+      function missingVendors() {
+        var need = { React: window.React, ReactDOM: window.ReactDOM, Babel: window.Babel };
+        var missing = [];
+        for (var k in need) { if (!need[k]) missing.push(k); }
+        return missing;
+      }
+
+      function check() {
+        if (reported) return;
+        var root = document.getElementById("root");
+        if (root && root.firstChild) return; // the app mounted - nothing to do
+        reported = true;
+
+        var stalled = missingVendors().length > 0;
+
+        // Normally the splash is still here, because the line that removes it never
+        // ran. If it did run and the render died after it, put one back so the visitor
+        // gets a message instead of a blank page.
+        var boot = document.getElementById("boot");
+        if (!boot) {
+          boot = document.createElement("div");
+          boot.id = "boot";
+          boot.innerHTML = '<div class="logo">B</div>';
+          document.body.appendChild(boot);
+        }
+        boot.className = "failed";
+
+        var msg = boot.querySelector(".msg");
+        if (!msg) {
+          msg = document.createElement("div");
+          msg.className = "msg";
+          boot.appendChild(msg);
+        }
+        msg.textContent = stalled
+          ? "BuildMyBill couldn't finish loading."
+          : "BuildMyBill couldn't start.";
+
+        var hint = document.createElement("div");
+        hint.className = "fail-msg";
+        hint.textContent = stalled
+          ? "It looks like the connection dropped partway. Move somewhere with signal and try again."
+          : "Something went wrong loading the app. Try again, and if it keeps happening let the office know.";
+        boot.appendChild(hint);
+
+        var btn = document.createElement("button");
+        btn.id = "boot-reload";
+        btn.type = "button";
+        btn.textContent = "Reload";
+        btn.onclick = function () { window.location.reload(); };
+        boot.appendChild(btn);
+      }
+
+      // The normal path: everything has arrived, so anything still missing after the
+      // grace period is the code's fault, not the connection's.
+      if (document.readyState === "complete") {
+        window.setTimeout(check, BOOT_GRACE_MS);
+      } else {
+        window.addEventListener("load", function () {
+          window.setTimeout(check, BOOT_GRACE_MS);
+        });
+      }
+
+      // The backstop: load never fired, so nothing above is ever scheduled.
+      window.setTimeout(check, BOOT_HANG_MS);
+    })();
+  </script>
 
   <!-- Crawlable fallback. The landing page above is drawn by React after load, so a
        crawler that does not run JavaScript sees an empty page. This is the same copy
