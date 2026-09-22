@@ -987,10 +987,24 @@ const bmbMedia = {
     // Downscaled photos are always jpeg; videos keep their real extension.
     const ext = isImage ? "jpg" : ((file.name.split(".").pop() || "bin").toLowerCase().replace(/[^a-z0-9]/g, ""));
     const contentType = isImage ? "image/jpeg" : (file.type || undefined);
+    const type = (file.type || "").startsWith("video") ? "video" : "image";
+
+    // A photo attached with no signal used to just fail. Only photos get the
+    // offline path (see the photo queue below downscaleImage's other callers) -
+    // a video isn't small enough to hold as a data URL, so it still fails
+    // visibly rather than silently blowing the queue's storage budget.
+    if (isImage && navigator.onLine === false) {
+      return queuePhotoUpload({ jobId, blob: body, name: file.name, uploader });
+    }
+
     const path = CURRENT_COMPANY_ID + "/" + jobId + "/" + uuid() + "." + ext;
     const { error } = await supa.storage.from(MEDIA_BUCKET).upload(path, body, { contentType, upsert: false });
-    if (error) throw error;
-    const type = (file.type || "").startsWith("video") ? "video" : "image";
+    if (error) {
+      // navigator.onLine said we had a connection and the upload still failed
+      // partway through - same fallback, just caught here instead of pre-empted.
+      if (isImage) return queuePhotoUpload({ jobId, blob: body, name: file.name, uploader });
+      throw error;
+    }
     return db.create("job_media", {
       jobId, path, type, name: file.name, size: body.size || file.size,
       customerVisible: false, uploadedBy: uploader?.id || null, uploadedByName: uploader?.name || "",
@@ -1221,6 +1235,93 @@ function startSafetySync() {
   window.addEventListener("online", () => { flushSafetyQueue(); });
   setInterval(() => { flushSafetyQueue(); }, 45000);
   flushSafetyQueue();
+}
+
+/* ── Offline photo queue ─────────────────────────────────────────────────────
+   Job photos used to go straight to Storage, one file at a time - offline, each
+   one just failed with its own "Couldn't upload" alert, nothing saved or queued
+   anywhere. Same mechanism as the Safety queue above (client-generated id reused
+   on retry, so a landed-but-unacknowledged push comes back 23505 and counts as
+   synced), but shaped differently: job_media is one ROW per photo, not several
+   files bundled into one submission, so each queued photo is independent from
+   the moment it's queued - one photo failing to sync can never affect another's.
+
+   Only photos, never videos: a downscaled jpeg (see downscaleImage) is small
+   enough to hold as a data URL inside the queue's ~4MB budget; a video is not,
+   so one offline still fails visibly rather than silently blowing that budget. */
+const PHOTO_QUEUE_KEY = "bmb_photo_queue";
+const PHOTO_QUEUE_MAX_BYTES = 4 * 1024 * 1024;
+
+function readPhotoQueue() { try { return JSON.parse(storage.get(PHOTO_QUEUE_KEY) || "[]"); } catch (e) { return []; } }
+function writePhotoQueue(q) { storage.set(PHOTO_QUEUE_KEY, JSON.stringify(q)); notifyData(); }
+// Pending photos for one job - what the gallery shows as "waiting to upload".
+function pendingPhotos(jobId) { return readPhotoQueue().filter(p => p.companyId === CURRENT_COMPANY_ID && p.jobId === jobId); }
+
+async function queuePhotoUpload({ jobId, blob, name, uploader }) {
+  const dataUrl = await blobToDataUrl(blob);
+  const id = uuid();
+  const item = {
+    id, companyId: CURRENT_COMPANY_ID, jobId, name, dataUrl, size: blob.size,
+    uploadedBy: uploader?.id || null, uploadedByName: uploader?.name || "",
+    queuedAt: new Date().toISOString(),
+  };
+  const q = readPhotoQueue().concat([item]);
+  if (JSON.stringify(q).length > PHOTO_QUEUE_MAX_BYTES) {
+    throw new Error("There are too many un-synced photos stored on this device. Get back in range so they can upload, then try again.");
+  }
+  writePhotoQueue(q);
+  flushPhotoQueue();
+  return { _id: id, jobId, type: "image", name, size: blob.size, _pending: true };
+}
+
+let photoFlushing = false;
+async function flushPhotoQueue() {
+  if (photoFlushing || !CURRENT_COMPANY_ID) return;
+  if (navigator.onLine === false) return;
+  const queued = readPhotoQueue().filter(p => p.companyId === CURRENT_COMPANY_ID);
+  if (!queued.length) return;
+  photoFlushing = true;
+  try {
+    for (const item of queued) {
+      try {
+        const blob = await dataUrlToBlob(item.dataUrl);
+        const path = item.companyId + "/" + item.jobId + "/" + uuid() + ".jpg"; // queued photos are always the downscaled jpeg
+        const { error: upErr } = await supa.storage.from(MEDIA_BUCKET).upload(path, blob, { contentType: "image/jpeg", upsert: false });
+        if (upErr) throw upErr;
+        const data = {
+          jobId: item.jobId, path, type: "image", name: item.name, size: item.size,
+          customerVisible: false, uploadedBy: item.uploadedBy, uploadedByName: item.uploadedByName,
+        };
+        const { error } = await supa.from("records").insert({ id: item.id, company_id: item.companyId, collection: "job_media", data });
+        if (error && error.code !== "23505") throw error; // 23505 → a previous try already landed it
+        writePhotoQueue(readPhotoQueue().filter(x => x.id !== item.id));
+        if (!(store.job_media || []).some(r => r._id === item.id)) {
+          const now = new Date().toISOString();
+          store.job_media.unshift({ ...data, _id: item.id, _createdDate: item.queuedAt || now, _updatedDate: now });
+        }
+        notifyData();
+      } catch (e) {
+        // Still offline, or the upload failed - leave everything queued and stop;
+        // the next online event or timer tick picks up where this left off.
+        const why = (e && (e.message || e.error_description)) || String(e);
+        console.warn("Photo still pending sync:", why);
+        writePhotoQueue(readPhotoQueue().map(x => (x.id === item.id
+          ? { ...x, attempts: (x.attempts || 0) + 1, lastError: why, lastTriedAt: new Date().toISOString() }
+          : x)));
+        break;
+      }
+    }
+  } finally {
+    photoFlushing = false;
+  }
+}
+
+function startPhotoSync() {
+  if (window.__bmbPhotoSync) return;
+  window.__bmbPhotoSync = true;
+  window.addEventListener("online", () => { flushPhotoQueue(); });
+  setInterval(() => { flushPhotoQueue(); }, 45000);
+  flushPhotoQueue();
 }
 
 /* ── Certifications ────────────────────────────────────────────────────────── */
@@ -2711,6 +2812,7 @@ function JobMediaGallery({ job }) {
   const bump = () => setTick(t => t + 1);
   const canAuthorize = user?.isOwner || user?.role === "Manager";
   const media = getCol("job_media").filter(m => m.jobId === job._id);
+  const pending = pendingPhotos(job._id); // queued with no signal yet - see the offline photo queue
   const [urls, setUrls] = useState({});
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
@@ -2733,13 +2835,19 @@ function JobMediaGallery({ job }) {
     const files = Array.from(fileList || []);
     if (!files.length) return;
     setBusy(true); setNote("");
-    let ok = 0;
+    let ok = 0, queued = 0;
     for (const file of files) {
-      try { await bmbMedia.upload(job._id, file, user); ok++; }
+      try {
+        const rec = await bmbMedia.upload(job._id, file, user);
+        if (rec && rec._pending) queued++; else ok++;
+      }
       catch (e) { window.alert("Couldn't upload " + file.name + ":\n" + (e.message || e)); }
     }
     setBusy(false);
-    setNote(ok ? ok + " file" + (ok > 1 ? "s" : "") + " uploaded." : "");
+    const parts = [];
+    if (ok) parts.push(ok + " file" + (ok > 1 ? "s" : "") + " uploaded");
+    if (queued) parts.push(queued + " photo" + (queued > 1 ? "s" : "") + " saved on this device — will upload once you're back in range");
+    setNote(parts.join(", ") + (parts.length ? "." : ""));
     bump();
     if (fileRef.current) fileRef.current.value = "";
   };
@@ -2765,14 +2873,30 @@ function JobMediaGallery({ job }) {
         </div>
       </div>
 
-      {media.length === 0
+      {pending.length > 0 && (
+        <div style={{ fontSize: 12, color: C.textMuted, background: C.surfaceAlt, borderRadius: 8, padding: "8px 12px", marginBottom: 10 }}>
+          ⏳ {pending.length} photo{pending.length > 1 ? "s" : ""} saved on this device, waiting for a connection to upload.
+        </div>
+      )}
+      {media.length === 0 && pending.length === 0
         ? <div style={{ fontSize: 13, color: C.textMuted, background: C.surfaceAlt, borderRadius: 8, padding: "16px", textAlign: "center" }}>
             No media yet. Add photos or videos to document this job — your crew can see them here as work progresses.
           </div>
         : (
           <>
-            {canAuthorize && <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 8 }}>Tick “Show to customer” on any photo to include it on quotes for this job. {shown > 0 && <strong>{shown} shared.</strong>}</div>}
+            {canAuthorize && media.length > 0 && <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 8 }}>Tick “Show to customer” on any photo to include it on quotes for this job. {shown > 0 && <strong>{shown} shared.</strong>}</div>}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 10 }}>
+              {pending.map(p => (
+                <div key={p.id} style={{ border: "1px dashed " + C.border, borderRadius: 10, overflow: "hidden", background: C.surfaceAlt, opacity: 0.75 }}>
+                  <div style={{ position: "relative", height: 120, background: "#0F172A", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <img src={p.dataUrl} alt={p.name || "Queued photo"} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                    <span style={{ position: "absolute", top: 6, left: 6, background: "#0F172A", color: "#fff", fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 20 }}>⏳ Waiting to upload</span>
+                  </div>
+                  <div style={{ padding: "7px 9px" }}>
+                    <div style={{ fontSize: 11, color: C.textMuted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={p.name}>🖼 {p.name || "Photo"}</div>
+                  </div>
+                </div>
+              ))}
               {media.map(m => {
                 const url = urls[m.path];
                 return (
@@ -11638,6 +11762,108 @@ function MobileLunchSheet({ grossMs, busy, onConfirm, onClose }) {
   );
 }
 
+/* ── Offline clock queue ──────────────────────────────────────────────────────
+   Clock in/out used to write straight through db.create/db.remove - fine for an
+   occasional blip, not for a crew with no signal for the length of a shift: the
+   background call fails, the optimistic write rolls back, an alert fires, and
+   the clock action is simply gone. This device's own "am I clocked in" state
+   (ACTIVE_CLOCK_KEY, below) kept showing clocked-in the whole time regardless,
+   since nothing told it the underlying record had vanished.
+
+   Same mechanism as the Safety and photo queues: a client-generated id reused
+   on every retry, so a push that actually landed just hits the primary key and
+   comes back 23505, counted as synced rather than a duplicate. Shaped as a
+   queue of OPERATIONS rather than rows, because a shift has two: clock-in
+   creates activeclocks, clock-out creates shifts and removes that activeclocks
+   row - using the same clockRecordId throughout, generated client-side at
+   clock-in, so clock-out can reference and remove it even if clock-in itself
+   hasn't reached the server yet. */
+const CLOCK_QUEUE_KEY = "bmb_clock_queue";
+
+function readClockQueue() { try { return JSON.parse(storage.get(CLOCK_QUEUE_KEY) || "[]"); } catch (e) { return []; } }
+function writeClockQueue(q) { storage.set(CLOCK_QUEUE_KEY, JSON.stringify(q)); notifyData(); }
+function pendingClockOps() { return readClockQueue().filter(o => o.companyId === CURRENT_COMPANY_ID); }
+
+// Queues a create and applies it to the local store immediately, same optimism
+// as db.create - so this device's own UI (today's hours, "who's clocked in")
+// is right, while the network write is retried in the background until it lands.
+function queueClockCreate(collection, data) {
+  const id = uuid();
+  const now = new Date().toISOString();
+  const rec = { ...data, _id: id, _createdDate: now, _updatedDate: now };
+  if (!store[collection]) store[collection] = [];
+  store[collection].unshift(rec);
+  writeClockQueue(readClockQueue().concat([{ id, op: "create", collection, data, companyId: CURRENT_COMPANY_ID, queuedAt: now }]));
+  flushClockQueue();
+  return rec;
+}
+
+// Queues a removal, applying the same optimistic splice db.remove uses.
+function queueClockRemove(collection, targetId) {
+  const arr = store[collection] || [];
+  const idx = arr.findIndex(i => i._id === targetId);
+  if (idx > -1) arr.splice(idx, 1);
+  writeClockQueue(readClockQueue().concat([{ id: uuid(), op: "remove", collection, targetId, companyId: CURRENT_COMPANY_ID, queuedAt: new Date().toISOString() }]));
+  flushClockQueue();
+}
+
+let clockFlushing = false;
+async function flushClockQueue() {
+  if (clockFlushing || !CURRENT_COMPANY_ID) return;
+  if (navigator.onLine === false) return;
+  const queued = readClockQueue().filter(o => o.companyId === CURRENT_COMPANY_ID);
+  if (!queued.length) return;
+  clockFlushing = true;
+  try {
+    for (const op of queued) {
+      try {
+        if (op.op === "create") {
+          const { error } = await supa.from("records").insert({ id: op.id, company_id: op.companyId, collection: op.collection, data: op.data });
+          if (error && error.code !== "23505") throw error;
+        } else if (op.op === "remove") {
+          const { error } = await supa.from("records").delete().eq("id", op.targetId);
+          if (error) throw error;
+        }
+        writeClockQueue(readClockQueue().filter(x => x.id !== op.id));
+      } catch (e) {
+        // Still offline, or the write failed - leave everything queued and stop
+        // here so ordering is preserved; the next online event or timer tick
+        // picks back up from this same operation.
+        const why = (e && (e.message || e.error_description)) || String(e);
+        console.warn("Clock entry still pending sync:", why);
+        writeClockQueue(readClockQueue().map(x => (x.id === op.id
+          ? { ...x, attempts: (x.attempts || 0) + 1, lastError: why, lastTriedAt: new Date().toISOString() }
+          : x)));
+        break;
+      }
+    }
+  } finally {
+    clockFlushing = false;
+  }
+}
+
+function startClockSync() {
+  if (window.__bmbClockSync) return;
+  window.__bmbClockSync = true;
+  window.addEventListener("online", () => { flushClockQueue(); });
+  setInterval(() => { flushClockQueue(); }, 45000);
+  flushClockQueue();
+}
+
+// Fire-and-forget, no retry, no alert - a live-trail ping is only ever "nice to
+// have while it's current," not a record that has to survive no signal. Missing
+// one while offline isn't worth the scary "Couldn't save to the server" dialog
+// db.create would raise for it, unlike the clock action itself above.
+function silentPing(collection, data) {
+  if (navigator.onLine === false || !CURRENT_COMPANY_ID) return;
+  const id = uuid();
+  const now = new Date().toISOString();
+  if (!store[collection]) store[collection] = [];
+  store[collection].unshift({ ...data, _id: id, _createdDate: now, _updatedDate: now });
+  supa.from("records").insert({ id, company_id: CURRENT_COMPANY_ID, collection, data })
+    .then(({ error }) => { if (error) { store[collection] = (store[collection] || []).filter(r => r._id !== id); notifyData(); } });
+}
+
 function MobileTimeClock({ onLogWork }) {
   const { user } = useAuth();
   const { company } = useCompany();
@@ -11690,7 +11916,7 @@ function MobileTimeClock({ onLogWork }) {
     if (!active || !active.clockRecordId) return;
     const ping = async () => {
       const coords = await getGeoCoords();
-      if (coords) db.create("locationpings", { employeeName: active.employee, clockRecordId: active.clockRecordId, lat: coords.lat, lng: coords.lng, at: new Date().toISOString() });
+      if (coords) silentPing("locationpings", { employeeName: active.employee, clockRecordId: active.clockRecordId, lat: coords.lat, lng: coords.lng, at: new Date().toISOString() });
     };
     const id = setInterval(ping, 90000);
     return () => clearInterval(id);
@@ -11701,14 +11927,15 @@ function MobileTimeClock({ onLogWork }) {
   const clockIn = async () => {
     // A server-visible "I'm on the clock" record, so owners/managers can see who's
     // active from any device — separate from the shift record, which is only
-    // written on clock-out.
-    const rec = db.create("activeclocks", { employeeName: employee, startISO: new Date().toISOString() });
+    // written on clock-out. Queued rather than a direct db.create: with no
+    // signal, this record still has to exist somewhere the next sync can find it.
+    const rec = queueClockCreate("activeclocks", { employeeName: employee, startISO: new Date().toISOString() });
     const v = { employee, startISO: rec.startISO, geoIn: null, clockRecordId: rec._id };
     persist(v);
     const coords = await getGeoCoords();
     if (coords) {
       persist({ ...v, geoIn: latLngStr(coords.lat, coords.lng) });
-      db.create("locationpings", { employeeName: employee, clockRecordId: rec._id, lat: coords.lat, lng: coords.lng, at: new Date().toISOString() });
+      silentPing("locationpings", { employeeName: employee, clockRecordId: rec._id, lat: coords.lat, lng: coords.lng, at: new Date().toISOString() });
     }
   };
 
@@ -11722,7 +11949,10 @@ function MobileTimeClock({ onLogWork }) {
     // kept, so a shift can still be explained to whoever asks about it later.
     const grossHours = Math.round((end - start) / 3600000 * 100) / 100;
     const brk = Math.min(Math.max(0, Math.round(num(breakMinutes))), Math.floor(grossHours * 60));
-    db.create("shifts", {
+    // Queued, same reason as clock-in: with no signal this shift has to survive
+    // until the next sync, not vanish along with an alert nobody but this phone
+    // would ever see.
+    queueClockCreate("shifts", {
       employeeName: active.employee, entryDate: dateStr(start),
       clockInAt: active.startISO, clockOutAt: end.toISOString(),
       startTime: timeHM(start), endTime: timeHM(end),
@@ -11734,7 +11964,7 @@ function MobileTimeClock({ onLogWork }) {
       // marker goes away — the trail itself is kept).
       clockRecordId: active.clockRecordId || "",
     });
-    if (active.clockRecordId) db.remove("activeclocks", active.clockRecordId);
+    if (active.clockRecordId) queueClockRemove("activeclocks", active.clockRecordId);
     notifyData();
     persist(null);
     setBusy(false);
@@ -11748,9 +11978,19 @@ function MobileTimeClock({ onLogWork }) {
   const clockedToday = myShifts.reduce((a, s) => a + num(s.hours), 0) + runningMs / 3600000;
   const loggedToday = loggedHoursFor(myWork);
   const effToday = clockedToday > 0 ? Math.round((loggedToday / clockedToday) * 100) : null;
+  const pendingClock = pendingClockOps(); // queued with no signal yet - see the offline clock queue
 
   return (
     <div>
+      {pendingClock.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, background: C.surfaceAlt, border: "1px solid " + C.border, borderRadius: 12, padding: "10px 12px", marginBottom: 14 }}>
+          <div style={{ fontSize: 18 }}>⏳</div>
+          <div style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: C.textMuted }}>
+            {pendingClock.length} clock entr{pendingClock.length > 1 ? "ies" : "y"} saved on this device, waiting for a connection.
+          </div>
+          <button type="button" onClick={() => flushClockQueue()} style={{ ...btnOutline, whiteSpace: "nowrap", padding: "7px 11px", fontSize: 12 }}>Try now</button>
+        </div>
+      )}
       {employeeOptions.length > 1 && !active && (
         <div style={{ marginBottom: 12 }}>
           <label style={{ fontSize: 12, color: C.textMuted, fontWeight: 600 }}>Logging time for</label>
@@ -12039,11 +12279,20 @@ function MobileDailyLog() {
     if (!files.length) return;
     if (!draft.jobId) { window.alert("Pick a registered job first, then photos/videos attach to it."); return; }
     setBusy(true);
-    let ok = 0;
-    for (const f of files) { try { await bmbMedia.upload(draft.jobId, f, user); ok++; } catch (e) { window.alert("Couldn't upload " + f.name + ":\n" + (e.message || e)); } }
+    let ok = 0, queued = 0;
+    for (const f of files) {
+      try {
+        const rec = await bmbMedia.upload(draft.jobId, f, user);
+        if (rec && rec._pending) queued++; else ok++;
+      }
+      catch (e) { window.alert("Couldn't upload " + f.name + ":\n" + (e.message || e)); }
+    }
     setBusy(false);
     notifyData();
-    if (ok) setMsg(ok + " file" + (ok > 1 ? "s" : "") + " added to job ✓");
+    const parts = [];
+    if (ok) parts.push(ok + " file" + (ok > 1 ? "s" : "") + " added to job");
+    if (queued) parts.push(queued + " photo" + (queued > 1 ? "s" : "") + " saved on this device — will upload once you're back in range");
+    if (parts.length) setMsg(parts.join(", ") + " ✓");
     if (fileRef.current) fileRef.current.value = "";
   };
 
@@ -12921,10 +13170,10 @@ function AppShell() {
   const isMobile = useIsMobile();
 
   useEffect(() => { setMenuOpen(false); }, [page]);
-  // Drain any safety forms that were filled out with no signal. Starts once the
-  // company is known (CURRENT_COMPANY_ID is set during bootstrap) and then keeps
-  // itself going for the life of the tab.
-  useEffect(() => { if (dataReady) startSafetySync(); }, [dataReady]);
+  // Drain anything that was saved with no signal - safety forms, clock in/out,
+  // job photos. Starts once the company is known (CURRENT_COMPANY_ID is set
+  // during bootstrap) and then keeps itself going for the life of the tab.
+  useEffect(() => { if (dataReady) { startSafetySync(); startClockSync(); startPhotoSync(); } }, [dataReady]);
 
   if (!ready) return <FullScreenLoader label="Starting BuildMyBill…" />;
   if (!isAuthenticated) return <LoginPage />;
