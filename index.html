@@ -4778,13 +4778,28 @@ function calcTotals(doc) {
   return { subtotal, discountAmt, taxAmt, total: afterDiscount + taxAmt };
 }
 
+// The old generator drew a random 4-digit number and never looked at existing
+// quotes/invoices - no uniqueness check, so it collided by chance as volume grew,
+// and a manual edit afterward (the number field is plain text) could collide too.
+// This reads every quoteId already issued this year and picks one past the
+// highest, so it never repeats a number that's still in use - including after a
+// deletion, since the next number is computed fresh from what currently exists.
+function nextQuoteNumber(year) {
+  let max = 1000;
+  for (const q of getCol("quotes")) {
+    const m = /^(?:INV|QTE)-(\d{4})-(\d+)$/.exec(q.quoteId || "");
+    if (m && Number(m[1]) === year) max = Math.max(max, Number(m[2]));
+  }
+  return max + 1;
+}
+
 function defaultDoc(company) {
   const d = new Date();
   const due = new Date(d);
   due.setDate(due.getDate() + 30);
   return {
     _id: genId(),
-    quoteId: "INV-" + d.getFullYear() + "-" + String(Math.floor(Math.random() * 9000) + 1000),
+    quoteId: "INV-" + d.getFullYear() + "-" + nextQuoteNumber(d.getFullYear()),
     status: "Invoice",
     currency: "CAD",
     issueDate: dateStr(d),
