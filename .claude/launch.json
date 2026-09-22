@@ -5,7 +5,8 @@
       "name": "buildmybill-serve",
       "runtimeExecutable": "powershell",
       "runtimeArgs": ["-ExecutionPolicy", "Bypass", "-File", "serve.ps1"],
-      "port": 8321
+      "port": 8321,
+      "autoPort": true
     }
   ]
 }

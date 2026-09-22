@@ -1,7 +1,16 @@
 # Minimal static file server for BuildMyBill.
 # Uses a raw TcpListener so it needs no admin rights and no Node.js.
 #   Usage:  powershell -ExecutionPolicy Bypass -File serve.ps1 [-Port 8321]
-param([int]$Port = 8321)
+#
+# Port resolution order: an explicit -Port wins, then the PORT environment
+# variable, then 8321. The env var matters because parallel sessions (and the
+# worktrees under .claude/worktrees) all serve this same app - a fixed port
+# guarantees the second one to start collides with the first.
+param([int]$Port = 0)
+
+if ($Port -le 0) {
+  $Port = if ($env:PORT -match '^\d+$') { [int]$env:PORT } else { 8321 }
+}
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
@@ -22,6 +31,13 @@ while ($true) {
   $client = $listener.AcceptTcpClient()
   try {
     $stream = $client.GetStream()
+    # A browser routinely opens more TCP connections than it ends up sending
+    # requests on (speculative/pooled connections). This loop accepts and
+    # handles one client at a time, so a connection nobody ever writes to
+    # would otherwise block ReadLine() forever - and because Accept() is
+    # never reached again, every later request queues up behind it and the
+    # server looks completely hung, not just slow. Bound the read instead.
+    $stream.ReadTimeout = 2000
     $reader = [System.IO.StreamReader]::new($stream)
     $requestLine = $reader.ReadLine()
     if (-not $requestLine) { $client.Close(); continue }
