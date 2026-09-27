@@ -514,6 +514,120 @@ from the add-on card on **Subscriptions** (route `#/setup`).
   anyone is going to get. It starts on whichever day was selected on the calendar,
   and saving opens the new job's screen, since the next thing anybody wants is
   directions or a photo.
+- **Change history hangs off `db` itself, not off each form** (`recordAudit`,
+  `AUDITED`, collection `auditlog`). Every create/edit/delete through
+  `db.create/update/remove` on quotes, jobs, timeentries, shifts, changeorders and
+  payables writes one row: who (`CURRENT_ACTOR`, set at sign-in), when, which
+  record, and field-by-field from → to (`auditDiff`; `5` vs `"5"` is not a change,
+  line items are summarised by count). There are a dozen places that write a time
+  entry; a history that relies on each one remembering to log is a history with
+  holes. Viewed per record (`RecordHistory`, on the job, quote, bill) and company-
+  wide on **Change History** (owners/managers only). **No SQL migration**, which
+  also means the database does not yet stop someone deleting an audit row through
+  the API. Locking that is a migration still to write; don't claim it's tamper-proof.
+- **Time is logged against a task, not just a job** (`taskName` on `timeentries`).
+  The company keeps one set list (Settings → Job tasks, `companies.settings.taskList`
+  in `BRANDING_KEYS`, read through `jobTasks()` / `WS.tasks`); the crew picks, never
+  types, because free text can't be added up. Until an owner saves a list, trades
+  companies get `DEFAULT_TASKS_TRADES` and everyone else `DEFAULT_TASKS_OTHER`.
+  `TaskSelect` keeps showing a task that has since been removed from the list rather
+  than blanking the entry. The payoff is `taskBreakdown` / `TaskHoursTable`: hours,
+  share, jobs and **average per job** by task, in Billing & Reports (respects its
+  filters, in the CSV) and on each job.
+- **Field writes go through the offline queue with `fieldQueued(() => …)`.** Inside
+  it, `db.create/update/remove` route to the clock queue (`queueClockCreate` /
+  `queueClockUpdate` / `queueClockRemove`, `bmb_clock_queue`) instead of the
+  network, so the phone's daily log — time entry, equipment usage, materials,
+  loads, maintenance reading, and edits/deletes from "today" — saves with no
+  signal and syncs in order later. That is how the SAME helpers the office uses
+  (`logEquipmentUsage`, `logMaterialUse`) work offline without offline twins. The
+  queue's `update` op sends the whole record (last write wins). Don't route the
+  desktop pages through it: an office with no internet should see the alert.
+- **Service reminders run on use, not the calendar** (`serviceStatus`). Equipment
+  can carry `serviceEveryHours` and/or `serviceEveryKm` plus the reading it was
+  last serviced at (`lastServiceHours` / `lastServiceKm`). Due/soon (last 10% of
+  the interval)/overdue is derived from `totalHours` / `currentMileage` on every
+  render. A machine with an interval but no last-service reading says "needs
+  reading" rather than assuming zero, which would flag everything overdue the
+  moment an interval is typed. Every place a service/maintenance is recorded calls
+  `markServiced(patch)` to capture the readings.
+- **Sub & vendor bills (`payables`) are money going OUT, kept apart from payroll.**
+  Payee, type (sub / equipment rental / supplier / other), job, their invoice #,
+  amount, due date, and what's been paid (`amountPaid`, plus a `payments` list from
+  "Record a payment"). Status (Overdue / Due this week / Part paid / Upcoming / Paid)
+  is derived, never stored. The page shows the next 8 weeks of money going out, a
+  bill's job cost shows on that job, and a sub's bills show on the sub.
+- **Quote → job → invoice.** `Accepted` is a quote status: the client's yes. An
+  accepted quote **stays a quote** and is the job's contract; invoices are their own
+  documents linked by `jobId` (older ones match by `jobReference` title through
+  `docJobId`). Change orders are `changeorders` records on the job (Pending /
+  Approved / Rejected); approved ones add to the contract. `jobMoney(job)` derives
+  quoted / change orders / contract / invoiced / left to bill — **all before tax**,
+  so GST never reads as a mismatch — and the `issues` list: finished job with money
+  unbilled, invoiced over contract, approved CO not on any invoice, pending CO on a
+  finished job, quote out with none accepted, invoiced with no accepted quote,
+  two accepted quotes. Shown on the job, the quote editor, the quotes list and the
+  dashboard. `createJobInvoice` builds a progress invoice (a % of the quote, a set
+  amount, or the balance) plus any approved COs; its lines carry `progressOf` /
+  `changeOrderId`, which is how "already billed" is worked out — derived from the
+  invoices, never kept as a running total that could drift from them. Invoicing
+  a job still ends at an ordinary invoice to check and print; nothing is sent.
+  "Finished" = job status matching `/complete|done|closed|finish/i`, since stages
+  are company-defined.
+- **Records open as full pages, not pop-ups** (`CRUDForm page`, `CRUDPage`). Create,
+  edit and view on every CRUDPage section — and the warehouse form — replace the
+  list with a page laid out like the quote editor: a sticky bar with Back/Save,
+  fields grouped into cards by each field's `section`, wide inputs (`textarea`,
+  `richtext`, `maps`, `multiselect`…) spanning the card. Under a saved record:
+  "Your fields", attached documents (`record_docs`, the `job-docs` bucket under
+  `records/<collection>/`), and change history. Pages with no `detail` of their own
+  get `RecordSummary` (every filled field, grouped the same way); pages with one
+  add `RecordSummary` for the fields they don't lay out themselves (`skip`).
+  `listFilter` hides rows behind a switch — Jobs hides `JOB_HIDDEN_RE`
+  (complete/done/closed/paid/invoiced) by default; On Hold stays visible.
+  `recordTitle` names the page. Contracts have a rich-text Scope and Terms
+  (`richtext` field type → `RichTextEditor`).
+- **Your own fields** (`customFieldDefs` in `companies.settings`, keyed by
+  collection; "⚙ Customize fields" on any full page, owners/managers). Types: text,
+  long text, number, date, yes/no, dropdown. Values are flat on the record as
+  `cf_<id>`, so history and exports see them. Removing a definition hides it; the
+  saved values stay. This is separate from the older free-form `customFields`
+  label/value list on Inventory and Warehouses, which still works.
+- **Vehicle log book is a CRUDPage now** with 15 walk-around checks (the first
+  three keep their original `brakesChecked`/`lightsChecked`/`fluidsChecked` keys),
+  readings, fuel/DEF, defects with severity, trip. Passes = every check ticked and
+  nothing "Major — out of service". A higher odometer/engine-hour reading is carried
+  onto the matching equipment so the service reminders keep counting. Odometer is
+  km (it was labelled miles before).
+- **Haul loads keep `yards` as the quantity key** even when `unit` is tonnes or
+  loads — the phone, daily log and Quick Command all write `yards`. `amount` =
+  quantity × `ratePerUnit`, worked out on save. Trucks come from `isTruckType`
+  (truck/semi/pickup in the type), trailers from type "Trailer".
+- **Warehouse layout has three views.** Floor plan (the grid builder, unchanged),
+  **Yard map** (`YardMap`: areas drawn on Esri World Imagery, stored on the
+  warehouse as `yardAreas`; Esri's rural imagery runs out past zoom 17, so it's
+  capped there and stretched — don't raise `maxNativeZoom`), and **3D view**
+  (`Warehouse3D`: the floor-plan zones stood up to `zone.heightFt` inside the
+  building's `lengthFt × widthFt × heightFt`, drawn on a plain canvas with
+  back-to-front face sorting — deliberately no three.js). Esri's free tiles are for
+  light use; heavy commercial use may need an Esri account.
+- **Never call `notifyData()` to refresh a page you're standing on.** The shell keys
+  `<main>` on `page + dataVersion`, so notifyData re-mounts the whole page and wipes
+  its state — an open record page, a modal, the Safety tab. Use a local tick. A
+  poller must use `db.refreshCollection(col, true)` (quiet) and re-render itself:
+  Crew Locations used the loud version, which re-mounted the page, which re-ran the
+  poll — a loop that closed the map the instant "View" opened it.
+- **Safety opens everything as a full page too** — filling out a form (desktop),
+  viewing a submission (with Print), the template builder (with who's filled it out),
+  certifications (add/edit/view, fuller fields, attach a photo of the ticket), and
+  equipment checks. `FullPage` is the bare frame; `PageChromeCtx` / `useHideChrome`
+  let a section with its own header and tabs (Safety) hide them while a record is
+  open. The phone's fill-out stays a bottom sheet.
+- **Leaflet markers are drawn (`circleMarker`), not `L.marker`** — the vendored
+  Leaflet has no pin image wired up, so a default marker renders as broken-image text.
+- **Not built: video compression.** Photos are already downscaled and queued
+  offline; videos upload at full size and still fail with no signal. Parked on
+  purpose — the heaviest to build and the least used.
 
 ---
 
