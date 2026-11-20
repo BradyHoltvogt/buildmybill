@@ -1836,7 +1836,7 @@ const DEFAULT_SECONDARY = "#16A34A";
 // the guided workspace setup produces (wording, stages, sections).
 const BRANDING_KEYS = ["primaryColor", "secondaryColor", "logoUrl", "address", "phone", "email", "website", "shopAddress", "shopLat", "shopLng", "geofenceRadiusM",
   "industry", "industryDetail", "terms", "stages", "modules", "setupComplete", "setupCompletedAt", "setupSkipped", "setupPackage",
-  "payPeriod", "payAnchor", "taskList", "customFieldDefs"];
+  "payPeriod", "payAnchor", "taskList", "customFieldDefs", "quoteCalc"];
 
 function applyBranding(company) {
   const root = document.documentElement;
@@ -7067,12 +7067,443 @@ function PreviewModal({ doc, onClose }) {
   );
 }
 
+/* ─── Quote calculator (aggregate / hauling price builder) ───────────────── */
+// A per-yard price built from four lines: material + haul (miles × tier rate)
+// + road tax (taxed grid miles × the area's rate) + fuel surcharge. The engine
+// lives here; EVERY number it uses (prices, tiers, trucks, road-tax areas,
+// diesel) belongs to the company and sits in companies.settings.quoteCalc,
+// loaded from a JSON price setup on Settings → Quote calculator. This repo is
+// public, so no company's rates are ever written into this file.
+//
+// Cents rule: the four per-yard lines are added UNROUNDED and the total is
+// yards × that sum, rounded once. That is why the lines it adds to a quote
+// carry an unrounded rate — rounding each rate to the cent first drifts the
+// total off the company's own calculator. Don't "tidy" the rates to 2 places.
+//
+// The route gate: a delivered price needs a person to say the truck route
+// was confirmed. Until then there is no total and nothing can be added.
+const QC_KM_PER_MI = 1.60934;
+
+function qcIsWinter(cfg, dateStr) {
+  const w = (cfg && cfg.winter) || null;
+  if (!w || !w.from || !w.to) return false;
+  const md = String(dateStr || today()).slice(5, 10);
+  return w.from <= w.to ? (md >= w.from && md <= w.to) : (md >= w.from || md <= w.to);
+}
+
+function qcAreaRate(cfg, areaId, winter) {
+  const a = (cfg.taxAreas || []).find(x => x.id === areaId);
+  if (!a) return 0;
+  return winter ? num(a.winter, num(a.summer) / 2) : num(a.summer);
+}
+
+function qcAreaName(cfg, areaId) {
+  const a = (cfg.taxAreas || []).find(x => x.id === areaId);
+  return a ? a.name : areaId;
+}
+
+// Checks an imported price setup and says what is wrong in plain words.
+function qcValidate(cfg) {
+  const errs = [];
+  if (!cfg || typeof cfg !== "object") return ["That file isn't a price setup."];
+  if (!Array.isArray(cfg.sources) || !cfg.sources.length) errs.push("No sources (pits / piles / yards).");
+  else cfg.sources.forEach((s, i) => {
+    if (!s || !s.name) errs.push("Source " + (i + 1) + " has no name.");
+    else if (!Array.isArray(s.materials) || !s.materials.length) errs.push(s.name + " has no materials.");
+  });
+  if (!Array.isArray(cfg.tiers) || !cfg.tiers.length) errs.push("No haul rates (tiers).");
+  if (!Array.isArray(cfg.trucks) || !cfg.trucks.length) errs.push("No trucks.");
+  if (cfg.trucks && cfg.trucks.some(t => !(num(t.yards) > 0))) errs.push("Every truck needs a load size in yards.");
+  if (!cfg.fuel || !(num(cfg.fuel.diesel) >= 0) || !(num(cfg.fuel.peg) >= 0)) errs.push("Fuel needs a diesel price and a peg.");
+  return errs;
+}
+
+// The engine. Pure: same inputs, same answer, to the cent.
+function qcPrice(cfg, s) {
+  const src = (cfg.sources || [])[s.source] || null;
+  const mat = src ? (src.materials || [])[s.material] : null;
+  const truck = (cfg.trucks || []).find(t => t.id === s.truck) || (cfg.trucks || [])[0] || { yards: 22, name: "" };
+  const tier = (cfg.tiers || []).find(t => t.id === s.tier) || (cfg.tiers || [])[0] || { rate: 0, name: "" };
+  const y = Math.max(0, num(s.yards));
+  const winter = qcIsWinter(cfg, s.date);
+  const f = cfg.fuel || {};
+  const d = Math.max(0, num(f.diesel) - num(f.peg));
+  const ypl = num(truck.yards) || 22;
+  const lmi = num(f.litresPerMile), loader = num(f.loaderLitres);
+  const inb = mat ? num(mat.inboundMiles) : 0;
+  const loads = mat ? (mat.loadings == null ? 1 : num(mat.loadings)) : 1;
+  const out = { src, mat, truck, tier, y, winter, haul: 0, fuel: 0, rt: 0, flat: 0, mi: 0, typed: 0, rtDesc: "", dest: null, routedMi: null, blocked: [] };
+
+  if (s.mode === "deliv") {
+    out.typed = Math.max(0, num(s.miles));
+    out.mi = Math.ceil(out.typed - 1e-9); // round up once, after the access offset is in
+    out.haul = out.mi * num(tier.rate);
+    out.fuel = d * lmi * 2 * (out.mi + inb) / ypl + d * loader * loads / ypl;
+    if (s.dest === "manual") {
+      const parts = [];
+      (s.manual || []).forEach(m => {
+        const mi = Math.max(0, num(m.miles));
+        if (mi > 0 && m.area) { out.rt += mi * qcAreaRate(cfg, m.area, winter); parts.push(mi.toFixed(1) + " mi " + qcAreaName(cfg, m.area)); }
+      });
+      out.rtDesc = parts.length ? parts.join(" + ") + (winter ? " · winter" : "") : "no taxed grid miles";
+    } else if (s.dest && s.dest !== "none" && src) {
+      const e = (src.destinations || []).find(x => x.name === s.dest);
+      if (e) {
+        out.dest = e;
+        out.routedMi = num(e.km) / QC_KM_PER_MI + num(src.accessOffset);
+        const parts = [];
+        Object.keys(e.taxedMiles || {}).forEach(k => {
+          const mi = num(e.taxedMiles[k]);
+          out.rt += mi * qcAreaRate(cfg, k, winter);
+          parts.push(mi.toFixed(2) + " mi " + qcAreaName(cfg, k));
+        });
+        out.rtDesc = parts.length ? parts.join(" + ") + (winter ? " · winter" : "") : "no taxed grid miles";
+      }
+    } else out.rtDesc = "none";
+    if (!(out.mi > 0)) out.blocked.push("Put in the confirmed one-way miles.");
+    if (!String(s.routeBy || "").trim()) out.blocked.push("No confirmed route, no price. Check the route and say who confirmed it.");
+  } else if (s.mode === "pickup") {
+    out.fuel = d * lmi * 2 * inb / ypl + d * loader * loads / ypl;
+  } else if (s.mode === "town") {
+    out.flat = num(cfg.inTownFlat);
+  }
+  if (!mat) out.blocked.push("Pick a material.");
+  else if (mat.price == null || mat.price === "") out.blocked.push("No price set for " + mat.name + " at " + src.name + ". Set it on Settings → Quote calculator.");
+  if (!(y > 0)) out.blocked.push("How many yards?");
+  const p = mat ? num(mat.price) : 0;
+  out.perYd = p + out.haul + out.rt + out.fuel;
+  out.total = y * out.perYd + out.flat;
+  return out;
+}
+
+function QuoteCalculator({ cfg, startAddress, onAdd, onClose }) {
+  const { user } = useAuth();
+  const unit = cfg.unit || "yd";
+  const groups = [];
+  (cfg.sources || []).forEach((s, i) => {
+    const g = s.group || "Sources";
+    let grp = groups.find(x => x.g === g);
+    if (!grp) { grp = { g, items: [] }; groups.push(grp); }
+    grp.items.push({ i, s });
+  });
+  const [s, setS] = useState(() => ({
+    source: 0, material: 0, yards: 10, truck: (cfg.trucks && cfg.trucks[0] && cfg.trucks[0].id) || "",
+    tier: (cfg.tiers && cfg.tiers[0] && cfg.tiers[0].id) || "", mode: "deliv", miles: 0, dest: "none",
+    manual: [{ area: (cfg.taxAreas && cfg.taxAreas[0] && cfg.taxAreas[0].id) || "", miles: 0 }, { area: (cfg.taxAreas && cfg.taxAreas[0] && cfg.taxAreas[0].id) || "", miles: 0 }],
+    place: startAddress || "", routeBy: "", date: today(),
+  }));
+  const set = patch => setS(x => ({ ...x, ...patch }));
+  const r = qcPrice(cfg, s);
+  const src = r.src;
+
+  const pickDest = v => {
+    const patch = { dest: v };
+    const e = src && (src.destinations || []).find(x => x.name === v);
+    if (e) patch.miles = Math.ceil(num(e.km) / QC_KM_PER_MI + num(src.accessOffset));
+    set(patch);
+  };
+  const destOf = str => {
+    const t = String(str || "").trim();
+    if (!t) return null;
+    const m = t.match(/(-?\d{1,3}\.\d{3,})[ ,]+(-?\d{1,3}\.\d{3,})/);
+    return m ? m[1] + "," + m[2] : encodeURIComponent(t);
+  };
+  const mapUrl = (() => {
+    const dq = destOf(s.place);
+    if (!dq || !src || !Array.isArray(src.pin)) return null;
+    return "https://www.google.com/maps/dir/" + src.pin[0] + "," + src.pin[1] + "/" + dq;
+  })();
+
+  const lab = { fontSize: 12, fontWeight: 600, color: C.textMuted, marginBottom: 4, display: "block" };
+  const box = { marginBottom: 12 };
+  const flag = (tone, text) => (
+    <div style={{ fontSize: 12.5, lineHeight: 1.5, padding: "8px 10px", borderRadius: 8, marginTop: 8,
+      background: tone === "ok" ? "#F0FDF4" : tone === "info" ? "#EFF6FF" : "#FFFBEB",
+      border: "1px solid " + (tone === "ok" ? "#BBF7D0" : tone === "info" ? "#BFDBFE" : "#FDE68A"),
+      color: tone === "ok" ? "#166534" : tone === "info" ? "#1E40AF" : "#92400E" }}>{text}</div>
+  );
+  const mismatch = s.mode === "deliv" && r.routedMi != null && Math.abs(num(s.miles) - r.routedMi) >= 1.2;
+
+  const add = () => {
+    if (r.blocked.length) return;
+    const lines = [];
+    const L = (description, u, qty, rate) => lines.push({ ...emptyItem(), description, unit: u, qty, rate, taxable: true });
+    L(r.mat.name + " — " + src.name, unit, r.y, num(r.mat.price));
+    if (s.mode === "deliv") {
+      L("Haul — " + r.mi + " mi one way, " + (r.tier.name || "haul rate"), unit, r.y, r.haul);
+      if (r.rt > 0) L("Road tax — " + r.rtDesc, unit, r.y, r.rt);
+    }
+    if (s.mode === "town") L("In-town delivery", "flat", 1, r.flat);
+    if (r.fuel > 0) L("Fuel surcharge" + (r.truck.name ? " (" + r.truck.name + ")" : ""), unit, r.y, r.fuel);
+    const source = {
+      at: new Date().toISOString(), by: (user && user.name) || "", pricesAsOf: cfg.pricesAsOf || "",
+      source: src.name, material: r.mat.name, yards: r.y, mode: s.mode,
+      route: s.mode === "deliv" ? { miles: r.mi, typedMiles: r.typed, destination: s.dest, confirmedBy: String(s.routeBy).trim(), customer: s.place, roadTax: r.rtDesc } : null,
+      perYd: Math.round(r.perYd * 100) / 100, total: Math.round(r.total * 100) / 100,
+    };
+    onAdd(lines, source);
+  };
+
+  return (
+    <Modal title="Price calculator" onClose={onClose} width={720}>
+      <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 14 }}>
+        {cfg.name ? cfg.name + " · " : ""}Prices as of <strong>{cfg.pricesAsOf || "—"}</strong>
+        {cfg.fuel && cfg.fuel.note ? " · " + cfg.fuel.note : ""}{r.winter ? " · winter road-tax rates" : ""}
+      </div>
+      <div className="grid-2" style={{ gap: 16 }}>
+        <div>
+          <div style={box}>
+            <label style={lab}>Where it's coming from</label>
+            <select value={s.source} onChange={e => set({ source: +e.target.value, material: 0, dest: "none" })} style={inputCls}>
+              {groups.map(g => (
+                <optgroup key={g.g} label={g.g}>
+                  {g.items.map(({ i, s: so }) => <option key={i} value={i}>{so.name}</option>)}
+                </optgroup>
+              ))}
+            </select>
+          </div>
+          <div style={box}>
+            <label style={lab}>Material</label>
+            <select value={s.material} onChange={e => set({ material: +e.target.value })} style={inputCls}>
+              {((src && src.materials) || []).map((m, i) => (
+                <option key={i} value={i}>{m.name + (m.price == null || m.price === "" ? "  —  confirm price" : "  —  $" + num(m.price).toFixed(2) + "/" + unit)}</option>
+              ))}
+            </select>
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ ...box, flex: 1 }}>
+              <label style={lab}>Yards</label>
+              <input type="number" min="0" step="1" value={s.yards} onChange={e => set({ yards: e.target.value })} style={inputCls} />
+            </div>
+            <div style={{ ...box, flex: 1 }}>
+              <label style={lab}>Truck</label>
+              <select value={s.truck} onChange={e => set({ truck: e.target.value })} style={inputCls}>
+                {(cfg.trucks || []).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </div>
+          </div>
+          <div style={box}>
+            <label style={lab}>Delivery</label>
+            <div style={{ display: "flex", gap: 6 }}>
+              {[["pickup", "Pickup", "at the pile"], ["town", "In-town", cfg.inTownFlat != null ? "+" + fmt(num(cfg.inTownFlat)) : "flat"], ["deliv", "Delivered", "by miles"]].map(([k, t, sub]) => (
+                <button key={k} type="button" onClick={() => set({ mode: k })} aria-pressed={s.mode === k}
+                  style={{ ...btnOutline, flex: 1, padding: "7px 6px", display: "flex", alignItems: "center", flexDirection: "column", lineHeight: 1.2, background: s.mode === k ? C.accent : "transparent", color: s.mode === k ? "#fff" : C.text }}>
+                  <span style={{ fontWeight: 700 }}>{t}</span><span style={{ fontSize: 10.5, opacity: 0.85 }}>{sub}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          {s.mode === "deliv" && (
+            <div style={{ background: C.surfaceAlt, border: "1px solid " + C.border, borderRadius: 10, padding: 12 }}>
+              <div style={box}>
+                <label style={lab}>Customer location — address or lat, long</label>
+                <input value={s.place} onChange={e => set({ place: e.target.value })} placeholder="Civic address, or 52.1955, -105.1408" style={inputCls} />
+                {mapUrl
+                  ? <a href={mapUrl} target="_blank" rel="noopener" style={{ fontSize: 12.5, fontWeight: 600, display: "inline-block", marginTop: 6 }}>🗺 Show route in Google Maps</a>
+                  : <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 6 }}>Type the customer's address or pin to get a route link.</div>}
+              </div>
+              <div style={box}>
+                <label style={lab}>Destination town — sets the road tax</label>
+                <select value={s.dest} onChange={e => pickDest(e.target.value)} style={inputCls}>
+                  <option value="none">— no road tax —</option>
+                  {((src && src.destinations) || []).map(d => <option key={d.name} value={d.name}>{d.name}</option>)}
+                  {(cfg.taxAreas || []).length > 0 && <option value="manual">Enter grid miles myself</option>}
+                </select>
+                {r.dest && r.dest.route && <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 4 }}>Figured on: {r.dest.route}. Run it a different way and the taxed miles change. Switch to "Enter grid miles myself" and use your own.</div>}
+              </div>
+              {s.dest === "manual" && [0, 1].map(k => (
+                <div key={k} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  <select value={s.manual[k].area} onChange={e => set({ manual: s.manual.map((m, j) => j === k ? { ...m, area: e.target.value } : m) })} style={{ ...inputCls, flex: 2 }}>
+                    {(cfg.taxAreas || []).map(a => <option key={a.id} value={a.id}>{(k ? "2nd: " : "") + a.name}</option>)}
+                  </select>
+                  <input type="number" min="0" step="0.1" value={s.manual[k].miles} placeholder="grid mi" onChange={e => set({ manual: s.manual.map((m, j) => j === k ? { ...m, miles: e.target.value } : m) })} style={{ ...inputCls, flex: 1 }} />
+                </div>
+              ))}
+              <div style={{ display: "flex", gap: 10 }}>
+                <div style={{ ...box, flex: 1 }}>
+                  <label style={lab}>Confirmed one-way miles</label>
+                  <input type="number" min="0" step="1" value={s.miles} onChange={e => set({ miles: e.target.value })} style={inputCls} />
+                </div>
+                <div style={{ ...box, flex: 1.4 }}>
+                  <label style={lab}>Haul rate</label>
+                  <select value={s.tier} onChange={e => set({ tier: e.target.value })} style={inputCls}>
+                    {(cfg.tiers || []).map(t => <option key={t.id} value={t.id}>{t.name} — ${num(t.rate).toFixed(4)}/{unit}·mi</option>)}
+                  </select>
+                </div>
+              </div>
+              {mismatch && flag("warn", <span>You put in <b>{num(s.miles).toFixed(0)} mi</b>; the road tax for {s.dest} was figured on <b>{r.routedMi.toFixed(1)} mi</b>. Different route, different taxed miles. Haul and fuel follow your number, but the road tax doesn't. Switch to "Enter grid miles myself" if you're running a different way.</span>)}
+              <div style={{ ...box, marginBottom: 0, marginTop: 8 }}>
+                <label style={lab}>Route confirmed by</label>
+                <input value={s.routeBy} onChange={e => set({ routeBy: e.target.value })} placeholder="Who checked a loaded truck can run it" style={inputCls} />
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div>
+          <div style={{ background: C.surfaceAlt, border: "1px solid " + C.border, borderRadius: 12, padding: 16 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>Total, before tax</div>
+            <div style={{ fontSize: r.blocked.length ? 20 : 34, fontWeight: 800, color: r.blocked.length ? "#B45309" : C.accent, margin: "4px 0" }}>
+              {r.blocked.length ? "BLOCKED — no price yet" : fmt(r.total)}
+            </div>
+            {!r.blocked.length && r.y > 0 && <div style={{ fontSize: 13, color: C.textMuted }}>{fmt(r.total / r.y)} / {unit} {s.mode === "pickup" ? "picked up" : "delivered"}</div>}
+            <table style={{ width: "100%", fontSize: 13, marginTop: 12, borderCollapse: "collapse" }}>
+              <tbody>
+                {[
+                  ["Material", r.mat && r.mat.price != null && r.mat.price !== "" ? fmt(r.y * num(r.mat.price)) : "—", r.mat && r.mat.price != null && r.mat.price !== "" ? "$" + num(r.mat.price).toFixed(2) + "/" + unit : "no price set"],
+                  s.mode === "deliv" ? ["Haul", fmt(r.haul * r.y), (r.typed !== r.mi ? r.typed + " → " : "") + r.mi + " mi @ " + fmt(r.haul) + "/" + unit] : s.mode === "town" ? ["In-town", fmt(r.flat), "flat"] : ["Delivery", fmt(0), "pickup"],
+                  ["Road tax", fmt(r.rt * r.y), s.mode === "deliv" ? r.rtDesc : "n/a"],
+                  ["Fuel surcharge", fmt(r.fuel * r.y), r.fuel > 0 ? fmt(r.fuel) + "/" + unit : "none"],
+                  ["Tonnes", r.mat && r.mat.tonFactor ? (r.y * num(r.mat.tonFactor)).toFixed(1) : "—", r.mat && r.mat.tonFactor ? "× " + r.mat.tonFactor + " per " + unit + ", approx." : ""],
+                ].map(([k, v, n]) => (
+                  <tr key={k} style={{ borderTop: "1px solid " + C.border }}>
+                    <td style={{ padding: "6px 0", fontWeight: 600 }}>{k}</td>
+                    <td style={{ padding: "6px 0", textAlign: "right", fontWeight: 700 }}>{v}</td>
+                    <td style={{ padding: "6px 0 6px 10px", color: C.textMuted, fontSize: 11.5 }}>{n}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {r.blocked.length > 0 && flag("warn", <span>{r.blocked.map((b, i) => <div key={i}>• {b}</div>)}</span>)}
+          {s.mode === "pickup" && r.fuel > 0 && flag("info", <span>Pickup, so no delivery charge. The {fmt(r.fuel)}/{unit} fuel line still applies: it covers {r.mat && num(r.mat.inboundMiles) ? "the " + num(r.mat.inboundMiles) + "-mi haul onto the pile and " : ""}the loading.</span>)}
+          {s.mode === "deliv" && !r.blocked.length && flag("info", <span>Fuel surcharge {fmt(r.fuel)}/{unit} is its own line{r.mat && num(r.mat.inboundMiles) ? ", and covers the " + num(r.mat.inboundMiles) + "-mi haul onto the pile" : ""}.</span>)}
+          {src && src.supplier && flag("warn", <span>This is <b>their catalogue</b>, not your stock. Phone them to confirm before you promise it.</span>)}
+          {src && !src.supplier && r.mat && (r.mat.available == null
+            ? flag("warn", <span><b>Not measured.</b> {r.mat.name} has no pile reading. Check it's there before promising it.</span>)
+            : r.y > num(r.mat.available)
+              ? flag("warn", <span>Only ~{num(r.mat.available).toLocaleString("en-CA")} {unit} of {r.mat.name} measured on the pile. This quote is {r.y} {unit}. Check the pile first.</span>)
+              : flag("ok", <span>~{num(r.mat.available).toLocaleString("en-CA")} {unit} of {r.mat.name} on the pile, last measured. Enough for this one.</span>))}
+          {r.mat && r.mat.note && flag("warn", <span>{r.mat.note}</span>)}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+        <button type="button" onClick={onClose} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+        <button type="button" onClick={add} disabled={r.blocked.length > 0} style={{ ...btnSecondary, flex: 2, opacity: r.blocked.length ? 0.5 : 1, cursor: r.blocked.length ? "not-allowed" : "pointer" }}>
+          Add {s.mode === "deliv" ? "material, haul, road tax & fuel" : "these"} lines to the quote
+        </button>
+      </div>
+      <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 8 }}>
+        Adds each part as its own line. The fuel surcharge stays a separate line, never folded into the rate. The quote is still a draft until you send it.
+      </div>
+    </Modal>
+  );
+}
+
+// Settings → Quote calculator. Owner only (Settings is). The price setup is the
+// company's own confidential data: it lives in companies.settings, never in code.
+function QuoteCalcCard() {
+  const { company, updateCompany } = useCompany();
+  const cfg = company && company.quoteCalc;
+  const fileRef = useRef(null);
+  const [msg, setMsg] = useState("");
+  const [draft, setDraft] = useState(null);
+  const [srcIdx, setSrcIdx] = useState(0);
+  const say = t => { setMsg(t); setTimeout(() => setMsg(""), 3500); };
+  useEffect(() => { setDraft(cfg ? JSON.parse(JSON.stringify(cfg)) : null); }, [cfg]);
+  const dirty = draft && cfg && JSON.stringify(draft) !== JSON.stringify(cfg);
+
+  const onFile = e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async ev => {
+      let parsed;
+      try { parsed = JSON.parse(ev.target.result); } catch { window.alert("That file isn't valid JSON."); return; }
+      const errs = qcValidate(parsed);
+      if (errs.length) { window.alert("Can't load this price setup:\n\n" + errs.join("\n")); return; }
+      const n = parsed.sources.reduce((a, x) => a + x.materials.length, 0);
+      const ok = await confirmDialog((cfg ? "Replace the current price setup" : "Load this price setup") + " (" + parsed.sources.length + " sources, " + n + " materials, prices as of " + (parsed.pricesAsOf || "unknown") + ")?", { confirmLabel: cfg ? "Replace" : "Load", tone: "primary" });
+      if (!ok) return;
+      await updateCompany({ quoteCalc: parsed });
+      say("Price setup loaded.");
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+  const exportIt = () => downloadFile("price-setup_" + today() + ".json", JSON.stringify(cfg, null, 1), "application/json");
+  const remove = async () => {
+    if (!(await confirmDialog("Remove the price setup? The calculator disappears from Quotes. Quotes already built keep their lines.", { confirmLabel: "Remove" }))) return;
+    await updateCompany({ quoteCalc: null });
+    say("Price setup removed.");
+  };
+  const save = async () => { await updateCompany({ quoteCalc: draft }); say("Price setup saved."); };
+  const setTop = patch => setDraft(d => ({ ...d, ...patch }));
+  const setFuel = patch => setDraft(d => ({ ...d, fuel: { ...(d.fuel || {}), ...patch } }));
+  const setMat = (si, mi, patch) => setDraft(d => ({ ...d, sources: d.sources.map((s, i) => i !== si ? s : { ...s, materials: s.materials.map((m, j) => j !== mi ? m : { ...m, ...patch }) }) }));
+  const numOrNull = v => (String(v).trim() === "" ? null : num(v));
+  const src = draft && draft.sources && draft.sources[srcIdx];
+
+  return (
+    <div style={{ ...card }}>
+      <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Quote calculator</h3>
+      <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 14, lineHeight: 1.6 }}>
+        Prices a load from a pit or pile: material, haul by the mile, road tax and a separate fuel surcharge. It shows up as
+        <strong> 🧮 Price calculator</strong> in the quote editor once a price setup is loaded. Your rates stay in your company's account, not in the app's code.
+        {cfg && " Change a price here or load a new setup file. If your prices are kept somewhere else as well, update both places so they don't drift apart."}
+      </p>
+      <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }} onChange={onFile} />
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: cfg ? 14 : 0 }}>
+        <button type="button" onClick={() => fileRef.current.click()} style={btnOutline}>📥 {cfg ? "Load a new price setup" : "Load a price setup"}</button>
+        {cfg && <button type="button" onClick={exportIt} style={btnOutline}>📤 Download a copy</button>}
+        {cfg && <button type="button" onClick={remove} style={{ ...btnOutline, color: "#DC2626" }}>Remove</button>}
+      </div>
+      {draft && (
+        <div>
+          <div className="grid-3" style={{ gap: 10, marginBottom: 12 }}>
+            <Field label="Prices as of"><input type="date" value={draft.pricesAsOf || ""} onChange={e => setTop({ pricesAsOf: e.target.value })} style={inputCls} /></Field>
+            <Field label="Diesel $/L"><input type="number" step="0.01" value={(draft.fuel || {}).diesel ?? ""} onChange={e => setFuel({ diesel: num(e.target.value) })} style={inputCls} /></Field>
+            <Field label="Diesel peg $/L"><input type="number" step="0.01" value={(draft.fuel || {}).peg ?? ""} onChange={e => setFuel({ peg: num(e.target.value) })} style={inputCls} /></Field>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 13, fontWeight: 600 }}>Material prices at</span>
+            <select value={srcIdx} onChange={e => setSrcIdx(+e.target.value)} style={{ ...inputCls, width: "auto" }}>
+              {draft.sources.map((s, i) => <option key={i} value={i}>{s.name}</option>)}
+            </select>
+          </div>
+          {src && (
+            <div className="scroll-x">
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 460 }}>
+                <thead><tr style={{ background: C.surfaceAlt }}>
+                  {["Material", "$ / " + (draft.unit || "yd"), "On the pile"].map((h, i) => <th key={h} style={{ padding: "6px 8px", textAlign: i ? "right" : "left", fontSize: 11, color: C.textMuted }}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  {src.materials.map((m, mi) => (
+                    <tr key={mi} style={{ borderBottom: "1px solid " + C.border }}>
+                      <td style={{ padding: "4px 8px" }}>{m.name}{(m.price == null || m.price === "") && <span style={{ color: "#B45309", fontSize: 11 }}> · needs a price</span>}</td>
+                      <td style={{ padding: "4px 4px", width: 110 }}><input type="number" step="0.01" value={m.price ?? ""} onChange={e => setMat(srcIdx, mi, { price: numOrNull(e.target.value) })} style={{ ...inputCls, textAlign: "right" }} /></td>
+                      <td style={{ padding: "4px 4px", width: 110 }}>{src.supplier ? <span style={{ fontSize: 11, color: C.textMuted }}>supplier</span> : <input type="number" step="1" value={m.available ?? ""} onChange={e => setMat(srcIdx, mi, { available: numOrNull(e.target.value) })} style={{ ...inputCls, textAlign: "right" }} />}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 8 }}>Haul rates, trucks, road-tax areas and destination routes come from the setup file. To change them, edit the file and load it again.</div>
+          <button type="button" onClick={save} disabled={!dirty} style={{ ...btnSecondary, marginTop: 12, opacity: dirty ? 1 : 0.5 }}>Save price changes</button>
+        </div>
+      )}
+      {msg && <div style={{ fontSize: 12, color: C.green, marginTop: 8 }}>{msg}</div>}
+    </div>
+  );
+}
+
 function QuoteEditor({ docId, onClose, startPreview }) {
   const { company } = useCompany();
   const [doc, setDoc] = useState(() => (docId && db.getById("quotes", docId)) || defaultDoc(company));
   const [savedId, setSavedId] = useState(docId || null);
   const [preview, setPreview] = useState(!!startPreview);
   const [saved, setSaved] = useState(false);
+  const [calcOpen, setCalcOpen] = useState(false);
+  const qcCfg = company && company.quoteCalc && !qcValidate(company.quoteCalc).length ? company.quoteCalc : null;
+  // Calculator lines replace a lone blank starter line instead of sitting under it.
+  const addCalcLines = (lines, source) => {
+    setDoc(d => {
+      const blank = d.items.length === 1 && !String(d.items[0].description || "").trim() && !num(d.items[0].rate);
+      return { ...d, items: (blank ? [] : d.items).concat(lines), calcSources: (d.calcSources || []).concat([source]) };
+    });
+    setCalcOpen(false);
+  };
   const clients = useMemo(() => db.getAll("clients").items, []);
   const jobs = useMemo(() => db.getAll("jobs").items, []);
 
@@ -7231,7 +7662,16 @@ function QuoteEditor({ docId, onClose, startPreview }) {
             </table>
           </div>
           <button type="button" onClick={() => updateItems([...doc.items, emptyItem()])} style={{ marginTop: 12, padding: "7px 14px", background: "#EEF2FF", color: C.accent, border: "1px dashed #A5B4FC", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>+ Add Line Item</button>
+          {qcCfg && <button type="button" onClick={() => setCalcOpen(true)} style={{ marginTop: 12, marginLeft: 8, padding: "7px 14px", background: "#F0FDF4", color: "#166534", border: "1px dashed #86EFAC", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>🧮 Price calculator</button>}
+          {(doc.calcSources || []).length > 0 && (
+            <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 10, lineHeight: 1.6 }}>
+              {doc.calcSources.map((c, i) => (
+                <div key={i}>🧮 {c.yards} {c.material} from {c.source}, prices as of {c.pricesAsOf || "?"}{c.route ? ", " + c.route.miles + " mi, route confirmed by " + c.route.confirmedBy : ""}{c.by ? " · " + c.by : ""}</div>
+              ))}
+            </div>
+          )}
         </div>
+        {calcOpen && qcCfg && <QuoteCalculator cfg={qcCfg} startAddress={doc.to && doc.to.address} onAdd={addCalcLines} onClose={() => setCalcOpen(false)} />}
 
         <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 20 }}>
           <div style={{ width: 360, maxWidth: "100%", background: C.surfaceAlt, borderRadius: 12, padding: "16px 20px", border: "1px solid " + C.border }}>
@@ -10223,6 +10663,7 @@ function SettingsPage() {
       </div>
 
       <JobTasksCard />
+      <QuoteCalcCard />
 
       <div style={{ ...card }}>
         <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Shop location &amp; clock-in alert</h3>

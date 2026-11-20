@@ -625,6 +625,32 @@ from the add-on card on **Subscriptions** (route `#/setup`).
   open. The phone's fill-out stays a bottom sheet.
 - **Leaflet markers are drawn (`circleMarker`), not `L.marker`** — the vendored
   Leaflet has no pin image wired up, so a default marker renders as broken-image text.
+- **Quote calculator** (`qcPrice` / `QuoteCalculator` / `QuoteCalcCard`, the
+  🧮 Price calculator button under a quote's line items). Prices a load from a
+  pit, pile or supplier yard as four lines: material + haul (one-way miles ×
+  tier rate) + road tax (taxed grid miles × the area's rate, half rate in the
+  company's winter window) + fuel surcharge (diesel over a peg × litres per mile
+  × round trip incl. inbound miles to a pile, plus per-loading litres, ÷ truck
+  yards). **The engine is in the code; the numbers are not.** Every price, tier,
+  truck, road-tax area, destination route and the diesel figure is the
+  company's own data in `companies.settings.quoteCalc` (in `BRANDING_KEYS`),
+  loaded from a JSON price setup on Settings → Quote calculator. This repo is
+  public — never put a company's rates in `index.html`, not even as a preset
+  or a test fixture.
+  - **Cents:** the four per-yard lines are summed unrounded and the total is
+    yards × that, rounded once. The quote lines it adds therefore carry an
+    unrounded rate. Rounding each rate to the cent drifts the total off the
+    company's own calculator; don't "tidy" it.
+  - **No confirmed route, no price.** Delivered mode stays BLOCKED, with no
+    total and no Add button, until someone fills in "Route confirmed by".
+    What was priced, against which price date, and who confirmed the route is
+    kept on the quote as `calcSources` (shown in the editor, never printed).
+  - Miles round up once, *after* the pit access offset is added. A contractor
+    customer is a tier choice made by the person quoting; the code doesn't guess.
+  - **No SQL migration.** Note that `companies.settings` is readable by every
+    active member of the company, so crew accounts can read the rates through
+    the API even though only Settings (owner) edits them. Locking that down needs
+    a migration.
 - **Not built: video compression.** Photos are already downscaled and queued
   offline; videos upload at full size and still fail with no signal. Parked on
   purpose — the heaviest to build and the least used.
