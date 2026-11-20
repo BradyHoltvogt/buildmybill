@@ -7075,8 +7075,8 @@ function PreviewModal({ doc, onClose }) {
 // loaded from a JSON price setup on Settings → Quote calculator. This repo is
 // public, so no company's rates are ever written into this file.
 //
-// Cents rule: the four per-yard lines are added UNROUNDED and the total is
-// yards × that sum, rounded once. That is why the lines it adds to a quote
+// Cents rule: nothing is rounded until the end. Each line is its unrounded
+// per-yard rate × yards, the lines are added, and the total is rounded once. That is why the lines it adds to a quote
 // carry an unrounded rate — rounding each rate to the cent first drifts the
 // total off the company's own calculator. Don't "tidy" the rates to 2 places.
 //
@@ -7114,7 +7114,9 @@ function qcValidate(cfg) {
   if (!Array.isArray(cfg.tiers) || !cfg.tiers.length) errs.push("No haul rates (tiers).");
   if (!Array.isArray(cfg.trucks) || !cfg.trucks.length) errs.push("No trucks.");
   if (cfg.trucks && cfg.trucks.some(t => !(num(t.yards) > 0))) errs.push("Every truck needs a load size in yards.");
-  if (!cfg.fuel || !(num(cfg.fuel.diesel) >= 0) || !(num(cfg.fuel.peg) >= 0)) errs.push("Fuel needs a diesel price and a peg.");
+  const isNum = v => v !== null && v !== "" && Number.isFinite(Number(v));
+  if (!cfg.fuel || !isNum(cfg.fuel.diesel) || !isNum(cfg.fuel.peg)) errs.push("Fuel needs a diesel price and a peg.");
+  else if (!isNum(cfg.fuel.litresPerMile) || !isNum(cfg.fuel.loaderLitres)) errs.push("Fuel needs litres per mile and litres per loading.");
   return errs;
 }
 
@@ -7172,7 +7174,10 @@ function qcPrice(cfg, s) {
   if (!(y > 0)) out.blocked.push("How many yards?");
   const p = mat ? num(mat.price) : 0;
   out.perYd = p + out.haul + out.rt + out.fuel;
-  out.total = y * out.perYd + out.flat;
+  // Scale each line by the yards, then add: the company calculator and the
+  // quote's own calcTotals both work this way. y × (sum) lands a cent off
+  // about one time in 1,300.
+  out.total = y * p + y * out.haul + y * out.rt + y * out.fuel + out.flat;
   return out;
 }
 
@@ -7647,7 +7652,7 @@ function QuoteEditor({ docId, onClose, startPreview }) {
                       <input type="number" min="0" step="any" value={item.qty} onChange={e => updateItem(item.id, "qty", num(e.target.value))} style={{ ...inputCls, width: 72, border: "none", background: "transparent", textAlign: "right" }} />
                     </td>
                     <td style={{ padding: "6px 4px" }}>
-                      <input type="number" min="0" step="0.01" value={item.rate} onChange={e => updateItem(item.id, "rate", num(e.target.value))} style={{ ...inputCls, width: 100, border: "none", background: "transparent", textAlign: "right" }} />
+                      <input type="number" min="0" step="any" value={item.rate} onChange={e => updateItem(item.id, "rate", num(e.target.value))} style={{ ...inputCls, width: 100, border: "none", background: "transparent", textAlign: "right" }} />
                     </td>
                     <td style={{ padding: "6px 8px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{fmt(num(item.qty) * num(item.rate), doc.currency)}</td>
                     <td style={{ padding: "6px 4px", textAlign: "center" }}>

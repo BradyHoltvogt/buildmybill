@@ -637,8 +637,10 @@ from the add-on card on **Subscriptions** (route `#/setup`).
   loaded from a JSON price setup on Settings → Quote calculator. This repo is
   public — never put a company's rates in `index.html`, not even as a preset
   or a test fixture.
-  - **Cents:** the four per-yard lines are summed unrounded and the total is
-    yards × that, rounded once. The quote lines it adds therefore carry an
+  - **Cents:** nothing is rounded until the end — each line is its unrounded
+    per-yard rate × yards, the lines are added, the total is rounded once
+    (that is what the company calculator and `calcTotals` do; yards × the
+    summed rate lands a cent off about 1 in 1,300). The quote lines it adds therefore carry an
     unrounded rate. Rounding each rate to the cent drifts the total off the
     company's own calculator; don't "tidy" it.
   - **No confirmed route, no price.** Delivered mode stays BLOCKED, with no
