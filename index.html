@@ -3487,6 +3487,7 @@ function JobsPage() {
     { key: "jobType", label: "Type of Work", type: "datalist", options: pastValues("jobs", "jobType"), placeholder: "Septic install, driveway, culvert…", section: "Job" },
     { key: "poNumber", label: "Client PO Number", placeholder: "If they gave you one", section: "Job" },
     { key: "jobAddress", label: "Job Location", type: "maps", placeholder: "Site address or pin (lat, lng)", section: "Site" },
+    { key: "squareFeet", label: "Square footage", type: "number", placeholder: "Area you're pricing, e.g. 4500", section: "Site" },
     { key: "siteContact", label: "Site Contact", placeholder: "Who to call on site", section: "Site" },
     { key: "siteContactPhone", label: "Site Contact Phone", placeholder: "+1 555 000 0000", section: "Site" },
     { key: "locatesRequired", label: "Locates required", type: "boolean", section: "Site" },
@@ -3595,6 +3596,7 @@ function SitesPage() {
       { key: "siteName", label: "Site Name", required: true, placeholder: "North Lot" },
       { key: "clientName", label: "Client", type: "datalist", options: clientNames, placeholder: "Type or pick a registered client" },
       { key: "siteAddress", label: "Site Location", type: "maps", placeholder: "Site address or pin (lat, lng)" },
+      { key: "squareFeet", label: "Square footage", type: "number", placeholder: "Area you clear or service, e.g. 4500" },
       { key: "billingNotes", label: "Billing Notes", type: "textarea", placeholder: "Rate, contract terms…" },
     ]}
     sort={(a, b) => (a.clientName || "").localeCompare(b.clientName || "") || (a.siteName || "").localeCompare(b.siteName || "")}
@@ -4668,6 +4670,7 @@ function ContractsPage() {
     { key: "contractType", label: "Type", type: "select", options: ["Fixed price", "Time & materials", "Unit price", "Service / maintenance agreement", "Rental", "Other"], section: "Contract" },
     { key: "status", label: "Status", type: "select", options: ["Draft", "Sent", "Active", "Pending", "Completed", "On Hold", "Cancelled"], section: "Contract" },
     { key: "contractValue", label: "Contract Value ($)", type: "number", placeholder: "250000", section: "Money & dates" },
+    { key: "squareFeet", label: "Square footage", type: "number", placeholder: "Area the contract covers, e.g. 4500", section: "Money & dates" },
     { key: "paymentTerms", label: "Payment Terms", type: "select", options: PAY_TERMS.concat(["Progress draws", "Milestones"]), section: "Money & dates" },
     { key: "depositRequired", label: "Deposit ($)", type: "number", placeholder: "If one is due at signing", section: "Money & dates" },
     { key: "holdbackPercent", label: "Holdback (%)", type: "number", placeholder: "e.g. 10", section: "Money & dates" },
@@ -7504,13 +7507,14 @@ function QuoteCalcCard() {
 // rate is the company's own decision, and a guessed one is worse than a blank:
 // starters arrive with no rate and are marked "needs a price" until someone
 // types one in. A line with no rate can't be added to a quote.
-const PRICE_UNITS = ["per visit", "per hour", "per season", "per month", "per week", "flat", "per job", "per load", "per item", "per ft", "per sq ft", "per acre", "per yd", "per application", "per bag", "per km"];
+const PRICE_UNITS = ["per visit", "per hour", "per season", "per month", "per week", "flat", "per job", "per load", "per item", "per ft", "per sq ft", "per sq ft per season", "per acre", "per yd", "per application", "per bag", "per km"];
 
 const PRICE_LIST_STARTERS = [
   { id: "snow", label: "Snow removal", items: [
     ["Snow removal", "Sidewalk clearing", "per visit"], ["Snow removal", "Driveway clearing", "per visit"],
     ["Snow removal", "Seasonal contract — residential", "per season"], ["Snow removal", "Seasonal contract — commercial lot", "per season"],
-    ["Snow removal", "Parking lot plowing", "per hour"], ["Snow removal", "Salting / sanding", "per application"],
+    ["Snow removal", "Parking lot plowing", "per hour"], ["Snow removal", "Lot / sidewalk clearing by area", "per sq ft"],
+    ["Snow removal", "Seasonal contract by area", "per sq ft per season"], ["Snow removal", "Salting / sanding", "per application"],
     ["Snow removal", "Snow hauling", "per load"], ["Snow removal", "Roof snow removal", "per hour"],
     ["Snow removal", "After-hours / holiday call-out", "flat"],
   ] },
@@ -7522,7 +7526,7 @@ const PRICE_LIST_STARTERS = [
     ["Junk removal", "Dump fees", "flat"],
   ] },
   { id: "lawn", label: "Lawn care & landscaping", items: [
-    ["Lawn care", "Lawn mowing", "per visit"], ["Lawn care", "Seasonal mowing contract", "per season"],
+    ["Lawn care", "Lawn mowing", "per visit"], ["Lawn care", "Lawn mowing by area", "per sq ft"], ["Lawn care", "Seasonal mowing contract", "per season"],
     ["Lawn care", "Trimming & edging", "per visit"], ["Lawn care", "Fertilizing", "per application"],
     ["Lawn care", "Weed control", "per application"], ["Lawn care", "Aeration", "per visit"],
     ["Lawn care", "Spring / fall cleanup", "per job"], ["Lawn care", "Leaf removal", "per visit"],
@@ -7559,6 +7563,34 @@ function plMergeStarter(list, starterId) {
   const add = st.items.filter(([, name]) => !have.has(plNorm(name)))
     .map(([category, name, unit]) => ({ id: genId(), category, name, unit, rate: null, taxable: true, description: "" }));
   return list.concat(add);
+}
+
+// Square footage lives on jobs, contracts and properties as `squareFeet`. A
+// company that already made its own number field for it ("Sq ft", "Square
+// footage"…) through Customize fields is read too, so nobody re-types it.
+const SQFT_LABEL_RE = /square\s*f(oo|ee)t|sq\.?\s*f(oo|ee)?t|footage/i;
+const isSqftUnit = u => /sq\.?\s*f(oo|ee)?t|square\s*f/i.test(String(u || ""));
+function sqftOf(rec, col) {
+  if (!rec) return 0;
+  const v = num(rec.squareFeet);
+  if (v > 0) return v;
+  const d = customFieldDefs(col).find(x => x.type === "number" && SQFT_LABEL_RE.test(x.label));
+  return d ? Math.max(0, num(rec["cf_" + d.id])) : 0;
+}
+// Everything a quote could be measured from: jobs, properties, contracts with
+// a square footage on file. The quote's own job and its client's records first.
+function sqftSources(doc) {
+  const client = plNorm(doc && doc.to && doc.to.name);
+  const linked = doc ? docJobId(doc) : null;
+  const out = [];
+  [["jobs", "Jobs", r => r.jobTitle, r => r.clientName], ["sites", "Local Sites", r => r.siteName, r => r.clientName], ["contracts", "Contracts", r => r.contractName, r => r.clientReference]]
+    .forEach(([col, group, name, who]) => getCol(col).forEach(r => {
+      const sf = sqftOf(r, col);
+      if (!(sf > 0)) return;
+      const mine = (col === "jobs" && r._id === linked) ? 2 : (client && plNorm(who(r)) === client ? 1 : 0);
+      out.push({ key: col + ":" + r._id, group: relabel(group), name: (name(r) || "Untitled") + (who(r) ? " — " + who(r) : ""), short: name(r) || "", sqft: sf, rank: mine });
+    }));
+  return out.sort((a, b) => b.rank - a.rank || a.name.localeCompare(b.name));
 }
 
 function PriceListCard() {
@@ -7616,7 +7648,7 @@ function PriceListCard() {
                   <td style={cell}><input value={it.name || ""} onChange={e => setRow(it.id, { name: e.target.value })} placeholder="e.g. Sidewalk clearing" style={inputCls} /></td>
                   <td style={{ ...cell, width: 140 }}><input list="pl-units" value={it.unit || ""} onChange={e => setRow(it.id, { unit: e.target.value })} style={inputCls} /></td>
                   <td style={{ ...cell, width: 120 }}>
-                    <input type="number" min="0" step="0.01" value={it.rate ?? ""} onChange={e => setRow(it.id, { rate: e.target.value === "" ? null : e.target.value })} placeholder="$ price"
+                    <input type="number" min="0" step="any" value={it.rate ?? ""} onChange={e => setRow(it.id, { rate: e.target.value === "" ? null : e.target.value })} placeholder="$ price"
                       style={{ ...inputCls, textAlign: "right", borderColor: plHasRate(it) ? undefined : "#F59E0B" }} />
                   </td>
                   <td style={{ ...cell, textAlign: "center", width: 50 }}><input type="checkbox" checked={it.taxable !== false} onChange={e => setRow(it.id, { taxable: e.target.checked })} style={{ accentColor: C.accent }} /></td>
@@ -7638,9 +7670,18 @@ function PriceListCard() {
 }
 
 // The quote editor's picker: tick services, put in how many, add them as lines.
-function PriceListPicker({ list, isOwner, onAdd, onClose }) {
+function PriceListPicker({ list, isOwner, onAdd, onClose, measures = [] }) {
   const [q, setQ] = useState("");
   const [pick, setPick] = useState({}); // id -> qty (string)
+  const [measureKey, setMeasureKey] = useState(() => (measures[0] && measures[0].rank > 0 ? measures[0].key : ""));
+  const measure = measures.find(m => m.key === measureKey) || null;
+  const hasSqftItems = list.some(it => isSqftUnit(it.unit));
+  // Changing what it's measured from re-fills every ticked per-sq-ft line.
+  const pickMeasure = k => {
+    setMeasureKey(k);
+    const m = measures.find(x => x.key === k);
+    if (m) setPick(p => { const n = { ...p }; list.forEach(it => { if (n[it.id] !== undefined && isSqftUnit(it.unit)) n[it.id] = String(m.sqft); }); return n; });
+  };
   const shown = list.filter(it => !q.trim() || (it.name + " " + (it.category || "") + " " + (it.unit || "")).toLowerCase().includes(q.trim().toLowerCase()));
   const groups = [];
   shown.forEach(it => {
@@ -7651,9 +7692,14 @@ function PriceListPicker({ list, isOwner, onAdd, onClose }) {
   });
   const chosen = list.filter(it => pick[it.id] !== undefined && plHasRate(it));
   const total = chosen.reduce((t, it) => t + num(pick[it.id]) * Number(it.rate), 0);
-  const toggle = it => setPick(p => { const n = { ...p }; if (n[it.id] !== undefined) delete n[it.id]; else n[it.id] = "1"; return n; });
+  const toggle = it => setPick(p => { const n = { ...p }; if (n[it.id] !== undefined) delete n[it.id]; else n[it.id] = (isSqftUnit(it.unit) && measure) ? String(measure.sqft) : "1"; return n; });
   const add = () => {
-    const lines = chosen.map(it => ({ ...emptyItem(), description: it.name + (it.description ? " — " + it.description : ""), unit: it.unit || "", qty: num(pick[it.id]), rate: Number(it.rate), taxable: it.taxable !== false }));
+    const lines = chosen.map(it => {
+      const qty = num(pick[it.id]);
+      const fromMeasure = isSqftUnit(it.unit) && measure && qty === measure.sqft;
+      return { ...emptyItem(), description: it.name + (it.description ? " — " + it.description : "") + (fromMeasure ? " — " + qty.toLocaleString("en-CA") + " sq ft" + (measure.short ? ", " + measure.short : "") : ""),
+        unit: it.unit || "", qty, rate: Number(it.rate), taxable: it.taxable !== false };
+    });
     if (lines.length) onAdd(lines);
   };
   return (
@@ -7664,6 +7710,22 @@ function PriceListPicker({ list, isOwner, onAdd, onClose }) {
         </div>
       ) : (
         <div>
+          {hasSqftItems && (
+            <div style={{ background: C.surfaceAlt, border: "1px solid " + C.border, borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+              <label style={{ fontSize: 12, fontWeight: 600, color: C.textMuted, display: "block", marginBottom: 4 }}>Square footage from</label>
+              <select value={measureKey} onChange={e => pickMeasure(e.target.value)} style={inputCls}>
+                <option value="">— type it in myself —</option>
+                {[...new Set(measures.map(m => m.group))].map(g => (
+                  <optgroup key={g} label={g}>
+                    {measures.filter(m => m.group === g).map(m => <option key={m.key} value={m.key}>{m.name} · {m.sqft.toLocaleString("en-CA")} sq ft</option>)}
+                  </optgroup>
+                ))}
+              </select>
+              <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 4 }}>
+                {measures.length ? "Per-sq-ft services fill their quantity from this. You can still change it." : "Nothing has a square footage yet. Add it on the job, property or contract (Square footage box) and it shows up here."}
+              </div>
+            </div>
+          )}
           <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search your services…" style={{ ...inputCls, marginBottom: 12 }} autoFocus />
           <div style={{ maxHeight: 420, overflowY: "auto" }}>
             {groups.map(g => (
@@ -7676,7 +7738,7 @@ function PriceListPicker({ list, isOwner, onAdd, onClose }) {
                       <input type="checkbox" checked={on} disabled={!priced} onChange={() => toggle(it)} style={{ accentColor: C.green, width: 16, height: 16 }} />
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ fontWeight: 600, fontSize: 13.5 }}>{it.name}</div>
-                        <div style={{ fontSize: 12, color: priced ? C.textMuted : "#B45309" }}>{priced ? fmt(Number(it.rate)) + " " + (it.unit || "") : "no price set" + (isOwner ? ", add one on Settings → Price list" : "")}</div>
+                        <div style={{ fontSize: 12, color: priced ? C.textMuted : "#B45309" }}>{priced ? "$" + Number(it.rate).toLocaleString("en-CA", { minimumFractionDigits: 2, maximumFractionDigits: 4 }) + " " + (it.unit || "") : "no price set" + (isOwner ? ", add one on Settings → Price list" : "")}</div>
                       </div>
                       {on && <input type="number" min="0" step="any" value={pick[it.id]} onChange={e => setPick(p => ({ ...p, [it.id]: e.target.value }))} aria-label={"How many: " + it.name} style={{ ...inputCls, width: 80, textAlign: "right" }} />}
                     </div>
@@ -7888,7 +7950,7 @@ function QuoteEditor({ docId, onClose, startPreview }) {
             </div>
           )}
         </div>
-        {plOpen && <PriceListPicker list={priceListOf(company)} isOwner={!!(user && user.isOwner)} onAdd={lines => { addLines(lines); setPlOpen(false); }} onClose={() => setPlOpen(false)} />}
+        {plOpen && <PriceListPicker list={priceListOf(company)} measures={sqftSources(doc)} isOwner={!!(user && user.isOwner)} onAdd={lines => { addLines(lines); setPlOpen(false); }} onClose={() => setPlOpen(false)} />}
         {calcOpen && qcCfg && <QuoteCalculator cfg={qcCfg} startAddress={doc.to && doc.to.address} onAdd={addCalcLines} onClose={() => setCalcOpen(false)} />}
 
         <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 20 }}>

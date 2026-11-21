@@ -635,6 +635,15 @@ from the add-on card on **Subscriptions** (route `#/setup`).
   price and can't be added to a quote until the company sets one. Don't add
   "typical" prices to the starters: a guessed rate on a customer's quote is
   worse than a blank. **No SQL migration.**
+- **Square footage** (`squareFeet` on jobs, contracts and Local Sites; `sqftOf`,
+  `sqftSources`, `isSqftUnit`). A price-list service counted "per sq ft" (or
+  "per sq ft per season") fills its quantity from a record's square footage in
+  the 📋 Price list picker. The picker pre-selects the quote's linked job, else a
+  record whose client matches the quote's Bill To name, else nothing — it never
+  guesses a stranger's property. A company's own number field labelled like
+  "Sq ft" / "Square footage" (Customize fields) is read too. The quantity is
+  copied onto the quote line, so changing a property's size later doesn't
+  rewrite old quotes. **No SQL migration.**
 - **Quote calculator** (`qcPrice` / `QuoteCalculator` / `QuoteCalcCard`, the
   🧮 Price calculator button under a quote's line items). Prices a load from a
   pit, pile or supplier yard as four lines: material + haul (one-way miles ×
