@@ -625,6 +625,16 @@ from the add-on card on **Subscriptions** (route `#/setup`).
   open. The phone's fill-out stays a bottom sheet.
 - **Leaflet markers are drawn (`circleMarker`), not `L.marker`** — the vendored
   Leaflet has no pin image wired up, so a default marker renders as broken-image text.
+- **Price list** (`companies.settings.priceList`, in `BRANDING_KEYS`; Settings →
+  Price list = `PriceListCard`; the quote editor's 📋 Price list = `PriceListPicker`).
+  The company's own services: group, name, how it's counted (per visit / hour /
+  season / load…), rate, taxable. Ticking services in a quote adds them as
+  ordinary line items, so nothing downstream changed. Works for any trade.
+  `PRICE_LIST_STARTERS` (snow, junk, lawn, property, cleaning, trades) are
+  service **names and units only, never rates** — a starter arrives with no
+  price and can't be added to a quote until the company sets one. Don't add
+  "typical" prices to the starters: a guessed rate on a customer's quote is
+  worse than a blank. **No SQL migration.**
 - **Quote calculator** (`qcPrice` / `QuoteCalculator` / `QuoteCalcCard`, the
   🧮 Price calculator button under a quote's line items). Prices a load from a
   pit, pile or supplier yard as four lines: material + haul (one-way miles ×

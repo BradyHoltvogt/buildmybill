@@ -1836,7 +1836,7 @@ const DEFAULT_SECONDARY = "#16A34A";
 // the guided workspace setup produces (wording, stages, sections).
 const BRANDING_KEYS = ["primaryColor", "secondaryColor", "logoUrl", "address", "phone", "email", "website", "shopAddress", "shopLat", "shopLng", "geofenceRadiusM",
   "industry", "industryDetail", "terms", "stages", "modules", "setupComplete", "setupCompletedAt", "setupSkipped", "setupPackage",
-  "payPeriod", "payAnchor", "taskList", "customFieldDefs", "quoteCalc"];
+  "payPeriod", "payAnchor", "taskList", "customFieldDefs", "quoteCalc", "priceList"];
 
 function applyBranding(company) {
   const root = document.documentElement;
@@ -7493,6 +7493,211 @@ function QuoteCalcCard() {
   );
 }
 
+/* ─── Price list (the company's own services and rates) ──────────────────── */
+// One list per company: what you sell, how it's counted (per visit, per hour,
+// per season…) and what you charge. It lives in companies.settings.priceList
+// (BRANDING_KEYS), is edited on Settings → Price list, and fills quote lines
+// from the 📋 Price list button in the quote editor. Works for any trade:
+// snow removal, lawn care, junk removal, cleaning, anything.
+//
+// The starter lists below are service NAMES and units only, never prices. A
+// rate is the company's own decision, and a guessed one is worse than a blank:
+// starters arrive with no rate and are marked "needs a price" until someone
+// types one in. A line with no rate can't be added to a quote.
+const PRICE_UNITS = ["per visit", "per hour", "per season", "per month", "per week", "flat", "per job", "per load", "per item", "per ft", "per sq ft", "per acre", "per yd", "per application", "per bag", "per km"];
+
+const PRICE_LIST_STARTERS = [
+  { id: "snow", label: "Snow removal", items: [
+    ["Snow removal", "Sidewalk clearing", "per visit"], ["Snow removal", "Driveway clearing", "per visit"],
+    ["Snow removal", "Seasonal contract — residential", "per season"], ["Snow removal", "Seasonal contract — commercial lot", "per season"],
+    ["Snow removal", "Parking lot plowing", "per hour"], ["Snow removal", "Salting / sanding", "per application"],
+    ["Snow removal", "Snow hauling", "per load"], ["Snow removal", "Roof snow removal", "per hour"],
+    ["Snow removal", "After-hours / holiday call-out", "flat"],
+  ] },
+  { id: "junk", label: "Junk removal", items: [
+    ["Junk removal", "Single item pickup", "per item"], ["Junk removal", "Truck load — quarter", "per load"],
+    ["Junk removal", "Truck load — half", "per load"], ["Junk removal", "Truck load — full", "per load"],
+    ["Junk removal", "Appliance removal", "per item"], ["Junk removal", "Mattress removal", "per item"],
+    ["Junk removal", "Yard waste removal", "per load"], ["Junk removal", "Labour (loading / demo)", "per hour"],
+    ["Junk removal", "Dump fees", "flat"],
+  ] },
+  { id: "lawn", label: "Lawn care & landscaping", items: [
+    ["Lawn care", "Lawn mowing", "per visit"], ["Lawn care", "Seasonal mowing contract", "per season"],
+    ["Lawn care", "Trimming & edging", "per visit"], ["Lawn care", "Fertilizing", "per application"],
+    ["Lawn care", "Weed control", "per application"], ["Lawn care", "Aeration", "per visit"],
+    ["Lawn care", "Spring / fall cleanup", "per job"], ["Lawn care", "Leaf removal", "per visit"],
+    ["Lawn care", "Hedge trimming", "per hour"], ["Landscaping", "Mulch installed", "per yd"],
+    ["Landscaping", "Sod installed", "per sq ft"],
+  ] },
+  { id: "property", label: "General property services", items: [
+    ["Property services", "General labour", "per hour"], ["Property services", "Pressure washing", "per hour"],
+    ["Property services", "Gutter cleaning", "per job"], ["Property services", "Window cleaning", "per job"],
+    ["Property services", "Fence / deck repair", "per hour"], ["Property services", "Travel / trip charge", "flat"],
+  ] },
+  { id: "cleaning", label: "Cleaning & janitorial", items: [
+    ["Cleaning", "Standard clean", "per visit"], ["Cleaning", "Deep clean", "per job"],
+    ["Cleaning", "Move-in / move-out clean", "per job"], ["Cleaning", "Office cleaning", "per month"],
+    ["Cleaning", "Carpet cleaning", "per sq ft"], ["Cleaning", "Hourly cleaning", "per hour"],
+  ] },
+  { id: "trades", label: "Trades & repair", items: [
+    ["Labour", "Journeyman labour", "per hour"], ["Labour", "Apprentice labour", "per hour"],
+    ["Labour", "Service call", "flat"], ["Labour", "After-hours call-out", "flat"],
+    ["Travel", "Travel / mileage", "per km"], ["Materials", "Materials (see invoice)", "flat"],
+  ] },
+];
+
+const plNorm = s => String(s || "").trim().toLowerCase();
+const plHasRate = it => it && it.rate !== null && it.rate !== undefined && it.rate !== "" && Number.isFinite(Number(it.rate));
+function priceListOf(company) {
+  return Array.isArray(company && company.priceList) ? company.priceList : [];
+}
+// Adds a starter list's services, skipping any the company already has.
+function plMergeStarter(list, starterId) {
+  const st = PRICE_LIST_STARTERS.find(s => s.id === starterId);
+  if (!st) return list;
+  const have = new Set(list.map(it => plNorm(it.name)));
+  const add = st.items.filter(([, name]) => !have.has(plNorm(name)))
+    .map(([category, name, unit]) => ({ id: genId(), category, name, unit, rate: null, taxable: true, description: "" }));
+  return list.concat(add);
+}
+
+function PriceListCard() {
+  const { company, updateCompany } = useCompany();
+  const saved = priceListOf(company);
+  const [list, setList] = useState(() => saved.map(x => ({ ...x })));
+  const [starter, setStarter] = useState("");
+  const [msg, setMsg] = useState("");
+  useEffect(() => { setList(priceListOf(company).map(x => ({ ...x }))); }, [company && company.priceList]);
+  const dirty = JSON.stringify(list) !== JSON.stringify(saved);
+  const say = t => { setMsg(t); setTimeout(() => setMsg(""), 3000); };
+  const setRow = (id, patch) => setList(l => l.map(it => (it.id === id ? { ...it, ...patch } : it)));
+  const addRow = () => setList(l => l.concat([{ id: genId(), category: (l[l.length - 1] || {}).category || "", name: "", unit: "per visit", rate: null, taxable: true, description: "" }]));
+  const addStarter = () => {
+    if (!starter) return;
+    const next = plMergeStarter(list, starter);
+    const n = next.length - list.length;
+    setList(next); setStarter("");
+    say(n ? n + " services added. Put your price on each one, then save." : "You already have everything on that list.");
+  };
+  const save = async () => {
+    const clean = list.map(it => ({ ...it, name: String(it.name || "").trim(), category: String(it.category || "").trim(), unit: String(it.unit || "").trim(), rate: plHasRate(it) ? Number(it.rate) : null }))
+      .filter(it => it.name);
+    await updateCompany({ priceList: clean });
+    say("Price list saved.");
+  };
+  const missing = list.filter(it => String(it.name || "").trim() && !plHasRate(it)).length;
+  const cell = { padding: "4px 4px" };
+  return (
+    <div style={{ ...card }}>
+      <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Price list</h3>
+      <p style={{ color: C.textMuted, fontSize: 13, marginBottom: 14, lineHeight: 1.6 }}>
+        What you sell, how it's counted and what you charge. In a quote, <strong>📋 Price list</strong> fills the lines from here,
+        so you set a price once instead of retyping it. Start from a list for your kind of work, or add your own. The starter lists
+        come with no prices. Your rates are yours to set.
+      </p>
+      <datalist id="pl-units">{PRICE_UNITS.map(u => <option key={u} value={u} />)}</datalist>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+        <select value={starter} onChange={e => setStarter(e.target.value)} style={{ ...inputCls, width: "auto", minWidth: 230 }}>
+          <option value="">Start from a list for…</option>
+          {PRICE_LIST_STARTERS.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+        </select>
+        <button type="button" onClick={addStarter} disabled={!starter} style={{ ...btnOutline, opacity: starter ? 1 : 0.5 }}>+ Add these services</button>
+      </div>
+      {list.length > 0 && (
+        <div className="scroll-x">
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 640 }}>
+            <thead><tr style={{ background: C.surfaceAlt }}>
+              {["Group", "Service", "Counted", "Price", "Tax?", ""].map((h, i) => <th key={i} style={{ padding: "6px 8px", textAlign: i === 3 ? "right" : "left", fontSize: 11, color: C.textMuted, textTransform: "uppercase" }}>{h}</th>)}
+            </tr></thead>
+            <tbody>
+              {list.map(it => (
+                <tr key={it.id} style={{ borderBottom: "1px solid " + C.border }}>
+                  <td style={{ ...cell, width: 150 }}><input value={it.category || ""} onChange={e => setRow(it.id, { category: e.target.value })} placeholder="e.g. Snow removal" style={inputCls} /></td>
+                  <td style={cell}><input value={it.name || ""} onChange={e => setRow(it.id, { name: e.target.value })} placeholder="e.g. Sidewalk clearing" style={inputCls} /></td>
+                  <td style={{ ...cell, width: 140 }}><input list="pl-units" value={it.unit || ""} onChange={e => setRow(it.id, { unit: e.target.value })} style={inputCls} /></td>
+                  <td style={{ ...cell, width: 120 }}>
+                    <input type="number" min="0" step="0.01" value={it.rate ?? ""} onChange={e => setRow(it.id, { rate: e.target.value === "" ? null : e.target.value })} placeholder="$ price"
+                      style={{ ...inputCls, textAlign: "right", borderColor: plHasRate(it) ? undefined : "#F59E0B" }} />
+                  </td>
+                  <td style={{ ...cell, textAlign: "center", width: 50 }}><input type="checkbox" checked={it.taxable !== false} onChange={e => setRow(it.id, { taxable: e.target.checked })} style={{ accentColor: C.accent }} /></td>
+                  <td style={{ ...cell, width: 34 }}><button type="button" onClick={() => setList(l => l.filter(x => x.id !== it.id))} title="Remove" style={{ background: "none", border: "none", color: "#DC2626", cursor: "pointer", fontSize: 15 }}>🗑</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {missing > 0 && <div style={{ fontSize: 12, color: "#B45309", marginTop: 8 }}>{missing} service{missing === 1 ? " has" : "s have"} no price yet. They show in quotes but can't be added until they do.</div>}
+      <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+        <button type="button" onClick={addRow} style={btnOutline}>+ Add a service</button>
+        <button type="button" onClick={save} disabled={!dirty} style={{ ...btnSecondary, opacity: dirty ? 1 : 0.5 }}>Save price list</button>
+      </div>
+      {msg && <div style={{ fontSize: 12, color: C.green, marginTop: 8 }}>{msg}</div>}
+    </div>
+  );
+}
+
+// The quote editor's picker: tick services, put in how many, add them as lines.
+function PriceListPicker({ list, isOwner, onAdd, onClose }) {
+  const [q, setQ] = useState("");
+  const [pick, setPick] = useState({}); // id -> qty (string)
+  const shown = list.filter(it => !q.trim() || (it.name + " " + (it.category || "") + " " + (it.unit || "")).toLowerCase().includes(q.trim().toLowerCase()));
+  const groups = [];
+  shown.forEach(it => {
+    const g = it.category || "Other";
+    let grp = groups.find(x => x.g === g);
+    if (!grp) { grp = { g, items: [] }; groups.push(grp); }
+    grp.items.push(it);
+  });
+  const chosen = list.filter(it => pick[it.id] !== undefined && plHasRate(it));
+  const total = chosen.reduce((t, it) => t + num(pick[it.id]) * Number(it.rate), 0);
+  const toggle = it => setPick(p => { const n = { ...p }; if (n[it.id] !== undefined) delete n[it.id]; else n[it.id] = "1"; return n; });
+  const add = () => {
+    const lines = chosen.map(it => ({ ...emptyItem(), description: it.name + (it.description ? " — " + it.description : ""), unit: it.unit || "", qty: num(pick[it.id]), rate: Number(it.rate), taxable: it.taxable !== false }));
+    if (lines.length) onAdd(lines);
+  };
+  return (
+    <Modal title="Price list" onClose={onClose} width={640}>
+      {!list.length ? (
+        <div style={{ fontSize: 13.5, color: C.textMuted, lineHeight: 1.6 }}>
+          No price list yet. {isOwner ? <span>Set one up on <strong>Settings → Price list</strong>: start from a list for your kind of work, put your prices in, and save.</span> : "Ask the owner to set one up on Settings → Price list."}
+        </div>
+      ) : (
+        <div>
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search your services…" style={{ ...inputCls, marginBottom: 12 }} autoFocus />
+          <div style={{ maxHeight: 420, overflowY: "auto" }}>
+            {groups.map(g => (
+              <div key={g.g} style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", margin: "4px 0" }}>{g.g}</div>
+                {g.items.map(it => {
+                  const on = pick[it.id] !== undefined, priced = plHasRate(it);
+                  return (
+                    <div key={it.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 8px", borderRadius: 8, background: on ? "#F0FDF4" : "transparent", opacity: priced ? 1 : 0.6 }}>
+                      <input type="checkbox" checked={on} disabled={!priced} onChange={() => toggle(it)} style={{ accentColor: C.green, width: 16, height: 16 }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: 13.5 }}>{it.name}</div>
+                        <div style={{ fontSize: 12, color: priced ? C.textMuted : "#B45309" }}>{priced ? fmt(Number(it.rate)) + " " + (it.unit || "") : "no price set" + (isOwner ? ", add one on Settings → Price list" : "")}</div>
+                      </div>
+                      {on && <input type="number" min="0" step="any" value={pick[it.id]} onChange={e => setPick(p => ({ ...p, [it.id]: e.target.value }))} aria-label={"How many: " + it.name} style={{ ...inputCls, width: 80, textAlign: "right" }} />}
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+            {!groups.length && <div style={{ fontSize: 13, color: C.textMuted }}>Nothing matches “{q}”.</div>}
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 16, alignItems: "center" }}>
+            <button type="button" onClick={onClose} style={{ ...btnOutline, flex: 1 }}>Cancel</button>
+            <button type="button" onClick={add} disabled={!chosen.length} style={{ ...btnSecondary, flex: 2, opacity: chosen.length ? 1 : 0.5 }}>
+              {chosen.length ? "Add " + chosen.length + " line" + (chosen.length === 1 ? "" : "s") + " · " + fmt(total) : "Tick what you're quoting"}
+            </button>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 function QuoteEditor({ docId, onClose, startPreview }) {
   const { company } = useCompany();
   const [doc, setDoc] = useState(() => (docId && db.getById("quotes", docId)) || defaultDoc(company));
@@ -7500,6 +7705,12 @@ function QuoteEditor({ docId, onClose, startPreview }) {
   const [preview, setPreview] = useState(!!startPreview);
   const [saved, setSaved] = useState(false);
   const [calcOpen, setCalcOpen] = useState(false);
+  const [plOpen, setPlOpen] = useState(false);
+  // Picked lines replace a lone blank starter line instead of sitting under it.
+  const addLines = lines => setDoc(d => {
+    const blank = d.items.length === 1 && !String(d.items[0].description || "").trim() && !num(d.items[0].rate);
+    return { ...d, items: (blank ? [] : d.items).concat(lines) };
+  });
   const qcCfg = company && company.quoteCalc && !qcValidate(company.quoteCalc).length ? company.quoteCalc : null;
   // Calculator lines replace a lone blank starter line instead of sitting under it.
   const addCalcLines = (lines, source) => {
@@ -7667,6 +7878,7 @@ function QuoteEditor({ docId, onClose, startPreview }) {
             </table>
           </div>
           <button type="button" onClick={() => updateItems([...doc.items, emptyItem()])} style={{ marginTop: 12, padding: "7px 14px", background: "#EEF2FF", color: C.accent, border: "1px dashed #A5B4FC", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>+ Add Line Item</button>
+          <button type="button" onClick={() => setPlOpen(true)} style={{ marginTop: 12, marginLeft: 8, padding: "7px 14px", background: "#FFF7ED", color: "#9A3412", border: "1px dashed #FDBA74", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>📋 Price list</button>
           {qcCfg && <button type="button" onClick={() => setCalcOpen(true)} style={{ marginTop: 12, marginLeft: 8, padding: "7px 14px", background: "#F0FDF4", color: "#166534", border: "1px dashed #86EFAC", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>🧮 Price calculator</button>}
           {(doc.calcSources || []).length > 0 && (
             <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 10, lineHeight: 1.6 }}>
@@ -7676,6 +7888,7 @@ function QuoteEditor({ docId, onClose, startPreview }) {
             </div>
           )}
         </div>
+        {plOpen && <PriceListPicker list={priceListOf(company)} isOwner={!!(user && user.isOwner)} onAdd={lines => { addLines(lines); setPlOpen(false); }} onClose={() => setPlOpen(false)} />}
         {calcOpen && qcCfg && <QuoteCalculator cfg={qcCfg} startAddress={doc.to && doc.to.address} onAdd={addCalcLines} onClose={() => setCalcOpen(false)} />}
 
         <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 20 }}>
@@ -10668,6 +10881,7 @@ function SettingsPage() {
       </div>
 
       <JobTasksCard />
+      <PriceListCard />
       <QuoteCalcCard />
 
       <div style={{ ...card }}>
